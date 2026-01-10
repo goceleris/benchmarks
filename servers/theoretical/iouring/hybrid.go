@@ -59,12 +59,12 @@ func (s *HybridServer) Run() error {
 	}
 	s.listenFd = listenFd
 
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	addr := &unix.SockaddrInet4{Port: portNum}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -249,7 +249,7 @@ func (s *HybridServer) eventLoop() error {
 					s.handleData(fd, data)
 					s.reprovideBuffer(bufIdx)
 				} else if cqe.Res <= 0 {
-					unix.Close(fd)
+					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
 			}

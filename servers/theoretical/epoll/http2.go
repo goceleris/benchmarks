@@ -95,7 +95,7 @@ func (s *HTTP2Server) Run() error {
 		Events: unix.EPOLLIN | unix.EPOLLET,
 		Fd:     int32(listenFd),
 	}
-	unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
+	_ = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
 
 	log.Printf("epoll-h2 server listening on port %s", s.port)
 	return s.eventLoop()
@@ -143,7 +143,7 @@ func (s *HTTP2Server) acceptConnections() {
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
 		}
-		unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
 		s.connState[connFd] = &h2ConnState{
 			buf: make([]byte, 16384),
@@ -230,14 +230,14 @@ func (s *HTTP2Server) sendSettings(fd int) {
 	// Empty SETTINGS frame
 	frame := make([]byte, 9)
 	frame[3] = h2FrameTypeSettings
-	unix.Write(fd, frame)
+	_, _ = unix.Write(fd, frame)
 }
 
 func (s *HTTP2Server) sendSettingsAck(fd int) {
 	frame := make([]byte, 9)
 	frame[3] = h2FrameTypeSettings
 	frame[4] = h2FlagAck
-	unix.Write(fd, frame)
+	_, _ = unix.Write(fd, frame)
 }
 
 func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
@@ -259,11 +259,11 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	// Send response
 	var headerBytes, bodyBytes []byte
 
-	switch {
-	case path == "/":
+	switch path {
+	case "/":
 		headerBytes = hpackHeadersSimple
 		bodyBytes = bodySimple
-	case path == "/json":
+	case "/json":
 		headerBytes = hpackHeadersJSON
 		bodyBytes = bodyJSON
 	default:

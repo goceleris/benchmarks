@@ -31,7 +31,6 @@ var (
 	hpackHeadersJSON   = []byte{0x88, 0x5f, 0x10, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73, 0x6f, 0x6e}
 	bodySimple         = []byte("Hello, World!")
 	bodyJSON           = []byte(`{"message":"Hello, World!","server":"iouring-h2"}`)
-	bodyOK             = []byte("OK")
 )
 
 // HTTP2Server is a barebones H2C server using io_uring with multishot.
@@ -39,8 +38,6 @@ type HTTP2Server struct {
 	port      string
 	ringFd    int
 	listenFd  int
-	sqePtr    unsafe.Pointer
-	cqePtr    unsafe.Pointer
 	sqHead    *uint32
 	sqTail    *uint32
 	cqHead    *uint32
@@ -76,12 +73,12 @@ func (s *HTTP2Server) Run() error {
 	}
 	s.listenFd = listenFd
 
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	addr := &unix.SockaddrInet4{Port: portNum}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -250,7 +247,7 @@ func (s *HTTP2Server) eventLoop() error {
 					s.handleH2Data(fd, data)
 					s.reprovideBuffer(bufIdx)
 				} else if cqe.Res <= 0 {
-					unix.Close(fd)
+					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
 			}

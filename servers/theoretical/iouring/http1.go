@@ -116,8 +116,6 @@ type HTTP1Server struct {
 	port     string
 	ringFd   int
 	listenFd int
-	sqePtr   unsafe.Pointer
-	cqePtr   unsafe.Pointer
 	sqHead   *uint32
 	sqTail   *uint32
 	cqHead   *uint32
@@ -147,12 +145,12 @@ func (s *HTTP1Server) Run() error {
 	}
 	s.listenFd = listenFd
 
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	addr := &unix.SockaddrInet4{Port: portNum}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -240,7 +238,7 @@ func (s *HTTP1Server) setupBuffers() error {
 	sqe.OpcodeFlags = bufferGroup
 	sqe.UserData = 0 // Special: buffer provision
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 
 	// Submit
@@ -264,7 +262,7 @@ func (s *HTTP1Server) submitMultishotAccept() {
 	sqe.OpcodeFlags = IORING_ACCEPT_MULTISHOT
 	sqe.UserData = uint64(s.listenFd) // Mark as listen fd
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -281,7 +279,7 @@ func (s *HTTP1Server) submitMultishotRecv(fd int) {
 	sqe.OpcodeFlags = IORING_RECV_MULTISHOT | (bufferGroup << 16)
 	sqe.UserData = uint64(fd)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -338,7 +336,7 @@ func (s *HTTP1Server) eventLoop() error {
 					// Re-provide the buffer
 					s.reprovideBuffer(bufIdx)
 				} else if cqe.Res <= 0 {
-					unix.Close(fd)
+					_ = unix.Close(fd)
 				}
 			}
 

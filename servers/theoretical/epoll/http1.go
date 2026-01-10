@@ -140,7 +140,7 @@ func (s *HTTP1Server) acceptConnections() {
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
 		}
-		unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
 		// Allocate read buffer
 		s.readBufs[connFd] = make([]byte, readBufSize)
@@ -203,12 +203,12 @@ func (s *HTTP1Server) handleRequest(fd int, data []byte) {
 	}
 
 	// Write response directly
-	unix.Write(fd, response)
+	_, _ = unix.Write(fd, response)
 }
 
 func (s *HTTP1Server) closeConnection(fd int) {
-	unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
-	unix.Close(fd)
+	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+	_ = unix.Close(fd)
 	delete(s.readBufs, fd)
 }
 
