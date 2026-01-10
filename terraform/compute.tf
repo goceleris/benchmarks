@@ -1,22 +1,3 @@
-# Security group for benchmark runners
-resource "aws_security_group" "benchmark_runner" {
-  name        = "benchmark-runner-sg-${var.benchmark_mode}"
-  description = "Security group for ${var.benchmark_mode} benchmark runner instances"
-
-  # Allow all outbound traffic (needed for GitHub API, package downloads)
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "benchmark-runner-sg-${var.benchmark_mode}"
-    Mode = var.benchmark_mode
-  }
-}
-
 # ARM64 Spot Instance
 resource "aws_spot_instance_request" "benchmark_arm64" {
   ami                    = data.aws_ami.ubuntu_arm64.id
@@ -24,8 +5,15 @@ resource "aws_spot_instance_request" "benchmark_arm64" {
   spot_price             = local.spot_prices[var.benchmark_mode].arm64
   wait_for_fulfillment   = true
   spot_type              = "one-time"
-  iam_instance_profile   = aws_iam_instance_profile.benchmark_runner.name
-  vpc_security_group_ids = [aws_security_group.benchmark_runner.id]
+  
+  # Use pre-existing IAM instance profile (optional)
+  iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
+  
+  # Use pre-existing security group if provided, otherwise use default
+  vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
+  
+  # Use specific subnet if provided
+  subnet_id = var.subnet_id != "" ? var.subnet_id : null
 
   user_data = templatefile("${path.module}/userdata.tftpl", {
     architecture        = "arm64"
@@ -58,8 +46,15 @@ resource "aws_spot_instance_request" "benchmark_x86" {
   spot_price             = local.spot_prices[var.benchmark_mode].x86
   wait_for_fulfillment   = true
   spot_type              = "one-time"
-  iam_instance_profile   = aws_iam_instance_profile.benchmark_runner.name
-  vpc_security_group_ids = [aws_security_group.benchmark_runner.id]
+  
+  # Use pre-existing IAM instance profile (optional)
+  iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
+  
+  # Use pre-existing security group if provided, otherwise use default
+  vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
+  
+  # Use specific subnet if provided
+  subnet_id = var.subnet_id != "" ? var.subnet_id : null
 
   user_data = templatefile("${path.module}/userdata.tftpl", {
     architecture        = "x86_64"

@@ -27,6 +27,26 @@ variable "benchmark_mode" {
   }
 }
 
+# Pre-existing infrastructure references
+# These must be created manually before running Terraform
+variable "iam_instance_profile_name" {
+  description = "Name of pre-existing IAM instance profile for benchmark runners"
+  type        = string
+  default     = "benchmark_runner_profile"
+}
+
+variable "security_group_id" {
+  description = "ID of pre-existing security group for benchmark runners"
+  type        = string
+  default     = ""  # If empty, instances will use default VPC security
+}
+
+variable "subnet_id" {
+  description = "Subnet ID for instances (optional, uses default if empty)"
+  type        = string
+  default     = ""
+}
+
 # Instance type mappings
 locals {
   # Fast mode: cheaper virtualized instances (same CPU family as metal)
@@ -65,9 +85,6 @@ locals {
       x86   = ["self-hosted", "metal-x86", "linux", "x86_64"]
     }
   }
-
-  # Wait time for runners (metal instances take longer to boot)
-  runner_wait_time = var.benchmark_mode == "metal" ? 120 : 60
 }
 
 # Selected configuration based on mode
