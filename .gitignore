@@ -1,32 +1,48 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# Build outputs
+bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# Test outputs
 *.test
-
-# Code coverage profiles and other test artifacts
 *.out
-coverage.*
-*.coverprofile
-profile.cov
+coverage.txt
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Dependency directories
+vendor/
 
-# Go workspace file
-go.work
-go.work.sum
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-# env file
-.env
+# OS
+.DS_Store
+Thumbs.db
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfplan
+*.tfvars
+!terraform.tfvars.example
+
+# Results
+# Keep official results (latest/ and version folders like v0.1.0/)
+# Ignore temporary test results and raw benchmark output
+results/test/
+results/*.json
+results/charts/
+
+# Logs
+*.log
+
+# Temporary files
+tmp/

@@ -1,0 +1,66 @@
+// Package main provides the entry point for running benchmark servers.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/goceleris/benchmarks/servers/baseline/fiber"
+	irisserver "github.com/goceleris/benchmarks/servers/baseline/iris"
+	"github.com/goceleris/benchmarks/servers/baseline/stdhttp"
+)
+
+func main() {
+	serverType := flag.String("server", "stdhttp-h1", "Server type to run")
+	port := flag.String("port", "8080", "Port to listen on")
+	flag.Parse()
+
+	log.Printf("Starting benchmark server: %s on port %s", *serverType, *port)
+
+	var err error
+
+	switch *serverType {
+	// Baseline servers
+	case "stdhttp-h1":
+		server := stdhttp.NewHTTP1Server(*port)
+		err = server.Run()
+
+	case "stdhttp-h2":
+		server := stdhttp.NewHTTP2Server(*port)
+		err = server.Run()
+
+	case "stdhttp-hybrid":
+		server := stdhttp.NewHybridServer(*port)
+		err = server.Run()
+
+	case "fiber-h1":
+		server := fiber.NewServer(*port)
+		err = server.Run()
+
+	case "iris-h2":
+		server := irisserver.NewServer(*port)
+		err = server.Run()
+
+	// Theoretical servers will be added here
+	case "epoll-h1", "epoll-h2", "epoll-hybrid":
+		log.Printf("Epoll server %s - Linux only", *serverType)
+		err = runEpollServer(*serverType, *port)
+
+	case "iouring-h1", "iouring-h2", "iouring-hybrid":
+		log.Printf("io_uring server %s - Linux 5.19+ only", *serverType)
+		err = runIOUringServer(*serverType, *port)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown server type: %s\n", *serverType)
+		fmt.Fprintf(os.Stderr, "Available types:\n")
+		fmt.Fprintf(os.Stderr, "  Baseline: stdhttp-h1, stdhttp-h2, stdhttp-hybrid, fiber-h1, iris-h2\n")
+		fmt.Fprintf(os.Stderr, "  Theoretical: epoll-h1, epoll-h2, epoll-hybrid, iouring-h1, iouring-h2, iouring-hybrid\n")
+		os.Exit(1)
+	}
+
+	if err != nil {
+		log.Fatalf("Server error: %v", err)
+	}
+}

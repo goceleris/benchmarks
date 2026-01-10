@@ -1,0 +1,217 @@
+name: Benchmark (Fast)
+
+# Fast mode: Runs on PRs for quick trend validation
+# Uses cheaper virtualized instances (c5.large, c6g.medium)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Benchmark duration (e.g., 15s, 30s)'
+        required: false
+        default: '15s'
+      benchmark_mode:
+        description: 'Benchmark servers to test'
+        required: false
+        default: 'baseline'
+        type: choice
+        options:
+          - baseline
+          - theoretical
+          - all
+
+env:
+  TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
+  TF_VAR_benchmark_mode: fast
+
+jobs:
+  # ============================================================
+  # Phase 1: Launch Fast Infrastructure
+  # ============================================================
+  launch:
+    name: Launch Fast Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      arm64_launched: ${{ steps.apply.outputs.arm64_launched }}
+      x86_launched: ${{ steps.apply.outputs.x86_launched }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+      
+      - name: Terraform Apply (Fast Mode)
+        id: apply
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "🚀 Launching FAST benchmark infrastructure (c5.large, c6g.medium)"
+          terraform apply -auto-approve
+          
+          echo "arm64_launched=true" >> $GITHUB_OUTPUT
+          echo "x86_launched=true" >> $GITHUB_OUTPUT
+      
+      - name: Wait for Runners
+        run: |
+          echo "Waiting for fast runners to register (60s)..."
+          sleep 60
+
+  # ============================================================
+  # Phase 2: Fast Benchmark (ARM64)
+  # ============================================================
+  benchmark-arm64:
+    name: Fast Benchmark (ARM64)
+    needs: launch
+    runs-on: [self-hosted, fast-arm64]
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+      
+      - name: Run Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
+        run: |
+          chmod +x scripts/runner.sh
+          ./scripts/runner.sh "$BENCHMARK_MODE"
+      
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-arm64
+          path: results/
+          retention-days: 7
+
+  # ============================================================
+  # Phase 2: Fast Benchmark (x86)
+  # ============================================================
+  benchmark-x86:
+    name: Fast Benchmark (x86)
+    needs: launch
+    runs-on: [self-hosted, fast-x86]
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+      
+      - name: Run Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
+        run: |
+          chmod +x scripts/runner.sh
+          ./scripts/runner.sh "$BENCHMARK_MODE"
+      
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-x86
+          path: results/
+          retention-days: 7
+
+  # ============================================================
+  # Phase 3: Generate PR Comment
+  # ============================================================
+  report:
+    name: Generate Report
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fast-results-*
+          path: results/
+          merge-multiple: true
+        continue-on-error: true
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Generate Charts
+        run: |
+          pip install matplotlib numpy
+          python scripts/generate_charts.py results results/charts || true
+      
+      - name: Create Summary
+        run: |
+          echo "# 🚀 Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note**: These are quick validation results using virtualized instances." >> $GITHUB_STEP_SUMMARY
+          echo "> For official results, run the Metal benchmark after merge." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for f in results/charts/*.md; do
+            [ -f "$f" ] && cat "$f" >> $GITHUB_STEP_SUMMARY
+          done
+
+  # ============================================================
+  # Cleanup
+  # ============================================================
+  cleanup:
+    name: Cleanup Infrastructure
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Destroy
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          terraform init
+          terraform destroy -auto-approve || true
