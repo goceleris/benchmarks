@@ -46,7 +46,13 @@ cd /
 echo "=== Installing wrk2 ==="
 git clone --depth 1 https://github.com/giltene/wrk2.git /tmp/wrk2
 cd /tmp/wrk2
-make -j$(nproc) WITH_LUAJIT=/usr/include/luajit-2.1 WITH_OPENSSL=/usr/include/openssl
+# Patch Makefile to use system LuaJIT and zlib for ARM64 compatibility
+sed -i 's|DEPS    := $(LDIR)/libluajit.a|DEPS    :=|g' Makefile
+sed -i 's|-lluajit|-lluajit-5.1|g' Makefile
+sed -i 's|-L$(LDIR)||g' Makefile
+sed -i 's|CFLAGS  += -std=c99|CFLAGS  += -std=c99 -I/usr/include/luajit-2.1|g' Makefile
+sed -i 's|-lpthread|-lpthread -lz|g' Makefile
+make -j$(nproc)
 cp wrk /usr/local/bin/wrk2
 cd /
 
