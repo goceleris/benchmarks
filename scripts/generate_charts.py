@@ -27,6 +27,9 @@ COLORS = {
     "stdhttp-hybrid": "#1abc9c",
     "fiber-h1": "#e74c3c",
     "iris-h2": "#9b59b6",
+    "gin-h1": "#e91e63",
+    "chi-h1": "#00bcd4",
+    "echo-h1": "#ff5722",
     # Theoretical - epoll
     "epoll-h1": "#27ae60",
     "epoll-h2": "#229954",
@@ -38,7 +41,7 @@ COLORS = {
 }
 
 CATEGORIES = {
-    "baseline": ["stdhttp-h1", "stdhttp-h2", "stdhttp-hybrid", "fiber-h1", "iris-h2"],
+    "baseline": ["stdhttp-h1", "stdhttp-h2", "stdhttp-hybrid", "fiber-h1", "iris-h2", "gin-h1", "chi-h1", "echo-h1"],
     "epoll": ["epoll-h1", "epoll-h2", "epoll-hybrid"],
     "iouring": ["iouring-h1", "iouring-h2", "iouring-hybrid"],
 }
