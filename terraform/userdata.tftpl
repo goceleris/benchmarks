@@ -18,7 +18,7 @@ REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
 echo "=== Installing Dependencies ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip libssl-dev libluajit-5.1-dev
+apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip libssl-dev libluajit-5.1-dev zlib1g-dev
 
 # Install Go 1.22
 echo "=== Installing Go ==="

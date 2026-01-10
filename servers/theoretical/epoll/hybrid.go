@@ -116,7 +116,7 @@ func (s *HybridServer) acceptConnections() {
 			continue
 		}
 
-		unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 		event := &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET,
