@@ -53,6 +53,8 @@ if [ ! -f /usr/local/bin/wrk2 ]; then
     sed -i 's|LDFLAGS += -L$(LDIR)||' Makefile
     sed -i 's|$(LDIR)/libluajit.a||' Makefile
     sed -i 's|cd $(LDIR) && ./luajit|luajit|' Makefile
+    # Fix source code compatibility with LuaJIT 2.1
+    sed -i 's|struct luaL_reg|luaL_Reg|g' src/script.c
     
     make -j$(nproc)
     cp wrk /usr/local/bin/wrk2
