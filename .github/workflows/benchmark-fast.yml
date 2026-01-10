@@ -15,7 +15,7 @@ on:
       benchmark_mode:
         description: 'Benchmark servers to test'
         required: false
-        default: 'all'
+        default: 'baseline'
         type: choice
         options:
           - baseline
@@ -100,7 +100,7 @@ jobs:
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
@@ -138,7 +138,7 @@ jobs:
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
