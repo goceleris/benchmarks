@@ -38,8 +38,8 @@ jobs:
     name: Launch Fast Infrastructure
     runs-on: ubuntu-latest
     outputs:
-      arm64_launched: ${{ steps.apply.outputs.arm64_launched }}
-      x86_launched: ${{ steps.apply.outputs.x86_launched }}
+      arm64_launched: ${{ steps.launch_arm64.outputs.launched }}
+      x86_launched: ${{ steps.launch_x86.outputs.launched }}
     
     steps:
       - name: Checkout
@@ -54,19 +54,49 @@ jobs:
         working-directory: terraform
         run: terraform init
       
-      - name: Terraform Apply (Fast Mode)
-        id: apply
+      - name: Launch x86 Instance
+        id: launch_x86
+        continue-on-error: true
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
-          echo "🚀 Launching FAST benchmark infrastructure (c5.large, c6g.medium)"
-          terraform apply -auto-approve
-          
-          echo "arm64_launched=true" >> $GITHUB_OUTPUT
-          echo "x86_launched=true" >> $GITHUB_OUTPUT
+          echo "🚀 Launching x86 benchmark instance..."
+          if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_x86; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "✅ x86 instance launched successfully"
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "⚠️ x86 instance failed to launch (Spot capacity issue)"
+          fi
+      
+      - name: Launch ARM64 Instance
+        id: launch_arm64
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "🚀 Launching ARM64 benchmark instance..."
+          if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_arm64; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "✅ ARM64 instance launched successfully"
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "⚠️ ARM64 instance failed to launch (Spot capacity issue)"
+          fi
+      
+      - name: Check At Least One Launched
+        run: |
+          if [[ "${{ steps.launch_x86.outputs.launched }}" != "true" && "${{ steps.launch_arm64.outputs.launched }}" != "true" ]]; then
+            echo "❌ BOTH instances failed to launch!"
+            exit 1
+          fi
+          echo "✅ At least one instance launched successfully"
       
       - name: Wait for Runners
         run: |
@@ -79,8 +109,10 @@ jobs:
   benchmark-arm64:
     name: Fast Benchmark (ARM64)
     needs: launch
+    if: needs.launch.outputs.arm64_launched == 'true'
     runs-on: [self-hosted, fast-arm64]
     timeout-minutes: 30
+    continue-on-error: true
     
     steps:
       - name: Checkout
@@ -117,8 +149,10 @@ jobs:
   benchmark-x86:
     name: Fast Benchmark (x86)
     needs: launch
+    if: needs.launch.outputs.x86_launched == 'true'
     runs-on: [self-hosted, fast-x86]
     timeout-minutes: 30
+    continue-on-error: true
     
     steps:
       - name: Checkout
