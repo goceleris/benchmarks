@@ -55,6 +55,8 @@ if [ ! -f /usr/local/bin/wrk2 ]; then
     sed -i 's|cd $(LDIR) && ./luajit|luajit|' Makefile
     # Fix source code compatibility with LuaJIT 2.1
     sed -i 's|struct luaL_reg|luaL_Reg|g' src/script.c
+    # Fix ARM64 build by removing x86-specific header
+    sed -i 's|#include <x86intrin.h>||g' src/hdr_histogram.c
     
     make -j$(nproc)
     cp wrk /usr/local/bin/wrk2
