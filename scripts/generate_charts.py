@@ -238,7 +238,16 @@ def generate_summary_table(results: Dict[str, Any], output_dir: str):
         benchmark_types = ["simple", "json", "path", "big-request"]
         all_servers = CATEGORIES["baseline"] + CATEGORIES["epoll"] + CATEGORIES["iouring"]
         
+        # First pass: collect servers that have at least one result
+        servers_with_data = set()
+        for result in results.get("results", []):
+            servers_with_data.add(result.get("server"))
+        
         for server in all_servers:
+            # Skip servers with no data
+            if server not in servers_with_data:
+                continue
+                
             row = [server]
             for bench_type in benchmark_types:
                 for result in results.get("results", []):
