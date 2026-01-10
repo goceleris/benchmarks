@@ -91,18 +91,18 @@ jobs:
         with:
           go-version: '1.25'
       
-      - name: Build Server
+      - name: Build Server and Benchmark Tool
         run: |
           go mod download
           go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
       
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
-          chmod +x scripts/runner.sh
-          ./scripts/runner.sh "$BENCHMARK_MODE"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -129,18 +129,18 @@ jobs:
         with:
           go-version: '1.25'
       
-      - name: Build Server
+      - name: Build Server and Benchmark Tool
         run: |
           go mod download
           go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
       
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
-          chmod +x scripts/runner.sh
-          ./scripts/runner.sh "$BENCHMARK_MODE"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
       - name: Upload Results
         uses: actions/upload-artifact@v4

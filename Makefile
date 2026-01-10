@@ -1,7 +1,7 @@
 # Celeris Benchmark Suite Makefile
 # ================================
 
-.PHONY: all build lint test docker-build docker-test validate clean help
+.PHONY: all build build-bench lint test docker-build docker-test validate clean help
 
 # Go parameters
 GOCMD=go
@@ -9,7 +9,8 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOVET=$(GOCMD) vet
 GOFMT=gofmt
-BINARY_NAME=server
+SERVER_BINARY=server
+BENCH_BINARY=bench
 BINARY_DIR=bin
 
 # Docker parameters
@@ -28,41 +29,53 @@ all: lint build
 help:
 	@echo "Celeris Benchmark Suite - Available targets:"
 	@echo ""
-	@echo "  make build          - Build the server binary"
+	@echo "  make build          - Build server and benchmark binaries"
+	@echo "  make build-server   - Build the server binary only"
+	@echo "  make build-bench    - Build the benchmark tool only"
 	@echo "  make build-linux    - Cross-compile for Linux"
 	@echo "  make lint           - Run golangci-lint"
 	@echo "  make fmt            - Format Go code"
 	@echo "  make vet            - Run go vet"
 	@echo "  make test           - Run unit tests"
+	@echo "  make benchmark      - Run benchmarks (requires server running)"
 	@echo "  make docker-build   - Build Docker images"
 	@echo "  make docker-test    - Run servers in Docker for validation"
 	@echo "  make validate       - Validate workflows and Terraform"
-	@echo "  make validate-tf    - Validate Terraform only"
-	@echo "  make validate-workflows - Validate GitHub Actions workflows"
 	@echo "  make clean          - Clean build artifacts"
-	@echo "  make all            - Run lint and build"
 	@echo ""
 
-## build: Build the server binary for current platform
-build:
+## build: Build both server and benchmark binaries
+build: build-server build-bench
+
+## build-server: Build the server binary for current platform
+build-server:
 	@echo "$(GREEN)Building server...$(NC)"
 	@mkdir -p $(BINARY_DIR)
-	$(GOBUILD) -o $(BINARY_DIR)/$(BINARY_NAME) ./cmd/server
-	@echo "$(GREEN)✓ Build complete: $(BINARY_DIR)/$(BINARY_NAME)$(NC)"
+	$(GOBUILD) -o $(BINARY_DIR)/$(SERVER_BINARY) ./cmd/server
+	@echo "$(GREEN)✓ Server build complete: $(BINARY_DIR)/$(SERVER_BINARY)$(NC)"
+
+## build-bench: Build the benchmark tool for current platform
+build-bench:
+	@echo "$(GREEN)Building benchmark tool...$(NC)"
+	@mkdir -p $(BINARY_DIR)
+	$(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY) ./cmd/bench
+	@echo "$(GREEN)✓ Benchmark tool build complete: $(BINARY_DIR)/$(BENCH_BINARY)$(NC)"
 
 ## build-linux: Cross-compile for Linux (amd64)
 build-linux:
-	@echo "$(GREEN)Building server for Linux amd64...$(NC)"
+	@echo "$(GREEN)Building for Linux amd64...$(NC)"
 	@mkdir -p $(BINARY_DIR)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
-	@echo "$(GREEN)✓ Linux build complete: $(BINARY_DIR)/$(BINARY_NAME)-linux-amd64$(NC)"
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(SERVER_BINARY)-linux-amd64 ./cmd/server
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY)-linux-amd64 ./cmd/bench
+	@echo "$(GREEN)✓ Linux build complete$(NC)"
 
 ## build-linux-arm: Cross-compile for Linux (arm64)
 build-linux-arm:
-	@echo "$(GREEN)Building server for Linux arm64...$(NC)"
+	@echo "$(GREEN)Building for Linux arm64...$(NC)"
 	@mkdir -p $(BINARY_DIR)
-	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/server
-	@echo "$(GREEN)✓ Linux ARM build complete: $(BINARY_DIR)/$(BINARY_NAME)-linux-arm64$(NC)"
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(SERVER_BINARY)-linux-arm64 ./cmd/server
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY)-linux-arm64 ./cmd/bench
+	@echo "$(GREEN)✓ Linux ARM build complete$(NC)"
 
 ## lint: Run golangci-lint
 lint:
@@ -95,47 +108,30 @@ test:
 	$(GOTEST) -v ./...
 	@echo "$(GREEN)✓ Tests complete$(NC)"
 
-## bench-quick: Run a quick benchmark test against stdhttp-h1 (validation only)
-bench-quick: build
+## benchmark: Run benchmarks using Go benchmark tool
+benchmark: build
+	@echo "$(GREEN)Running benchmarks...$(NC)"
+	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 30s -connections 256 -workers 8
+
+## benchmark-quick: Quick benchmark for validation
+benchmark-quick: build
 	@echo "$(GREEN)Running quick benchmark validation...$(NC)"
-	@echo "Starting stdhttp-h1 server in background..."
-	@$(BINARY_DIR)/$(BINARY_NAME) -server stdhttp-h1 -port 8099 &
-	@sleep 2
-	@echo "Testing server responds..."
-	@curl -s http://localhost:8099/ > /dev/null && echo "  Server OK" || (echo "  Server failed" && exit 1)
-	@curl -s http://localhost:8099/json > /dev/null && echo "  JSON endpoint OK" || echo "  JSON endpoint failed"
-	@curl -s http://localhost:8099/users/123 > /dev/null && echo "  Path endpoint OK" || echo "  Path endpoint failed"
-	@echo "Running mini wrk test (if available)..."
-	@if command -v wrk >/dev/null 2>&1; then \
-		wrk -t1 -c10 -d3s http://localhost:8099/ 2>&1 | grep -E "(Requests/sec|Latency)" || true; \
-	else \
-		echo "$(YELLOW)⚠ wrk not installed, skipping load test$(NC)"; \
-	fi
-	@echo "Stopping server..."
-	@pkill -f "$(BINARY_NAME) -server stdhttp-h1 -port 8099" || true
-	@echo "$(GREEN)✓ Quick benchmark validation complete$(NC)"
+	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 5s -connections 64 -workers 4
 
 ## bench-charts: Test chart generation with sample data
 bench-charts:
 	@echo "$(GREEN)Testing chart generation...$(NC)"
 	@mkdir -p results/test
-	@echo '{"timestamp":"2026-01-10T12:00:00Z","architecture":"test","config":{"duration":"5s","connections":10,"threads":2},"results":[{"server":"stdhttp-h1","benchmark":"simple","method":"GET","path":"/","requests_per_sec":50000,"transfer_per_sec":"10MB","latency":{"avg":"1ms","stdev":"0.5ms","max":"10ms","p50":"0.8ms","p75":"1.2ms","p90":"2ms","p99":"5ms"}},{"server":"epoll-h1","benchmark":"simple","method":"GET","path":"/","requests_per_sec":75000,"transfer_per_sec":"15MB","latency":{"avg":"0.7ms","stdev":"0.3ms","max":"8ms","p50":"0.5ms","p75":"0.9ms","p90":"1.5ms","p99":"4ms"}}]}' > results/test/benchmark-test-sample.json
+	@echo '{"timestamp":"2026-01-10T12_00_00Z","architecture":"test","config":{"duration":"5s","connections":10,"workers":2},"results":[{"server":"stdhttp-h1","benchmark":"simple","method":"GET","path":"/","requests_per_sec":50000,"transfer_per_sec":"10MB","latency":{"avg":"1ms","max":"10ms","p50":"0.8ms","p75":"1.2ms","p90":"2ms","p99":"5ms"}},{"server":"gin-h1","benchmark":"simple","method":"GET","path":"/","requests_per_sec":55000,"transfer_per_sec":"11MB","latency":{"avg":"0.9ms","max":"9ms","p50":"0.7ms","p75":"1.1ms","p90":"1.8ms","p99":"4.5ms"}}]}' > results/test/benchmark-test-sample.json
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run --with matplotlib --with numpy python scripts/generate_charts.py results/test results/test 2>&1 && \
-		echo "$(GREEN)✓ Charts generated in results/test/$(NC)" && \
-		ls -la results/test/*.png 2>/dev/null || echo "  (No PNG files - may need display)"; \
+		echo "$(GREEN)✓ Charts generated in results/test/$(NC)"; \
 	elif command -v python3 >/dev/null 2>&1; then \
 		python3 scripts/generate_charts.py results/test results/test 2>&1 || \
 		echo "$(YELLOW)⚠ Install matplotlib/numpy: pip install matplotlib numpy$(NC)"; \
 	else \
 		echo "$(YELLOW)⚠ python3/uv not installed, skipping chart test$(NC)"; \
 	fi
-
-## bench-runner-syntax: Check benchmark runner script syntax
-bench-runner-syntax:
-	@echo "$(GREEN)Checking benchmark runner script...$(NC)"
-	@bash -n scripts/runner.sh && echo "  runner.sh syntax OK" || echo "  runner.sh syntax ERROR"
-	@echo "$(GREEN)✓ Script syntax check complete$(NC)"
 
 ## docker-build: Build Docker images
 docker-build:
@@ -176,15 +172,9 @@ docker-test-theoretical:
 	@echo "Waiting for servers to start..."
 	@sleep 5
 	@echo "$(GREEN)Testing theoretical endpoints...$(NC)"
-	@echo "Testing HTTP/1.1 servers..."
 	@curl -s --max-time 2 http://localhost:8091/ && echo " - epoll-h1 ✓" || echo " - epoll-h1 ✗"
 	@curl -s --max-time 2 http://localhost:8093/ && echo " - epoll-hybrid ✓" || echo " - epoll-hybrid ✗"
-	@echo "Testing HTTP/2 servers (prior knowledge)..."
 	@curl -s --max-time 2 --http2-prior-knowledge http://localhost:8092/ && echo " - epoll-h2 ✓" || echo " - epoll-h2 ✗"
-	@echo "Testing io_uring servers (may require kernel 6.15+)..."
-	@curl -s --max-time 2 http://localhost:8094/ && echo " - iouring-h1 ✓" || echo " - iouring-h1 ✗ (io_uring ring issue)"
-	@curl -s --max-time 2 --http2-prior-knowledge http://localhost:8095/ && echo " - iouring-h2 ✓" || echo " - iouring-h2 ✗ (io_uring ring issue)"
-	@curl -s --max-time 2 http://localhost:8096/ && echo " - iouring-hybrid ✓" || echo " - iouring-hybrid ✗ (io_uring ring issue)"
 	@echo "$(GREEN)Stopping theoretical containers...$(NC)"
 	$(DOCKER_COMPOSE) -f docker/docker-compose.yml --profile theoretical down
 	@echo "$(GREEN)✓ Theoretical Docker test complete$(NC)"

@@ -18,7 +18,7 @@ REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
 echo "=== Installing Dependencies ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip libssl-dev libluajit-5.1-dev zlib1g-dev luajit
+apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip
 
 # Install Go 1.22
 echo "=== Installing Go ==="
@@ -33,37 +33,6 @@ rm -rf /usr/local/go
 tar -C /usr/local -xzf "go$${GO_VERSION}.linux-$${GO_ARCH}.tar.gz"
 export PATH=$PATH:/usr/local/go/bin
 echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-
-# Install wrk
-echo "=== Installing wrk ==="
-git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk
-cd /tmp/wrk
-make -j$(nproc)
-cp wrk /usr/local/bin/
-cd /
-
-# Install wrk2 for latency testing
-echo "=== Installing wrk2 ==="
-if [ ! -f /usr/local/bin/wrk2 ]; then
-    git clone --depth 1 https://github.com/giltene/wrk2.git /tmp/wrk2
-    cd /tmp/wrk2
-    # Patch Makefile to use system LuaJIT and zlib for ARM64 compatibility
-    sed -i 's|LIBS    := -lluajit $(LIBS)|LIBS    := -lluajit-5.1 $(LIBS) -lz|' Makefile
-    sed -i 's|CFLAGS  += -I$(LDIR)|CFLAGS  += -I/usr/include/luajit-2.1|' Makefile
-    sed -i 's|LDFLAGS += -L$(LDIR)||' Makefile
-    sed -i 's|$(LDIR)/libluajit.a||' Makefile
-    sed -i 's|cd $(LDIR) && ./luajit|luajit|' Makefile
-    # Fix source code compatibility with LuaJIT 2.1
-    sed -i 's|struct luaL_reg|luaL_Reg|g' src/script.c
-    # Fix ARM64 build by removing x86-specific header
-    sed -i 's|#include <x86intrin.h>||g' src/hdr_histogram.c
-    
-    make -j$(nproc)
-    cp wrk /usr/local/bin/wrk2
-    cd /
-else
-    echo "wrk2 already installed"
-fi
 
 # Create runner directory
 echo "=== Setting up GitHub Actions Runner ==="

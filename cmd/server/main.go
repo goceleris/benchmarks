@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 
+	"github.com/goceleris/benchmarks/servers/baseline/chi"
+	"github.com/goceleris/benchmarks/servers/baseline/echo"
 	"github.com/goceleris/benchmarks/servers/baseline/fiber"
+	"github.com/goceleris/benchmarks/servers/baseline/gin"
 	irisserver "github.com/goceleris/benchmarks/servers/baseline/iris"
 	"github.com/goceleris/benchmarks/servers/baseline/stdhttp"
 )
@@ -43,6 +46,18 @@ func main() {
 		server := irisserver.NewServer(*port)
 		err = server.Run()
 
+	case "gin-h1":
+		server := gin.NewServer(*port)
+		err = server.Run()
+
+	case "chi-h1":
+		server := chi.NewServer(*port)
+		err = server.Run()
+
+	case "echo-h1":
+		server := echo.NewServer(*port)
+		err = server.Run()
+
 	// Theoretical servers will be added here
 	case "epoll-h1", "epoll-h2", "epoll-hybrid":
 		log.Printf("Epoll server %s - Linux only", *serverType)
@@ -55,7 +70,7 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown server type: %s\n", *serverType)
 		fmt.Fprintf(os.Stderr, "Available types:\n")
-		fmt.Fprintf(os.Stderr, "  Baseline: stdhttp-h1, stdhttp-h2, stdhttp-hybrid, fiber-h1, iris-h2\n")
+		fmt.Fprintf(os.Stderr, "  Baseline: stdhttp-h1, stdhttp-h2, stdhttp-hybrid, fiber-h1, iris-h2, gin-h1, chi-h1, echo-h1\n")
 		fmt.Fprintf(os.Stderr, "  Theoretical: epoll-h1, epoll-h2, epoll-hybrid, iouring-h1, iouring-h2, iouring-hybrid\n")
 		os.Exit(1)
 	}

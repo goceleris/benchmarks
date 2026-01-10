@@ -12,10 +12,23 @@ This repository contains comprehensive benchmarks for testing HTTP server perfor
 - **std/http Hybrid** - HTTP/1.1 + H2C auto-detection
 - **Fiber** - HTTP/1.1 only
 - **Iris** - H2C only
+- **Gin** - HTTP/1.1
+- **Chi** - HTTP/1.1
+- **Echo** - HTTP/1.1
 
 ### Theoretical Maximum Implementations
 - **epoll** - Barebones servers using raw `epoll` syscalls
 - **io_uring** - Barebones servers using `io_uring` with multishot
+
+## Benchmark Tool
+
+This suite includes a custom Go benchmarking tool (`cmd/bench`) designed for maximum throughput testing:
+
+- High-concurrency workers using goroutines
+- Accurate latency percentiles (p50, p90, p99, p99.9)
+- Connection pooling with keep-alive
+- Progressive load testing to find max RPS
+- JSON output compatible with chart generation
 
 ## Benchmark Modes
 
@@ -43,16 +56,28 @@ This repository contains comprehensive benchmarks for testing HTTP server perfor
 | Simple | `GET /` | Plain text response |
 | JSON | `GET /json` | JSON serialization |
 | Path | `GET /users/:id` | Path parameter extraction |
-| Big Request | `POST /upload` | 1KB body handling |
+| Big Request | `POST /upload` | 4KB body handling |
 
 ## Running Locally
 
 ### Build and Test
 ```bash
-make build           # Build server binary
+make build           # Build server and benchmark binaries
 make lint            # Run golangci-lint
-make bench-quick     # Quick local benchmark test
+make benchmark-quick # Quick local benchmark test
 make bench-charts    # Test chart generation
+```
+
+### Run Benchmarks
+```bash
+# Build everything
+make build
+
+# Run baseline benchmarks (30s duration)
+./bin/bench -mode baseline -duration 30s -connections 256 -workers 8
+
+# Run all benchmarks with custom settings
+./bin/bench -mode all -duration 60s -connections 512 -workers 16
 ```
 
 ### Docker Validation
@@ -63,18 +88,18 @@ make docker-test-theoretical  # Test theoretical servers (Linux)
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.22+
 - Linux kernel 6.15+ (for io_uring multishot)
 - AWS credentials (for cloud benchmarks)
 - Docker (for local validation)
-- uv (for Python chart generation)
+- Python with matplotlib/numpy (for chart generation)
 
 ## Infrastructure
 
 The benchmark infrastructure uses:
 - **Terraform** for AWS Spot Instance provisioning
 - **GitHub Actions** self-hosted runners (ephemeral)
-- **wrk/wrk2** for throughput and latency testing
+- **Custom Go benchmark tool** for throughput and latency testing
 
 ### Instance Types
 
