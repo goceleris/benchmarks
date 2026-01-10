@@ -133,7 +133,7 @@ func (s *HTTP1Server) acceptConnections() {
 		}
 
 		// Set TCP_NODELAY for low latency
-		unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 		// Add to epoll (edge-triggered)
 		event := &unix.EpollEvent{

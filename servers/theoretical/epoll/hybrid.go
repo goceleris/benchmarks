@@ -223,7 +223,7 @@ func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) {
 }
 
 func (s *HybridServer) closeConnection(fd int) {
-	unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Close(fd)
 	delete(s.connState, fd)
 }

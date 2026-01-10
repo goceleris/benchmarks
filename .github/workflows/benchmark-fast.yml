@@ -22,6 +22,10 @@ on:
           - theoretical
           - all
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
   TF_VAR_benchmark_mode: fast

@@ -197,7 +197,7 @@ func (s *HTTP2Server) submitMultishotRecv(fd int) {
 	sqe.OpcodeFlags = IORING_RECV_MULTISHOT | (bufferGroup << 16)
 	sqe.UserData = uint64(fd)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -212,7 +212,7 @@ func (s *HTTP2Server) submitSend(fd int, data []byte) {
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -269,7 +269,7 @@ func (s *HTTP2Server) reprovideBuffer(bufIdx int) {
 	sqe.Off = uint64(bufIdx)
 	sqe.OpcodeFlags = bufferGroup
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 

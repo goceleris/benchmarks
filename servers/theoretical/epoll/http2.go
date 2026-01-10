@@ -69,9 +69,9 @@ func (s *HTTP2Server) Run() error {
 	s.listenFd = listenFd
 
 	// Set socket options
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-	unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
 	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
@@ -280,7 +280,7 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	headersFrame[4] = h2FlagEndHeaders
 	binary.BigEndian.PutUint32(headersFrame[5:9], streamID)
 	copy(headersFrame[9:], headerBytes)
-	unix.Write(fd, headersFrame)
+	_, _ = unix.Write(fd, headersFrame)
 
 	// DATA frame
 	dataFrame := make([]byte, 9+len(bodyBytes))
@@ -295,7 +295,7 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 }
 
 func (s *HTTP2Server) closeConnection(fd int) {
-	unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
-	unix.Close(fd)
+	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+	_ = unix.Close(fd)
 	delete(s.connState, fd)
 }
