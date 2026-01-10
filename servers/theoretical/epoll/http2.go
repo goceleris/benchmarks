@@ -291,7 +291,7 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	dataFrame[4] = h2FlagEndStream
 	binary.BigEndian.PutUint32(dataFrame[5:9], streamID)
 	copy(dataFrame[9:], bodyBytes)
-	unix.Write(fd, dataFrame)
+	_, _ = unix.Write(fd, dataFrame)
 }
 
 func (s *HTTP2Server) closeConnection(fd int) {

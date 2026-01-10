@@ -147,7 +147,7 @@ func (s *HybridServer) setupBuffers() error {
 	sqe.OpcodeFlags = bufferGroup
 	sqe.UserData = 0
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 
 	_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
@@ -198,7 +198,7 @@ func (s *HybridServer) submitSend(fd int, data []byte) {
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -214,7 +214,7 @@ func (s *HybridServer) reprovideBuffer(bufIdx int) {
 	sqe.Off = uint64(bufIdx)
 	sqe.OpcodeFlags = bufferGroup
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 

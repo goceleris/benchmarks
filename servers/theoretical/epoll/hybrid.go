@@ -207,13 +207,13 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) {
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []byte) {
 	// Send 101 Switching Protocols
 	upgradeResponse := []byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
-	unix.Write(fd, upgradeResponse)
+	_, _ = unix.Write(fd, upgradeResponse)
 
 	// Send server preface (SETTINGS)
 	state.h2state.settingsSent = true
 	settingsFrame := make([]byte, 9)
 	settingsFrame[3] = h2FrameTypeSettings
-	unix.Write(fd, settingsFrame)
+	_, _ = unix.Write(fd, settingsFrame)
 }
 
 func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) {
