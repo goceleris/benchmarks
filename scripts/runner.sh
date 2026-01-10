@@ -79,7 +79,7 @@ case "$ARCH" in
 esac
 
 # Initialize results JSON
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H_%M_%SZ")
 RESULTS_FILE="${RESULTS_DIR}/benchmark-${ARCH_NAME}-${TIMESTAMP}.json"
 
 cat > "$RESULTS_FILE" << EOF
@@ -208,7 +208,11 @@ run_wrk2_latency() {
     
     # Run wrk2 with fixed rate
     local output
-    output=$(wrk2 -t$THREADS -c$CONNECTIONS -d$BENCHMARK_DURATION -R$LATENCY_RATE --latency "http://localhost:${PORT}${path}" 2>&1)
+    if ! output=$(wrk2 -t$THREADS -c$CONNECTIONS -d$BENCHMARK_DURATION -R$LATENCY_RATE --latency "http://localhost:${PORT}${path}" 2>&1); then
+        log_error "wrk2 failed to execute:"
+        echo "$output"
+        return
+    fi
     
     # Parse detailed latency
     local p50=$(echo "$output" | grep "50.000%" | awk '{print $2}')
