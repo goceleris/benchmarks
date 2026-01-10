@@ -182,7 +182,7 @@ func (s *HTTP2Server) submitMultishotAccept() {
 	sqe.OpcodeFlags = IORING_ACCEPT_MULTISHOT
 	sqe.UserData = uint64(s.listenFd)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -234,7 +234,7 @@ func (s *HTTP2Server) eventLoop() error {
 			if fd == s.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &h2ioConnState{}
 					s.submitMultishotRecv(connFd)
 				}

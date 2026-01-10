@@ -74,7 +74,7 @@ func (s *HTTP2Server) Run() error {
 	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	addr := &unix.SockaddrInet4{Port: portNum}
 	if err := unix.Bind(listenFd, addr); err != nil {

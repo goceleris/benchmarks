@@ -294,7 +294,7 @@ func (s *HTTP1Server) submitSend(fd int, data []byte) {
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32) // Mark as send
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -319,7 +319,7 @@ func (s *HTTP1Server) eventLoop() error {
 				// Accept completion
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.submitMultishotRecv(connFd)
 				}
 			} else if !isSend {
@@ -357,7 +357,7 @@ func (s *HTTP1Server) reprovideBuffer(bufIdx int) {
 	sqe.Off = uint64(bufIdx)
 	sqe.OpcodeFlags = bufferGroup
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 

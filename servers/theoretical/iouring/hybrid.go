@@ -236,7 +236,7 @@ func (s *HybridServer) eventLoop() error {
 			if fd == s.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO}
 					s.submitMultishotRecv(connFd)
 				}

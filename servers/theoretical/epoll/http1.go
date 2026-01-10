@@ -60,7 +60,7 @@ func (s *HTTP1Server) Run() error {
 
 	// Parse port
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	// Bind
 	addr := &unix.SockaddrInet4{Port: portNum}

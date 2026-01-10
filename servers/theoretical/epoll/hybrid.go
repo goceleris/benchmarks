@@ -53,7 +53,7 @@ func (s *HybridServer) Run() error {
 	unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
 	var portNum int
-	fmt.Sscanf(s.port, "%d", &portNum)
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
 
 	addr := &unix.SockaddrInet4{Port: portNum}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -74,7 +74,7 @@ func (s *HybridServer) Run() error {
 		Events: unix.EPOLLIN | unix.EPOLLET,
 		Fd:     int32(listenFd),
 	}
-	unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
+	_ = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
 
 	log.Printf("epoll-hybrid server listening on port %s", s.port)
 	return s.eventLoop()
@@ -122,7 +122,7 @@ func (s *HybridServer) acceptConnections() {
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
 		}
-		unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
 		s.connState[connFd] = &hybridConnState{
 			buf:      make([]byte, 16384),
@@ -201,7 +201,7 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) {
 		response = response404
 	}
 
-	unix.Write(fd, response)
+	_, _ = unix.Write(fd, response)
 }
 
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []byte) {
@@ -224,6 +224,6 @@ func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) {
 
 func (s *HybridServer) closeConnection(fd int) {
 	unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
-	unix.Close(fd)
+	_ = unix.Close(fd)
 	delete(s.connState, fd)
 }
