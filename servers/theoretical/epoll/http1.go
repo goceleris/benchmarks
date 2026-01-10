@@ -174,6 +174,31 @@ func (s *HTTP1Server) handleRead(fd int) {
 }
 
 func (s *HTTP1Server) handleRequest(fd int, data []byte) {
+	// Wait for complete HTTP request (headers end with \r\n\r\n)
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		// Incomplete request, wait for more data
+		return
+	}
+
+	// For POST requests with Content-Length, ensure body is received
+	if bytes.HasPrefix(data, []byte("POST")) {
+		clIdx := bytes.Index(data, []byte("Content-Length: "))
+		if clIdx > 0 {
+			clEnd := bytes.Index(data[clIdx:], []byte("\r\n"))
+			if clEnd > 0 {
+				var contentLen int
+				_, _ = fmt.Sscanf(string(data[clIdx+16:clIdx+clEnd]), "%d", &contentLen)
+				bodyStart := headerEnd + 4
+				bodyReceived := len(data) - bodyStart
+				if bodyReceived < contentLen {
+					// Body not fully received yet
+					return
+				}
+			}
+		}
+	}
+
 	// Minimal HTTP/1.1 parsing - just look at first line
 	var response []byte
 

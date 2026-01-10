@@ -187,6 +187,29 @@ func (s *HybridServer) handleRead(fd int) {
 }
 
 func (s *HybridServer) handleHTTP1(fd int, data []byte) {
+	// Wait for complete HTTP request (headers end with \r\n\r\n)
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return // Incomplete request
+	}
+
+	// For POST requests with Content-Length, ensure body is received
+	if bytes.HasPrefix(data, []byte("POST")) {
+		clIdx := bytes.Index(data, []byte("Content-Length: "))
+		if clIdx > 0 {
+			clEnd := bytes.Index(data[clIdx:], []byte("\r\n"))
+			if clEnd > 0 {
+				var contentLen int
+				_, _ = fmt.Sscanf(string(data[clIdx+16:clIdx+clEnd]), "%d", &contentLen)
+				bodyStart := headerEnd + 4
+				bodyReceived := len(data) - bodyStart
+				if bodyReceived < contentLen {
+					return // Body not fully received
+				}
+			}
+		}
+	}
+
 	var response []byte
 
 	if bytes.HasPrefix(data, []byte("GET / ")) {
