@@ -218,20 +218,43 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: Debug Artifact Structure
+        run: |
+          echo "=== Checking downloaded artifact structure ==="
+          echo "ARM64 results:"
+          find results/arm64 -name "*.json" 2>/dev/null || echo "  No JSON files found"
+          ls -laR results/arm64 2>/dev/null || echo "  Directory not found"
+          echo ""
+          echo "x86 results:"
+          find results/x86 -name "*.json" 2>/dev/null || echo "  No JSON files found"
+          ls -laR results/x86 2>/dev/null || echo "  Directory not found"
+      
       - name: Generate Charts
         run: |
           pip install matplotlib numpy
           
+          # Find and use JSON files wherever they are in the download structure
+          ARM64_JSON=$(find results/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
+          X86_JSON=$(find results/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
+          
           # Generate charts for ARM64
-          if [ -d "results/arm64" ] && ls results/arm64/*.json 1>/dev/null 2>&1; then
+          if [ -n "$ARM64_JSON" ]; then
+            ARM64_DIR=$(dirname "$ARM64_JSON")
+            echo "Found ARM64 results in: $ARM64_DIR"
             mkdir -p results/charts/arm64
-            python scripts/generate_charts.py results/arm64 results/charts/arm64
+            python scripts/generate_charts.py "$ARM64_DIR" results/charts/arm64
+          else
+            echo "No ARM64 JSON results found"
           fi
           
           # Generate charts for x86
-          if [ -d "results/x86" ] && ls results/x86/*.json 1>/dev/null 2>&1; then
+          if [ -n "$X86_JSON" ]; then
+            X86_DIR=$(dirname "$X86_JSON")
+            echo "Found x86 results in: $X86_DIR"
             mkdir -p results/charts/x86
-            python scripts/generate_charts.py results/x86 results/charts/x86
+            python scripts/generate_charts.py "$X86_DIR" results/charts/x86
+          else
+            echo "No x86 JSON results found"
           fi
       
       - name: Upload Charts Artifact
