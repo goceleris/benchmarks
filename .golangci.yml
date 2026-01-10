@@ -4,7 +4,7 @@ run:
   timeout: 5m
 
 linters:
-  # Use defaults plus some additional linters
+  default: standard
   enable:
     - errcheck
     - govet
@@ -23,13 +23,8 @@ formatters:
       local-prefixes:
         - github.com/goceleris/benchmarks
 
-linters-settings:
-  misspell:
-    locale: US
-
 issues:
   exclude-rules:
-    # Exclude some linters from running on tests files
     - path: _test\.go
       linters:
         - errcheck
