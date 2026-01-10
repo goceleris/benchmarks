@@ -18,7 +18,7 @@ REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
 echo "=== Installing Dependencies ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip libssl-dev
+apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip libssl-dev libluajit-5.1-dev
 
 # Install Go 1.22
 echo "=== Installing Go ==="
@@ -46,7 +46,7 @@ cd /
 echo "=== Installing wrk2 ==="
 git clone --depth 1 https://github.com/giltene/wrk2.git /tmp/wrk2
 cd /tmp/wrk2
-make -j$(nproc)
+make -j$(nproc) WITH_LUAJIT=/usr/include/luajit-2.1 WITH_OPENSSL=/usr/include/openssl
 cp wrk /usr/local/bin/wrk2
 cd /
 

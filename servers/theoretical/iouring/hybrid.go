@@ -168,7 +168,7 @@ func (s *HybridServer) submitMultishotAccept() {
 	sqe.OpcodeFlags = IORING_ACCEPT_MULTISHOT
 	sqe.UserData = uint64(s.listenFd)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
@@ -183,7 +183,7 @@ func (s *HybridServer) submitMultishotRecv(fd int) {
 	sqe.OpcodeFlags = IORING_RECV_MULTISHOT | (bufferGroup << 16)
 	sqe.UserData = uint64(fd)
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 

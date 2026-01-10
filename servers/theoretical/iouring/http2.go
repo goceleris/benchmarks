@@ -161,7 +161,7 @@ func (s *HTTP2Server) setupBuffers() error {
 	sqe.OpcodeFlags = bufferGroup
 	sqe.UserData = 0
 
-	s.sqArray[idx] = uint32(idx)
+	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 
 	_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
