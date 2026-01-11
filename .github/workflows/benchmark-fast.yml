@@ -15,7 +15,7 @@ on:
       benchmark_mode:
         description: 'Benchmark servers to test'
         required: false
-        default: 'all'
+        default: 'baseline'
         type: choice
         options:
           - baseline
@@ -132,16 +132,18 @@ jobs:
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fast-results-arm64
           path: results/
           retention-days: 7
+          if-no-files-found: ignore
 
   # ============================================================
   # Phase 2: Fast Benchmark (x86)
@@ -172,16 +174,18 @@ jobs:
       - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'baseline' }}
         run: |
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
       
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fast-results-x86
           path: results/
           retention-days: 7
+          if-no-files-found: ignore
 
   # ============================================================
   # Phase 3: Generate PR Comment
