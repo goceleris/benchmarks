@@ -28,19 +28,25 @@ var (
 	response404    = []byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nNot Found")
 )
 
+// connState tracks per-connection state for request accumulation.
+type connState struct {
+	buf []byte
+	pos int
+}
+
 // HTTP1Server is a barebones HTTP/1.1 server using raw epoll.
 type HTTP1Server struct {
-	port     string
-	epollFd  int
-	listenFd int
-	readBufs map[int][]byte
+	port      string
+	epollFd   int
+	listenFd  int
+	connState map[int]*connState
 }
 
 // NewHTTP1Server creates a new barebones epoll HTTP/1.1 server.
 func NewHTTP1Server(port string) *HTTP1Server {
 	return &HTTP1Server{
-		port:     port,
-		readBufs: make(map[int][]byte),
+		port:      port,
+		connState: make(map[int]*connState),
 	}
 }
 
@@ -142,20 +148,27 @@ func (s *HTTP1Server) acceptConnections() {
 		}
 		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
-		// Allocate read buffer
-		s.readBufs[connFd] = make([]byte, readBufSize)
+		// Initialize connection state with larger buffer for POST
+		s.connState[connFd] = &connState{
+			buf: make([]byte, readBufSize*2), // 8KB to hold headers + body
+			pos: 0,
+		}
 	}
 }
 
 func (s *HTTP1Server) handleRead(fd int) {
-	buf := s.readBufs[fd]
-	if buf == nil {
-		buf = make([]byte, readBufSize)
-		s.readBufs[fd] = buf
+	state := s.connState[fd]
+	if state == nil {
+		state = &connState{
+			buf: make([]byte, readBufSize*2),
+			pos: 0,
+		}
+		s.connState[fd] = state
 	}
 
+	// Read into buffer at current position
 	for {
-		n, err := unix.Read(fd, buf)
+		n, err := unix.Read(fd, state.buf[state.pos:])
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
@@ -167,18 +180,24 @@ func (s *HTTP1Server) handleRead(fd int) {
 			s.closeConnection(fd)
 			return
 		}
+		state.pos += n
 
-		// Parse request and send response
-		s.handleRequest(fd, buf[:n])
+		// Try to process accumulated data
+		if s.handleRequest(fd, state) {
+			// Request handled, reset buffer for next request
+			state.pos = 0
+		}
 	}
 }
 
-func (s *HTTP1Server) handleRequest(fd int, data []byte) {
+func (s *HTTP1Server) handleRequest(fd int, state *connState) bool {
+	data := state.buf[:state.pos]
+
 	// Wait for complete HTTP request (headers end with \r\n\r\n)
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		// Incomplete request, wait for more data
-		return
+		return false
 	}
 
 	// For POST requests with Content-Length, ensure body is received
@@ -193,7 +212,7 @@ func (s *HTTP1Server) handleRequest(fd int, data []byte) {
 				bodyReceived := len(data) - bodyStart
 				if bodyReceived < contentLen {
 					// Body not fully received yet
-					return
+					return false
 				}
 			}
 		}
@@ -229,12 +248,13 @@ func (s *HTTP1Server) handleRequest(fd int, data []byte) {
 
 	// Write response directly
 	_, _ = unix.Write(fd, response)
+	return true
 }
 
 func (s *HTTP1Server) closeConnection(fd int) {
 	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Close(fd)
-	delete(s.readBufs, fd)
+	delete(s.connState, fd)
 }
 
 // ListenAddr returns the server's listen address.
