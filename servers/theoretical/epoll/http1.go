@@ -182,37 +182,47 @@ func (s *HTTP1Server) handleRead(fd int) {
 		}
 		state.pos += n
 
-		// Try to process accumulated data
-		if s.handleRequest(fd, state) {
-			// Request handled, reset buffer for next request
-			state.pos = 0
+		// Try to process accumulated data (may handle multiple pipelined requests)
+		for {
+			consumed := s.handleRequest(fd, state)
+			if consumed == 0 {
+				break // No complete request yet
+			}
+			// Shift remaining data to front of buffer
+			remaining := state.pos - consumed
+			if remaining > 0 {
+				copy(state.buf, state.buf[consumed:state.pos])
+			}
+			state.pos = remaining
 		}
 	}
 }
 
-func (s *HTTP1Server) handleRequest(fd int, state *connState) bool {
+func (s *HTTP1Server) handleRequest(fd int, state *connState) int {
 	data := state.buf[:state.pos]
 
 	// Wait for complete HTTP request (headers end with \r\n\r\n)
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		// Incomplete request, wait for more data
-		return false
+		return 0
 	}
+
+	// Calculate total request length
+	requestLen := headerEnd + 4 // headers + \r\n\r\n
 
 	// For POST requests with Content-Length, ensure body is received
 	if bytes.HasPrefix(data, []byte("POST")) {
 		clIdx := bytes.Index(data, []byte("Content-Length: "))
-		if clIdx > 0 {
+		if clIdx > 0 && clIdx < headerEnd {
 			clEnd := bytes.Index(data[clIdx:], []byte("\r\n"))
 			if clEnd > 0 {
 				var contentLen int
 				_, _ = fmt.Sscanf(string(data[clIdx+16:clIdx+clEnd]), "%d", &contentLen)
-				bodyStart := headerEnd + 4
-				bodyReceived := len(data) - bodyStart
-				if bodyReceived < contentLen {
+				requestLen = headerEnd + 4 + contentLen
+				if state.pos < requestLen {
 					// Body not fully received yet
-					return false
+					return 0
 				}
 			}
 		}
@@ -248,7 +258,7 @@ func (s *HTTP1Server) handleRequest(fd int, state *connState) bool {
 
 	// Write response directly
 	_, _ = unix.Write(fd, response)
-	return true
+	return requestLen
 }
 
 func (s *HTTP1Server) closeConnection(fd int) {
