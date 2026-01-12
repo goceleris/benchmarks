@@ -16,7 +16,7 @@ import (
 
 const (
 	maxEvents    = 1024
-	readBufSize  = 4096
+	readBufSize  = 8192 // Larger buffer for POST bodies
 	writeBufSize = 4096
 )
 
@@ -252,7 +252,21 @@ func (s *HTTP1Server) handleRequest(fd int, state *connState) int {
 		}
 	} else if bytes.HasPrefix(data, []byte("POST /upload")) {
 		response = responseOK
+	} else if bytes.HasPrefix(data, []byte("POST ")) {
+		// Any other POST request - check if it's /upload with different spacing
+		lineEnd := bytes.Index(data, []byte("\r\n"))
+		if lineEnd > 0 && bytes.Contains(data[:lineEnd], []byte("/upload")) {
+			response = responseOK
+		} else {
+			log.Printf("Unmatched POST: %q", string(data[:min(lineEnd+1, 100)]))
+			response = response404
+		}
 	} else {
+		// Log what we received for debugging
+		lineEnd := bytes.Index(data, []byte("\r\n"))
+		if lineEnd > 0 && lineEnd < 100 {
+			log.Printf("Unmatched request: %q", string(data[:lineEnd]))
+		}
 		response = response404
 	}
 
