@@ -191,6 +191,11 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 				state.settingsSent = true
 			}
 		} else {
+			// Handle HTTP/1.1 health check fallback
+			if bytes.HasPrefix(data, []byte("GET / ")) {
+				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!")
+				_, _ = unix.Write(fd, response)
+			}
 			s.closeConnection(fd)
 			return
 		}

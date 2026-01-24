@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -22,6 +23,7 @@ type HybridServer struct {
 	cqTail    *uint32
 	sqMask    uint32
 	cqMask    uint32
+	sqeTail   uint32 // Local tracking
 	sqes      []IoUringSqe
 	cqes      []IoUringCqe
 	sqArray   []uint32
@@ -133,40 +135,64 @@ func (s *HybridServer) setupRing() error {
 
 	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
+	s.sqeTail = atomic.LoadUint32(s.sqTail)
+
 	return nil
 }
 
 func (s *HybridServer) submitAccept() {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
 	sqe.UserData = uint64(s.listenFd)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
+
+	// Immediate submit
+	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
 }
 
 func (s *HybridServer) submitRecv(fd int) {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
 	sqe.Len = bufferSize
-	sqe.Off = 0
-	sqe.Flags = 0
-	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(fd)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
 }
 
 func (s *HybridServer) submitSend(fd int, data []byte) {
@@ -174,32 +200,58 @@ func (s *HybridServer) submitSend(fd int, data []byte) {
 		state.inflightBuffers = append(state.inflightBuffers, data)
 	}
 
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_SEND
 	sqe.Fd = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
 }
 
 func (s *HybridServer) eventLoop() error {
 	for {
+		// Calculate pending submissions
+		sqTail := atomic.LoadUint32(s.sqTail)
+		sqHead := atomic.LoadUint32(s.sqHead)
+		toSubmit := sqTail - sqHead
+
+		// Enter kernel: submit pending SQEs and wait for at least 1 CQE
 		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
-			uintptr(*s.sqTail-*s.sqHead), 1, IORING_ENTER_GETEVENTS, 0, 0)
+			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
 		}
 
-		for head := *s.cqHead; head != *s.cqTail; head++ {
+		for {
+			head := atomic.LoadUint32(s.cqHead)
+			tail := atomic.LoadUint32(s.cqTail)
+
+			if head == tail {
+				break
+			}
+
 			idx := head & s.cqMask
 			cqe := &s.cqes[idx]
+
+			atomic.StoreUint32(s.cqHead, head+1)
 
 			fd := int(cqe.UserData & 0xFFFFFFFF)
 			isSend := (cqe.UserData>>32)&1 == 1
@@ -240,9 +292,8 @@ func (s *HybridServer) eventLoop() error {
 					delete(s.connState, fd)
 				}
 			}
-
-			*s.cqHead = head + 1
 		}
+
 	}
 }
 

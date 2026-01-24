@@ -7,88 +7,122 @@ package iouring
 import (
 	"bytes"
 	"fmt"
-	"log"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// ... (existing code)
-
 func (s *HTTP1Server) submitMultishotAccept() {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{} // Zero out
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
 	sqe.UserData = uint64(s.listenFd)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
+
+	// Immediate submit for accept (from PoC)
+	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
 }
 
 func (s *HTTP1Server) submitRecv(fd int) {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
 	sqe.Len = bufferSize
-	sqe.Off = 0
-	sqe.Flags = 0
-	sqe.Ioprio = 0
-	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(fd)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
 }
 
 func (s *HTTP1Server) submitSend(fd int, data []byte) {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
+	head := atomic.LoadUint32(s.sqHead)
+	next := s.sqeTail + 1
 
-	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
+	if next-head > uint32(sqeCount) {
+		return
+	}
+
+	idx := s.sqeTail & s.sqMask
 	sqe := &s.sqes[idx]
+	s.sqeTail = next
+
+	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_SEND
 	sqe.Fd = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32)
 
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
 }
 
 func (s *HTTP1Server) eventLoop() error {
 	for {
-		toSubmit := *s.sqTail - *s.sqHead
+		// Calculate pending submissions
+		sqTail := atomic.LoadUint32(s.sqTail)
+		sqHead := atomic.LoadUint32(s.sqHead)
+		toSubmit := sqTail - sqHead
 
+		// Enter kernel: submit pending SQEs and wait for at least 1 CQE
 		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
 			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
 		}
 
-		// Process completions
-		// Note: Without atomics, we assume io_uring_enter acts as barrier
-		head := *s.cqHead
-		if head == *s.cqTail {
-			continue
-		}
+		for {
+			head := atomic.LoadUint32(s.cqHead)
+			tail := atomic.LoadUint32(s.cqTail)
 
-		for ; head != *s.cqTail; head++ {
+			if head == tail {
+				break
+			}
+
 			idx := head & s.cqMask
 			cqe := &s.cqes[idx]
 
+			atomic.StoreUint32(s.cqHead, head+1)
+
 			if cqe.UserData == UserDataBufferProvision {
-				// Buffer provision completion or nop
-				*s.cqHead = head + 1
 				continue
 			}
 
@@ -123,9 +157,8 @@ func (s *HTTP1Server) eventLoop() error {
 					s.submitRecv(fd)
 				}
 			}
-
-			*s.cqHead = head + 1
 		}
+
 	}
 }
 
@@ -152,9 +185,9 @@ const (
 	IORING_ENTER_GETEVENTS = 1 << 0
 
 	// Buffer ring constants
-	ringSize    = 1024
-	sqeCount    = 1024
-	bufferCount = 16384 // Process up to 16k connections
+	ringSize    = 4096
+	sqeCount    = 4096
+	bufferCount = 16384
 	bufferSize  = 4096
 	bufferGroup = 0
 
@@ -240,6 +273,7 @@ type HTTP1Server struct {
 	cqTail   *uint32
 	sqMask   uint32
 	cqMask   uint32
+	sqeTail  uint32 // Local tracking of SQE tail for submissions
 	sqes     []IoUringSqe
 	cqes     []IoUringCqe
 	sqArray  []uint32
@@ -292,7 +326,7 @@ func (s *HTTP1Server) Run() error {
 	}
 
 	// Submit multishot accept
-	log.Printf("Submitting initial Accept on fd %d", s.listenFd)
+	// log.Printf("Submitting initial Accept on fd %d", s.listenFd)
 	s.submitMultishotAccept()
 
 	// log.Printf("iouring-h1 server listening on port %s", s.port)
@@ -343,6 +377,8 @@ func (s *HTTP1Server) setupRing() error {
 	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
 
 	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
+
+	s.sqeTail = atomic.LoadUint32(s.sqTail)
 
 	return nil
 }
