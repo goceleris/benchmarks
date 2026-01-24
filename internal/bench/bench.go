@@ -212,19 +212,3 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		Latency:        b.latencies.Percentiles(),
 	}
 }
-
-// bodyReader is a reusable body reader.
-type bodyReader struct {
-	data []byte
-	pos  int
-}
-
-func (r *bodyReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) {
-		r.pos = 0
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
-}

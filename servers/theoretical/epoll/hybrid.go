@@ -22,6 +22,7 @@ type HybridServer struct {
 
 type hybridConnState struct {
 	buf      []byte
+	pos      int // Current position in buffer for accumulation
 	protocol int // 0 = unknown, 1 = HTTP/1.1, 2 = H2C
 	h2state  *h2ConnState
 }
@@ -139,7 +140,8 @@ func (s *HybridServer) handleRead(fd int) {
 	}
 
 	for {
-		n, err := unix.Read(fd, state.buf)
+		// Read into buffer at current position
+		n, err := unix.Read(fd, state.buf[state.pos:])
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
@@ -151,12 +153,13 @@ func (s *HybridServer) handleRead(fd int) {
 			s.closeConnection(fd)
 			return
 		}
+		state.pos += n
 
-		data := state.buf[:n]
+		data := state.buf[:state.pos]
 
 		// Detect protocol on first read
 		if state.protocol == protoUnknown {
-			if n >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
+			if state.pos >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
 				state.protocol = protoH2C
 				state.h2state = &h2ConnState{buf: state.buf}
 			} else if bytes.HasPrefix(data, []byte("GET ")) ||
@@ -168,6 +171,7 @@ func (s *HybridServer) handleRead(fd int) {
 					state.protocol = protoH2C
 					state.h2state = &h2ConnState{buf: state.buf}
 					s.handleH2CUpgrade(fd, state, data)
+					state.pos = 0
 					continue
 				}
 				state.protocol = protoHTTP1
@@ -179,24 +183,30 @@ func (s *HybridServer) handleRead(fd int) {
 
 		switch state.protocol {
 		case protoHTTP1:
-			s.handleHTTP1(fd, data)
+			if s.handleHTTP1(fd, state) {
+				// Request handled, reset buffer for next request
+				state.pos = 0
+			}
 		case protoH2C:
 			s.handleH2C(fd, state.h2state, data)
+			state.pos = 0
 		}
 	}
 }
 
-func (s *HybridServer) handleHTTP1(fd int, data []byte) {
+func (s *HybridServer) handleHTTP1(fd int, state *hybridConnState) bool {
+	data := state.buf[:state.pos]
+
 	// Wait for complete HTTP request (headers end with \r\n\r\n)
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
-		return // Incomplete request
+		return false // Incomplete request
 	}
 
 	// For POST requests with Content-Length, ensure body is received
 	if bytes.HasPrefix(data, []byte("POST")) {
 		clIdx := bytes.Index(data, []byte("Content-Length: "))
-		if clIdx > 0 {
+		if clIdx > 0 && clIdx < headerEnd {
 			clEnd := bytes.Index(data[clIdx:], []byte("\r\n"))
 			if clEnd > 0 {
 				var contentLen int
@@ -204,7 +214,7 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) {
 				bodyStart := headerEnd + 4
 				bodyReceived := len(data) - bodyStart
 				if bodyReceived < contentLen {
-					return // Body not fully received
+					return false // Body not fully received
 				}
 			}
 		}
@@ -220,11 +230,20 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) {
 		response = responseSimple // Simplified
 	} else if bytes.HasPrefix(data, []byte("POST /upload")) {
 		response = responseOK
+	} else if bytes.HasPrefix(data, []byte("POST ")) {
+		// Any POST to /upload with different spacing
+		lineEnd := bytes.Index(data, []byte("\r\n"))
+		if lineEnd > 0 && bytes.Contains(data[:lineEnd], []byte("/upload")) {
+			response = responseOK
+		} else {
+			response = response404
+		}
 	} else {
 		response = response404
 	}
 
 	_, _ = unix.Write(fd, response)
+	return true
 }
 
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []byte) {
