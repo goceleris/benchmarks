@@ -63,13 +63,13 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
-          echo "🚀 Launching x86 benchmark instance..."
+          echo "Launching x86 benchmark instance..."
           if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_x86; then
             echo "launched=true" >> $GITHUB_OUTPUT
-            echo "✅ x86 instance launched successfully"
+            echo "[OK] x86 instance launched successfully"
           else
             echo "launched=false" >> $GITHUB_OUTPUT
-            echo "⚠️ x86 instance failed to launch (Spot capacity issue)"
+            echo "[WARN] x86 instance failed to launch (Spot capacity issue)"
           fi
       
       - name: Launch ARM64 Instance
@@ -81,22 +81,22 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
-          echo "🚀 Launching ARM64 benchmark instance..."
+          echo "Launching ARM64 benchmark instance..."
           if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_arm64; then
             echo "launched=true" >> $GITHUB_OUTPUT
-            echo "✅ ARM64 instance launched successfully"
+            echo "[OK] ARM64 instance launched successfully"
           else
             echo "launched=false" >> $GITHUB_OUTPUT
-            echo "⚠️ ARM64 instance failed to launch (Spot capacity issue)"
+            echo "[WARN] ARM64 instance failed to launch (Spot capacity issue)"
           fi
       
       - name: Check At Least One Launched
         run: |
           if [[ "${{ steps.launch_x86.outputs.launched }}" != "true" && "${{ steps.launch_arm64.outputs.launched }}" != "true" ]]; then
-            echo "❌ BOTH instances failed to launch!"
+            echo "[ERROR] BOTH instances failed to launch!"
             exit 1
           fi
-          echo "✅ At least one instance launched successfully"
+          echo "[OK] At least one instance launched successfully"
       
       - name: Wait for Runners
         run: |
@@ -274,7 +274,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Build PR comment body
-          COMMENT_BODY="## 🚀 Fast Benchmark Results (Preview)
+          COMMENT_BODY="## Fast Benchmark Results (Preview)
           
           > **Note**: These are quick validation results using virtualized instances.
           > For official results, run the Metal benchmark after merge.
@@ -285,12 +285,12 @@ jobs:
           # Add ARM64 results
           if [ -f "results/charts/arm64/summary_arm64.md" ]; then
             COMMENT_BODY+="
-          ### 🔵 ARM64 (Graviton)
+          ### ARM64 (Graviton)
           
           $(cat results/charts/arm64/summary_arm64.md | tail -n +2)
           
           <details>
-          <summary>📊 View ARM64 Raw Data</summary>
+          <summary>View ARM64 Raw Data</summary>
           
           \`\`\`json
           $(cat results/arm64/*.json 2>/dev/null | head -200)
@@ -302,9 +302,9 @@ jobs:
           "
           else
             COMMENT_BODY+="
-          ### 🔵 ARM64 (Graviton)
+          ### ARM64 (Graviton)
           
-          ⚠️ No ARM64 results available (benchmark may have failed)
+          [WARN] No ARM64 results available (benchmark may have failed)
           
           ---
           "
@@ -313,12 +313,12 @@ jobs:
           # Add x86 results
           if [ -f "results/charts/x86/summary_x86.md" ]; then
             COMMENT_BODY+="
-          ### 🟢 x86 (Intel)
+          ### x86 (Intel)
           
           $(cat results/charts/x86/summary_x86.md | tail -n +2)
           
           <details>
-          <summary>📊 View x86 Raw Data</summary>
+          <summary>View x86 Raw Data</summary>
           
           \`\`\`json
           $(cat results/x86/*.json 2>/dev/null | head -200)
@@ -330,9 +330,9 @@ jobs:
           "
           else
             COMMENT_BODY+="
-          ### 🟢 x86 (Intel)
+          ### x86 (Intel)
           
-          ⚠️ No x86 results available (benchmark may have failed)
+          [WARN] No x86 results available (benchmark may have failed)
           
           ---
           "
@@ -340,7 +340,7 @@ jobs:
           
           # Add chart artifacts link
           COMMENT_BODY+="
-          ### 📈 Charts
+          ### Charts
           
           Download the full benchmark charts from the [workflow artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
           
@@ -349,11 +349,11 @@ jobs:
           
           for chart_type in simple json path big-request; do
             COMMENT_BODY+="
-          | ${chart_type} throughput | ✅ | ✅ |"
+          | ${chart_type} throughput | OK | OK |"
           done
           
           COMMENT_BODY+="
-          | latency distribution | ✅ | ✅ |
+          | latency distribution | OK | OK |
           
           ---
           
@@ -382,7 +382,7 @@ jobs:
       
       - name: Create Summary
         run: |
-          echo "# 🚀 Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
+          echo "# Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: These are quick validation results using virtualized instances." >> $GITHUB_STEP_SUMMARY
           echo "> For official results, run the Metal benchmark after merge." >> $GITHUB_STEP_SUMMARY

@@ -2,6 +2,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -162,12 +163,17 @@ func (b *Benchmarker) worker(ctx context.Context) {
 func (b *Benchmarker) doRequest(ctx context.Context) (int, error) {
 	var body io.Reader
 	if len(b.config.Body) > 0 {
-		body = &bodyReader{data: b.config.Body}
+		body = bytes.NewReader(b.config.Body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, b.config.Method, b.config.URL, body)
 	if err != nil {
 		return 0, err
+	}
+
+	// Set Content-Length explicitly to avoid chunked transfer encoding
+	if len(b.config.Body) > 0 {
+		req.ContentLength = int64(len(b.config.Body))
 	}
 
 	for k, v := range b.config.Headers {

@@ -182,19 +182,14 @@ func (s *HTTP1Server) handleRead(fd int) {
 		}
 		state.pos += n
 
-		// Try to process accumulated data (may handle multiple pipelined requests)
-		for {
-			consumed := s.handleRequest(fd, state)
-			if consumed == 0 {
-				break // No complete request yet
-			}
-			// Shift remaining data to front of buffer
-			remaining := state.pos - consumed
-			if remaining > 0 {
-				copy(state.buf, state.buf[consumed:state.pos])
-			}
-			state.pos = remaining
+		// Try to process complete request
+		consumed := s.handleRequest(fd, state)
+		if consumed > 0 {
+			// Request handled, reset buffer for next request
+			// For keep-alive, simply reset - next request will arrive fresh
+			state.pos = 0
 		}
+		// If consumed == 0, we need more data - continue reading
 	}
 }
 
@@ -258,15 +253,9 @@ func (s *HTTP1Server) handleRequest(fd int, state *connState) int {
 		if lineEnd > 0 && bytes.Contains(data[:lineEnd], []byte("/upload")) {
 			response = responseOK
 		} else {
-			log.Printf("Unmatched POST: %q", string(data[:min(lineEnd+1, 100)]))
 			response = response404
 		}
 	} else {
-		// Log what we received for debugging
-		lineEnd := bytes.Index(data, []byte("\r\n"))
-		if lineEnd > 0 && lineEnd < 100 {
-			log.Printf("Unmatched request: %q", string(data[:lineEnd]))
-		}
 		response = response404
 	}
 
