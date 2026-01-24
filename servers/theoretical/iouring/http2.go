@@ -160,10 +160,10 @@ func (s *HTTP2Server) submitAccept() {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
-	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(s.listenFd)
 
 	s.sqArray[idx] = idx
@@ -190,7 +190,6 @@ func (s *HTTP2Server) submitRecv(fd int) {
 }
 
 func (s *HTTP2Server) submitSend(fd int, data []byte) {
-	// Keep a reference to the data to prevent GC/overwrite until completion
 	if state, ok := s.connState[fd]; ok {
 		state.inflightBuffers = append(state.inflightBuffers, data)
 	}
@@ -198,6 +197,7 @@ func (s *HTTP2Server) submitSend(fd int, data []byte) {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_SEND
 	sqe.Fd = int32(fd)

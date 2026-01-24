@@ -140,10 +140,10 @@ func (s *HybridServer) submitAccept() {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
-	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(s.listenFd)
 
 	s.sqArray[idx] = idx
@@ -177,6 +177,7 @@ func (s *HybridServer) submitSend(fd int, data []byte) {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_SEND
 	sqe.Fd = int32(fd)

@@ -19,14 +19,11 @@ func (s *HTTP1Server) submitMultishotAccept() {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
-	sqe.Addr = 0
-	sqe.Off = 0
-	sqe.Ioprio = 0 // Single Shot Accept
-	sqe.OpcodeFlags = 0
-	sqe.UserData = uint64(s.listenFd) // Mark as listen fd
+	sqe.UserData = uint64(s.listenFd)
 
 	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
@@ -56,12 +53,13 @@ func (s *HTTP1Server) submitSend(fd int, data []byte) {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out the SQE
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_SEND
 	sqe.Fd = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
 	sqe.Len = uint32(len(data))
-	sqe.UserData = uint64(fd) | (1 << 32) // Mark as send
+	sqe.UserData = uint64(fd) | (1 << 32)
 
 	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
@@ -154,8 +152,8 @@ const (
 	IORING_ENTER_GETEVENTS = 1 << 0
 
 	// Buffer ring constants
-	ringSize    = 256
-	sqeCount    = 256
+	ringSize    = 1024
+	sqeCount    = 1024
 	bufferCount = 16384 // Process up to 16k connections
 	bufferSize  = 4096
 	bufferGroup = 0
@@ -166,7 +164,7 @@ const (
 // Pre-built HTTP/1.1 responses
 var (
 	responseSimple = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
-	responseJSON   = []byte(`HTTP/1.1 200 OK` + "\r\n" + `Content-Type: application/json` + "\r\n" + `Content-Length: 50` + "\r\n" + `Connection: keep-alive` + "\r\n\r\n" + `{"message":"Hello, World!","server":"iouring-h1"}`)
+	responseJSON   = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"iouring-h1\"}")
 	responseOK     = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
 	response404    = []byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nNot Found")
 )
