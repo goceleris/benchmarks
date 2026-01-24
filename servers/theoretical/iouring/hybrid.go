@@ -36,12 +36,15 @@ type hybridioConnState struct {
 	prefaceRecv     bool
 	settingsSent    bool
 	inflightBuffers [][]byte
+	pos             int // Current buffer position
 }
 
 const (
 	protoUnknownIO = 0
 	protoHTTP1IO   = 1
 	protoH2CIO     = 2
+
+	// UserDataBufferProvision is defined in http1.go
 )
 
 // NewHybridServer creates a new barebones io_uring hybrid mux server.
@@ -169,6 +172,11 @@ func (s *HybridServer) submitAccept() {
 }
 
 func (s *HybridServer) submitRecv(fd int) {
+	state := s.connState[fd]
+	if state == nil {
+		return
+	}
+
 	head := atomic.LoadUint32(s.sqHead)
 	next := s.sqeTail + 1
 
@@ -183,8 +191,9 @@ func (s *HybridServer) submitRecv(fd int) {
 	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
-	sqe.Len = bufferSize
+	// Read into buffer at current position
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize+state.pos])))
+	sqe.Len = uint32(bufferSize - state.pos)
 	sqe.UserData = uint64(fd)
 
 	tail := s.sqeTail
@@ -253,6 +262,10 @@ func (s *HybridServer) eventLoop() error {
 
 			atomic.StoreUint32(s.cqHead, head+1)
 
+			if cqe.UserData == UserDataBufferProvision {
+				continue
+			}
+
 			fd := int(cqe.UserData & 0xFFFFFFFF)
 			isSend := (cqe.UserData>>32)&1 == 1
 
@@ -260,7 +273,7 @@ func (s *HybridServer) eventLoop() error {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO}
+					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO, pos: 0}
 
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
@@ -272,12 +285,33 @@ func (s *HybridServer) eventLoop() error {
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					dataLen := int(cqe.Res)
-					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
-					closed := s.handleData(fd, data)
+					n := int(cqe.Res)
+					state := s.connState[fd]
+					if state != nil {
+						state.pos += n
+						// Process available data
+						data := s.buffers[fd*bufferSize : fd*bufferSize+state.pos]
+						consumed, closed := s.handleData(fd, data)
 
-					if !closed {
-						s.submitRecv(fd)
+						if closed {
+							// Connection closed
+							_ = unix.Close(fd)
+							delete(s.connState, fd)
+						} else {
+							// Compact buffer if needed
+							if consumed > 0 {
+								copy(s.buffers[fd*bufferSize:], s.buffers[fd*bufferSize+consumed:fd*bufferSize+state.pos])
+								state.pos -= consumed
+							}
+
+							if state.pos >= bufferSize {
+								// Overflow
+								_ = unix.Close(fd)
+								delete(s.connState, fd)
+							} else {
+								s.submitRecv(fd)
+							}
+						}
 					}
 				} else if cqe.Res <= 0 {
 					_ = unix.Close(fd)
@@ -290,6 +324,9 @@ func (s *HybridServer) eventLoop() error {
 				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
+				} else if fd < bufferCount {
+					// Wait for next request
+					s.submitRecv(fd)
 				}
 			}
 		}
@@ -297,10 +334,10 @@ func (s *HybridServer) eventLoop() error {
 	}
 }
 
-func (s *HybridServer) handleData(fd int, data []byte) (closed bool) {
+func (s *HybridServer) handleData(fd int, data []byte) (consumed int, closed bool) {
 	state := s.connState[fd]
 	if state == nil {
-		return true
+		return 0, true
 	}
 
 	if state.protocol == protoUnknownIO {
@@ -311,7 +348,7 @@ func (s *HybridServer) handleData(fd int, data []byte) (closed bool) {
 			if bytes.Contains(data, []byte("Upgrade: h2c")) {
 				state.protocol = protoH2CIO
 				s.handleH2CUpgrade(fd, state)
-				return false
+				return len(data), false
 			}
 			state.protocol = protoHTTP1IO
 		} else {
@@ -320,36 +357,77 @@ func (s *HybridServer) handleData(fd int, data []byte) (closed bool) {
 			} else {
 				_ = unix.Close(fd)
 				delete(s.connState, fd)
-				return true
+				return 0, true
 			}
 		}
 	}
 
 	switch state.protocol {
 	case protoHTTP1IO:
-		return s.handleHTTP1(fd, data)
+		consumed, _ := s.handleHTTP1(fd, data)
+		return consumed, false
 	case protoH2CIO:
 		return s.handleH2C(fd, state, data)
 	default:
-		return false
+		return 0, false
 	}
 }
 
-func (s *HybridServer) handleHTTP1(fd int, data []byte) (closed bool) {
-	var response []byte
+func (s *HybridServer) handleHTTP1(fd int, data []byte) (consumed int, complete bool) {
+	// Basic HTTP/1.1 parsing
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return 0, false
+	}
 
-	if bytes.HasPrefix(data, []byte("GET / ")) {
+	reqLen := headerEnd + 4
+
+	// Check Content-Length for POST
+	if bytes.HasPrefix(data, []byte("POST")) {
+		clIdx := bytes.Index(data, []byte("Content-Length: "))
+		if clIdx > 0 && clIdx < headerEnd {
+			clEnd := bytes.Index(data[clIdx:], []byte("\r\n"))
+			if clEnd > 0 {
+				var contentLen int
+				_, _ = fmt.Sscanf(string(data[clIdx+16:clIdx+clEnd]), "%d", &contentLen)
+				reqLen += contentLen
+				if len(data) < reqLen {
+					return 0, false
+				}
+			}
+		}
+	}
+
+	var response []byte
+	requestData := data[:reqLen]
+
+	if bytes.HasPrefix(requestData, []byte("GET / ")) {
 		response = responseSimple
-	} else if bytes.HasPrefix(data, []byte("GET /json")) {
+	} else if bytes.HasPrefix(requestData, []byte("GET /json")) {
 		response = responseJSON
-	} else if bytes.HasPrefix(data, []byte("POST /upload")) {
+	} else if bytes.HasPrefix(requestData, []byte("GET /users/")) {
+		// Extract user ID from path
+		lineEnd := bytes.Index(requestData, []byte("\r\n"))
+		if lineEnd > 0 {
+			path := string(requestData[11:lineEnd])
+			spaceIdx := bytes.Index([]byte(path), []byte(" "))
+			if spaceIdx > 0 {
+				id := path[:spaceIdx]
+				resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\nUser ID: %s", 9+len(id), id)
+				response = []byte(resp)
+			}
+		}
+		if response == nil {
+			response = response404
+		}
+	} else if bytes.HasPrefix(requestData, []byte("POST /upload")) {
 		response = responseOK
 	} else {
 		response = response404
 	}
 
 	s.submitSend(fd, response)
-	return false
+	return reqLen, true
 }
 
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridioConnState) {
@@ -361,39 +439,43 @@ func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridioConnState) {
 	state.settingsSent = true
 }
 
-func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) (closed bool) {
+func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) (consumed int, closed bool) {
 	offset := 0
 
 	if !state.prefaceRecv {
-		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
-			state.prefaceRecv = true
-			offset = h2PrefaceLen
+		if len(data) >= h2PrefaceLen {
+			if string(data[:h2PrefaceLen]) == h2Preface {
+				state.prefaceRecv = true
+				offset = h2PrefaceLen
 
-			if !state.settingsSent {
-				s.submitSend(fd, frameSettings)
-				state.settingsSent = true
+				if !state.settingsSent {
+					s.submitSend(fd, frameSettings)
+					state.settingsSent = true
+				}
+			} else {
+				// Invalid preface?
+				_ = unix.Close(fd)
+				delete(s.connState, fd)
+				return 0, true
 			}
 		} else {
-			_ = unix.Close(fd)
-			delete(s.connState, fd)
-			return true
+			return 0, false
 		}
 	}
 
 	for offset+h2FrameHeaderLen <= len(data) {
 		length := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
+		totalFrameLen := h2FrameHeaderLen + length
+
+		if offset+totalFrameLen > len(data) {
+			break
+		}
+
 		frameType := data[offset+3]
 		flags := data[offset+4]
 		streamID := binary.BigEndian.Uint32(data[offset+5:offset+9]) & 0x7fffffff
 
-		offset += h2FrameHeaderLen
-
-		if offset+length > len(data) {
-			break
-		}
-
-		frameData := data[offset : offset+length]
-		offset += length
+		frameData := data[offset+h2FrameHeaderLen : offset+totalFrameLen]
 
 		switch frameType {
 		case h2FrameTypeSettings:
@@ -401,13 +483,16 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 				s.submitSend(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
-			s.handleH2Request(fd, streamID, frameData)
+			s.handleH2Request(fd, streamID, frameData, flags)
 		}
+
+		offset += totalFrameLen
 	}
-	return false
+
+	return offset, false
 }
 
-func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []byte) {
+func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
 	var headerBytes, dataBytes []byte
 
 	if bytes.Contains(headerBlock, []byte("/json")) {

@@ -62,6 +62,7 @@ type h2ioConnState struct {
 	prefaceRecv     bool
 	settingsSent    bool
 	inflightBuffers [][]byte // Keep buffers alive until completion
+	pos             int      // Current buffer position
 }
 
 // NewHTTP2Server creates a new barebones io_uring H2C server.
@@ -189,6 +190,11 @@ func (s *HTTP2Server) submitAccept() {
 }
 
 func (s *HTTP2Server) submitRecv(fd int) {
+	state := s.connState[fd]
+	if state == nil {
+		return
+	}
+
 	head := atomic.LoadUint32(s.sqHead)
 	next := s.sqeTail + 1
 
@@ -203,8 +209,9 @@ func (s *HTTP2Server) submitRecv(fd int) {
 	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
-	sqe.Len = bufferSize
+	// Read into buffer at current position
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize+state.pos])))
+	sqe.Len = uint32(bufferSize - state.pos)
 	sqe.UserData = uint64(fd)
 
 	tail := s.sqeTail
@@ -280,7 +287,7 @@ func (s *HTTP2Server) eventLoop() error {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					s.connState[connFd] = &h2ioConnState{}
+					s.connState[connFd] = &h2ioConnState{pos: 0}
 
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
@@ -292,12 +299,35 @@ func (s *HTTP2Server) eventLoop() error {
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					dataLen := int(cqe.Res)
-					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
-					closed := s.handleH2Data(fd, data)
+					n := int(cqe.Res)
+					state := s.connState[fd]
+					if state != nil {
+						state.pos += n
+						// Process available data
+						data := s.buffers[fd*bufferSize : fd*bufferSize+state.pos]
+						consumed, closed := s.handleH2Data(fd, data)
 
-					if !closed {
-						s.submitRecv(fd)
+						if closed {
+							// Connection closed by handler
+							_ = unix.Close(fd)
+							delete(s.connState, fd)
+						} else {
+							// Compact buffer if needed
+							if consumed > 0 {
+								copy(s.buffers[fd*bufferSize:], s.buffers[fd*bufferSize+consumed:fd*bufferSize+state.pos])
+								state.pos -= consumed
+							}
+
+							// If buffer full, we have a problem (frame too large)
+							// For benchmark, assume we recover space.
+							if state.pos >= bufferSize {
+								// Overflow protection: close connection
+								_ = unix.Close(fd)
+								delete(s.connState, fd)
+							} else {
+								s.submitRecv(fd)
+							}
+						}
 					}
 				} else if cqe.Res <= 0 {
 					_ = unix.Close(fd)
@@ -317,63 +347,77 @@ func (s *HTTP2Server) eventLoop() error {
 	}
 }
 
-func (s *HTTP2Server) handleH2Data(fd int, data []byte) (closed bool) {
+func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bool) {
 	state := s.connState[fd]
 	if state == nil {
-		return true
+		return 0, true
 	}
 
 	offset := 0
 
 	if !state.prefaceRecv {
-		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
-			state.prefaceRecv = true
-			offset = h2PrefaceLen
+		if len(data) >= h2PrefaceLen {
+			if string(data[:h2PrefaceLen]) == h2Preface {
+				state.prefaceRecv = true
+				offset = h2PrefaceLen
 
-			if !state.settingsSent {
-				s.submitSend(fd, frameSettings)
-				state.settingsSent = true
+				if !state.settingsSent {
+					s.submitSend(fd, frameSettings)
+					state.settingsSent = true
+				}
+			} else {
+				// Legacy HTTP/1.1 fallback
+				if bytes.HasPrefix(data, []byte("GET / ")) {
+					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
+					return len(data), false // Consumed all, wait for more? No, connection will close?
+					// Actually, H1 is stateless here. We just reply.
+					// Return consumed=len(data) to clear buffer.
+					// Caller continues.
+				}
+				_ = unix.Close(fd)
+				delete(s.connState, fd)
+				return 0, true
 			}
 		} else {
-			if bytes.HasPrefix(data, []byte("GET / ")) {
-				s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
-				return false
-			}
-			_ = unix.Close(fd)
-			delete(s.connState, fd)
-			return true
+			// Not enough data for preface, wait
+			return 0, false
 		}
 	}
 
 	// Process frames
 	for offset+h2FrameHeaderLen <= len(data) {
 		length := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
+
+		totalFrameLen := h2FrameHeaderLen + length
+
+		if offset+totalFrameLen > len(data) {
+			break // Incomplete frame
+		}
+
 		frameType := data[offset+3]
 		flags := data[offset+4]
 		streamID := binary.BigEndian.Uint32(data[offset+5:offset+9]) & 0x7fffffff
 
-		offset += h2FrameHeaderLen
-
-		if offset+length > len(data) {
-			break
-		}
-
-		frameData := data[offset : offset+length]
-		offset += length
+		frameData := data[offset+h2FrameHeaderLen : offset+totalFrameLen]
 
 		switch frameType {
 		case h2FrameTypeSettings:
 			if flags&h2FlagAck == 0 {
+				// Send settings ACK
 				s.submitSend(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
-			s.handleH2Request(fd, streamID, frameData)
+			// Parse minimal headers and send response
+			s.handleH2Request(fd, streamID, frameData, flags)
 		}
+
+		offset += totalFrameLen
 	}
-	return false
+
+	return offset, false
 }
 
-func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte) {
+func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
 	var path string
 
 	if bytes.Contains(headerBlock, []byte("/json")) {
