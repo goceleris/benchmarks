@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -107,16 +106,14 @@ func (s *HTTP2Server) Run() error {
 		return fmt.Errorf("setup ring: %w", err)
 	}
 
-	// Submit initial accept
 	s.submitAccept()
 
-	log.Printf("iouring-h2 server listening on port %s", s.port)
 	return s.eventLoop()
 }
 
 func (s *HTTP2Server) setupRing() error {
 	params := &IoUringParams{
-		Flags: IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		Flags: 0,
 	}
 
 	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
@@ -147,14 +144,14 @@ func (s *HTTP2Server) setupRing() error {
 	s.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
 	s.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	s.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
-	s.sqArray = (*[ringSize]uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array]))[:]
+	s.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
 
 	s.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	s.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
 	s.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
-	s.cqes = (*[ringSize]IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes]))[:]
+	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
 
-	s.sqes = (*[ringSize]IoUringSqe)(unsafe.Pointer(&sqePtr[0]))[:]
+	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
 	return nil
 }
@@ -233,34 +230,29 @@ func (s *HTTP2Server) eventLoop() error {
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &h2ioConnState{}
 
-					// Submit first recv
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
 					} else {
-						unix.Close(connFd)
+						_ = unix.Close(connFd)
 					}
 
-					// Re-arm accept
 					s.submitAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
 					dataLen := int(cqe.Res)
 					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
+					closed := s.handleH2Data(fd, data)
 
-					s.handleH2Data(fd, data)
-
-					// Keep reading
-					s.submitRecv(fd)
+					if !closed {
+						s.submitRecv(fd)
+					}
 				} else if cqe.Res <= 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
 			} else if isSend {
-				// Send completion
 				if state, ok := s.connState[fd]; ok && len(state.inflightBuffers) > 0 {
-					// Remove the oldest buffer (FIFO)
-					// In a real server, we might match pointer addresses, but FIFO is safe for single-thread ring
 					state.inflightBuffers = state.inflightBuffers[1:]
 				}
 				if cqe.Res < 0 {
@@ -274,25 +266,31 @@ func (s *HTTP2Server) eventLoop() error {
 	}
 }
 
-func (s *HTTP2Server) handleH2Data(fd int, data []byte) {
+func (s *HTTP2Server) handleH2Data(fd int, data []byte) (closed bool) {
 	state := s.connState[fd]
 	if state == nil {
-		return
+		return true
 	}
 
 	offset := 0
 
-	// Check for connection preface
 	if !state.prefaceRecv {
 		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
 			state.prefaceRecv = true
 			offset = h2PrefaceLen
 
 			if !state.settingsSent {
-				// Send settings
 				s.submitSend(fd, frameSettings)
 				state.settingsSent = true
 			}
+		} else {
+			if bytes.HasPrefix(data, []byte("GET / ")) {
+				s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
+				return false
+			}
+			_ = unix.Close(fd)
+			delete(s.connState, fd)
+			return true
 		}
 	}
 
@@ -321,6 +319,7 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) {
 			s.handleH2Request(fd, streamID, frameData)
 		}
 	}
+	return false
 }
 
 func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte) {

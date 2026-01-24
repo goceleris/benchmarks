@@ -68,24 +68,13 @@ func (s *HTTP1Server) submitSend(fd int, data []byte) {
 }
 
 func (s *HTTP1Server) eventLoop() error {
-	log.Println("Starting io_uring event loop")
 	for {
-		// Submit and wait for completions
 		toSubmit := *s.sqTail - *s.sqHead
 
-		if toSubmit > 0 {
-			log.Printf("Submitting %d SQEs", toSubmit)
-		} else {
-			log.Println("Waiting for events (toSubmit=0)...")
-		}
-
-		submitted, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
+		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
 			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
-		}
-		if toSubmit > 0 {
-			log.Printf("Submitted: %d", submitted)
 		}
 
 		// Process completions
@@ -108,52 +97,32 @@ func (s *HTTP1Server) eventLoop() error {
 			fd := int(cqe.UserData & 0xFFFFFFFF)
 			isSend := (cqe.UserData>>32)&1 == 1
 
-			log.Printf("CQE: fd=%d, res=%d, isSend=%v, flags=%x", fd, cqe.Res, isSend, cqe.Flags)
-
 			if fd == s.listenFd && !isSend {
-				// Accept completion
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					log.Printf("Accepted connection: fd=%d", connFd)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
-					// Submit first recv
-					// Ensure FD is within buffer limits
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
 					} else {
-						log.Printf("Connection fd %d exceeds buffer limits", connFd)
-						unix.Close(connFd)
+						_ = unix.Close(connFd)
 					}
-				} else {
-					log.Printf("Accept error: %d", cqe.Res)
+
+					s.submitMultishotAccept()
 				}
 			} else if !isSend {
-				// Recv completion
 				if cqe.Res > 0 {
 					dataLen := int(cqe.Res)
-					// Manually map buffer based on FD
 					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
-
-					log.Printf("Received %d bytes on fd %d", dataLen, fd)
-
-					// Handle request (submits send)
 					s.handleRequest(fd, data)
 				} else if cqe.Res <= 0 {
-					log.Printf("Closing fd %d (res=%d)", fd, cqe.Res)
 					_ = unix.Close(fd)
 				}
 			} else if isSend {
-				log.Printf("Send completed on fd %d, res=%d", fd, cqe.Res)
 				if cqe.Res < 0 {
-					log.Printf("Send error on fd %d: %d", fd, cqe.Res)
 					_ = unix.Close(fd)
-				} else {
-					// Send successful, submit recv for next request (keep-alive)
-					// Check FD limits again safety
-					if fd < bufferCount {
-						s.submitRecv(fd)
-					}
+				} else if fd < bufferCount {
+					s.submitRecv(fd)
 				}
 			}
 
@@ -328,7 +297,7 @@ func (s *HTTP1Server) Run() error {
 	log.Printf("Submitting initial Accept on fd %d", s.listenFd)
 	s.submitMultishotAccept()
 
-	log.Printf("iouring-h1 server listening on port %s", s.port)
+	// log.Printf("iouring-h1 server listening on port %s", s.port)
 	return s.eventLoop()
 }
 
@@ -366,14 +335,16 @@ func (s *HTTP1Server) setupRing() error {
 	s.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
 	s.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	s.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
-	s.sqArray = (*[ringSize]uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array]))[:]
+	// Use kernel-reported entry count, not hardcoded ringSize
+	s.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
 
 	s.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	s.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
 	s.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
-	s.cqes = (*[ringSize]IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes]))[:]
+	// CQ ring is often 2x SQ ring, use actual kernel count
+	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
 
-	s.sqes = (*[ringSize]IoUringSqe)(unsafe.Pointer(&sqePtr[0]))[:]
+	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
 	return nil
 }

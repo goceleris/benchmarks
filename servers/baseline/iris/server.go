@@ -32,6 +32,7 @@ func (s *Server) Run() error {
 	return s.app.Listen(":"+s.port,
 		iris.WithOptimizations,
 		iris.WithoutServerError(iris.ErrServerClosed),
+		iris.WithoutStartupLog,
 	)
 }
 

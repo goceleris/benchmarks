@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -87,16 +86,14 @@ func (s *HybridServer) Run() error {
 		return fmt.Errorf("setup ring: %w", err)
 	}
 
-	// Submit initial accept
 	s.submitAccept()
 
-	log.Printf("iouring-hybrid server listening on port %s", s.port)
 	return s.eventLoop()
 }
 
 func (s *HybridServer) setupRing() error {
 	params := &IoUringParams{
-		Flags: IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		Flags: 0,
 	}
 
 	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
@@ -127,14 +124,14 @@ func (s *HybridServer) setupRing() error {
 	s.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
 	s.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	s.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
-	s.sqArray = (*[ringSize]uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array]))[:]
+	s.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
 
 	s.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	s.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
 	s.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
-	s.cqes = (*[ringSize]IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes]))[:]
+	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
 
-	s.sqes = (*[ringSize]IoUringSqe)(unsafe.Pointer(&sqePtr[0]))[:]
+	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
 	return nil
 }
@@ -212,32 +209,28 @@ func (s *HybridServer) eventLoop() error {
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO}
 
-					// Submit first recv
-					// Ensure FD is within buffer limits
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
 					} else {
-						unix.Close(connFd)
+						_ = unix.Close(connFd)
 					}
 
-					// Re-arm accept
 					s.submitAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
 					dataLen := int(cqe.Res)
 					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
+					closed := s.handleData(fd, data)
 
-					s.handleData(fd, data)
-
-					// Keep reading
-					s.submitRecv(fd)
+					if !closed {
+						s.submitRecv(fd)
+					}
 				} else if cqe.Res <= 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
 			} else if isSend {
-				// Send completion
 				if state, ok := s.connState[fd]; ok && len(state.inflightBuffers) > 0 {
 					state.inflightBuffers = state.inflightBuffers[1:]
 				}
@@ -252,37 +245,45 @@ func (s *HybridServer) eventLoop() error {
 	}
 }
 
-func (s *HybridServer) handleData(fd int, data []byte) {
+func (s *HybridServer) handleData(fd int, data []byte) (closed bool) {
 	state := s.connState[fd]
 	if state == nil {
-		return
+		return true
 	}
 
-	// Protocol detection on first data
 	if state.protocol == protoUnknownIO {
 		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
 			state.protocol = protoH2CIO
 		} else if bytes.HasPrefix(data, []byte("GET ")) ||
 			bytes.HasPrefix(data, []byte("POST ")) {
-			// Check for H2C upgrade
 			if bytes.Contains(data, []byte("Upgrade: h2c")) {
 				state.protocol = protoH2CIO
 				s.handleH2CUpgrade(fd, state)
-				return
+				return false
 			}
 			state.protocol = protoHTTP1IO
+		} else {
+			if bytes.Contains(data, []byte("GET /")) {
+				state.protocol = protoHTTP1IO
+			} else {
+				_ = unix.Close(fd)
+				delete(s.connState, fd)
+				return true
+			}
 		}
 	}
 
 	switch state.protocol {
 	case protoHTTP1IO:
-		s.handleHTTP1(fd, data)
+		return s.handleHTTP1(fd, data)
 	case protoH2CIO:
-		s.handleH2C(fd, state, data)
+		return s.handleH2C(fd, state, data)
+	default:
+		return false
 	}
 }
 
-func (s *HybridServer) handleHTTP1(fd int, data []byte) {
+func (s *HybridServer) handleHTTP1(fd int, data []byte) (closed bool) {
 	var response []byte
 
 	if bytes.HasPrefix(data, []byte("GET / ")) {
@@ -296,6 +297,7 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) {
 	}
 
 	s.submitSend(fd, response)
+	return false
 }
 
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridioConnState) {
@@ -307,7 +309,7 @@ func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridioConnState) {
 	state.settingsSent = true
 }
 
-func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) {
+func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) (closed bool) {
 	offset := 0
 
 	if !state.prefaceRecv {
@@ -319,6 +321,10 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 				s.submitSend(fd, frameSettings)
 				state.settingsSent = true
 			}
+		} else {
+			_ = unix.Close(fd)
+			delete(s.connState, fd)
+			return true
 		}
 	}
 
@@ -346,6 +352,7 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 			s.handleH2Request(fd, streamID, frameData)
 		}
 	}
+	return false
 }
 
 func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []byte) {
