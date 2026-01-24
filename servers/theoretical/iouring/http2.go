@@ -31,6 +31,12 @@ var (
 	hpackHeadersJSON   = []byte{0x88, 0x5f, 0x10, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73, 0x6f, 0x6e}
 	bodySimple         = []byte("Hello, World!")
 	bodyJSON           = []byte(`{"message":"Hello, World!","server":"iouring-h2"}`)
+
+	// Global static frames (Stream ID 0)
+	// Settings Frame (Empty): Length=0, Type=4, Flags=0, Stream=0
+	frameSettings = []byte{0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}
+	// Settings Ack: Length=0, Type=4, Flags=1 (Ack), Stream=0
+	frameSettingsAck = []byte{0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00}
 )
 
 // HTTP2Server is a barebones H2C server using io_uring with multishot.
@@ -52,21 +58,29 @@ type HTTP2Server struct {
 }
 
 type h2ioConnState struct {
-	prefaceRecv  bool
-	settingsSent bool
+	prefaceRecv     bool
+	settingsSent    bool
+	inflightBuffers [][]byte // Keep buffers alive until completion
 }
 
 // NewHTTP2Server creates a new barebones io_uring H2C server.
 func NewHTTP2Server(port string) *HTTP2Server {
 	return &HTTP2Server{
 		port:      port,
-		buffers:   make([]byte, bufferCount*bufferSize),
 		connState: make(map[int]*h2ioConnState),
 	}
 }
 
 // Run starts the io_uring event loop for H2C.
 func (s *HTTP2Server) Run() error {
+	// Allocate buffers using mmap (pinned memory)
+	bufSize := bufferCount * bufferSize
+	bufPtr, err := unix.Mmap(-1, 0, bufSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		return fmt.Errorf("mmap buffers: %w", err)
+	}
+	s.buffers = (*[1 << 30]byte)(unsafe.Pointer(&bufPtr[0]))[:bufSize:bufSize]
+
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
@@ -93,11 +107,8 @@ func (s *HTTP2Server) Run() error {
 		return fmt.Errorf("setup ring: %w", err)
 	}
 
-	if err := s.setupBuffers(); err != nil {
-		return fmt.Errorf("setup buffers: %w", err)
-	}
-
-	s.submitMultishotAccept()
+	// Submit initial accept
+	s.submitAccept()
 
 	log.Printf("iouring-h2 server listening on port %s", s.port)
 	return s.eventLoop()
@@ -148,53 +159,33 @@ func (s *HTTP2Server) setupRing() error {
 	return nil
 }
 
-func (s *HTTP2Server) setupBuffers() error {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
-
-	sqe := &s.sqes[idx]
-	sqe.Opcode = IORING_OP_PROVIDE_BUFFERS
-	sqe.Fd = int32(bufferCount)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[0])))
-	sqe.Len = bufferSize
-	sqe.Off = 0
-	sqe.OpcodeFlags = bufferGroup
-	sqe.UserData = 0
-
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
-
-	_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
-	if errno != 0 {
-		return fmt.Errorf("io_uring_enter (buffers): %w", errno)
-	}
-
-	return nil
-}
-
-func (s *HTTP2Server) submitMultishotAccept() {
+func (s *HTTP2Server) submitAccept() {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
-	sqe.OpcodeFlags = IORING_ACCEPT_MULTISHOT
+	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(s.listenFd)
 
 	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
-func (s *HTTP2Server) submitMultishotRecv(fd int) {
+func (s *HTTP2Server) submitRecv(fd int) {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	sqe.Flags = IOSQE_BUFFER_SELECT
-	sqe.OpcodeFlags = IORING_RECV_MULTISHOT | (bufferGroup << 16)
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
+	sqe.Len = bufferSize
+	sqe.Off = 0
+	sqe.Flags = 0
+	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(fd)
 
 	s.sqArray[idx] = idx
@@ -202,6 +193,11 @@ func (s *HTTP2Server) submitMultishotRecv(fd int) {
 }
 
 func (s *HTTP2Server) submitSend(fd int, data []byte) {
+	// Keep a reference to the data to prevent GC/overwrite until completion
+	if state, ok := s.connState[fd]; ok {
+		state.inflightBuffers = append(state.inflightBuffers, data)
+	}
+
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
@@ -236,17 +232,38 @@ func (s *HTTP2Server) eventLoop() error {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &h2ioConnState{}
-					s.submitMultishotRecv(connFd)
+
+					// Submit first recv
+					if connFd < bufferCount {
+						s.submitRecv(connFd)
+					} else {
+						unix.Close(connFd)
+					}
+
+					// Re-arm accept
+					s.submitAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					bufIdx := int((cqe.Flags >> 16) & 0xFFFF)
 					dataLen := int(cqe.Res)
-					data := s.buffers[bufIdx*bufferSize : bufIdx*bufferSize+dataLen]
+					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
 
 					s.handleH2Data(fd, data)
-					s.reprovideBuffer(bufIdx)
+
+					// Keep reading
+					s.submitRecv(fd)
 				} else if cqe.Res <= 0 {
+					_ = unix.Close(fd)
+					delete(s.connState, fd)
+				}
+			} else if isSend {
+				// Send completion
+				if state, ok := s.connState[fd]; ok && len(state.inflightBuffers) > 0 {
+					// Remove the oldest buffer (FIFO)
+					// In a real server, we might match pointer addresses, but FIFO is safe for single-thread ring
+					state.inflightBuffers = state.inflightBuffers[1:]
+				}
+				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
@@ -255,22 +272,6 @@ func (s *HTTP2Server) eventLoop() error {
 			*s.cqHead = head + 1
 		}
 	}
-}
-
-func (s *HTTP2Server) reprovideBuffer(bufIdx int) {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
-
-	sqe := &s.sqes[idx]
-	sqe.Opcode = IORING_OP_PROVIDE_BUFFERS
-	sqe.Fd = 1
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[bufIdx*bufferSize])))
-	sqe.Len = bufferSize
-	sqe.Off = uint64(bufIdx)
-	sqe.OpcodeFlags = bufferGroup
-
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
 }
 
 func (s *HTTP2Server) handleH2Data(fd int, data []byte) {
@@ -289,9 +290,7 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) {
 
 			if !state.settingsSent {
 				// Send settings
-				settingsFrame := make([]byte, 9)
-				settingsFrame[3] = h2FrameTypeSettings
-				s.submitSend(fd, settingsFrame)
+				s.submitSend(fd, frameSettings)
 				state.settingsSent = true
 			}
 		}
@@ -316,10 +315,7 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) {
 		switch frameType {
 		case h2FrameTypeSettings:
 			if flags&h2FlagAck == 0 {
-				ack := make([]byte, 9)
-				ack[3] = h2FrameTypeSettings
-				ack[4] = h2FlagAck
-				s.submitSend(fd, ack)
+				s.submitSend(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
 			s.handleH2Request(fd, streamID, frameData)

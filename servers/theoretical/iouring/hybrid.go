@@ -31,9 +31,10 @@ type HybridServer struct {
 }
 
 type hybridioConnState struct {
-	protocol     int // 0=unknown, 1=HTTP/1.1, 2=H2C
-	prefaceRecv  bool
-	settingsSent bool
+	protocol        int // 0=unknown, 1=HTTP/1.1, 2=H2C
+	prefaceRecv     bool
+	settingsSent    bool
+	inflightBuffers [][]byte
 }
 
 const (
@@ -46,13 +47,20 @@ const (
 func NewHybridServer(port string) *HybridServer {
 	return &HybridServer{
 		port:      port,
-		buffers:   make([]byte, bufferCount*bufferSize),
 		connState: make(map[int]*hybridioConnState),
 	}
 }
 
 // Run starts the hybrid io_uring event loop.
 func (s *HybridServer) Run() error {
+	// Allocate buffers using mmap (pinned memory)
+	bufSize := bufferCount * bufferSize
+	bufPtr, err := unix.Mmap(-1, 0, bufSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		return fmt.Errorf("mmap buffers: %w", err)
+	}
+	s.buffers = (*[1 << 30]byte)(unsafe.Pointer(&bufPtr[0]))[:bufSize:bufSize]
+
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
@@ -79,11 +87,8 @@ func (s *HybridServer) Run() error {
 		return fmt.Errorf("setup ring: %w", err)
 	}
 
-	if err := s.setupBuffers(); err != nil {
-		return fmt.Errorf("setup buffers: %w", err)
-	}
-
-	s.submitMultishotAccept()
+	// Submit initial accept
+	s.submitAccept()
 
 	log.Printf("iouring-hybrid server listening on port %s", s.port)
 	return s.eventLoop()
@@ -134,53 +139,33 @@ func (s *HybridServer) setupRing() error {
 	return nil
 }
 
-func (s *HybridServer) setupBuffers() error {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
-
-	sqe := &s.sqes[idx]
-	sqe.Opcode = IORING_OP_PROVIDE_BUFFERS
-	sqe.Fd = int32(bufferCount)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[0])))
-	sqe.Len = bufferSize
-	sqe.Off = 0
-	sqe.OpcodeFlags = bufferGroup
-	sqe.UserData = 0
-
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
-
-	_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
-	if errno != 0 {
-		return fmt.Errorf("io_uring_enter (buffers): %w", errno)
-	}
-
-	return nil
-}
-
-func (s *HybridServer) submitMultishotAccept() {
+func (s *HybridServer) submitAccept() {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
-	sqe.OpcodeFlags = IORING_ACCEPT_MULTISHOT
+	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(s.listenFd)
 
 	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
 }
 
-func (s *HybridServer) submitMultishotRecv(fd int) {
+func (s *HybridServer) submitRecv(fd int) {
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
+	s.sqes[idx] = IoUringSqe{} // Zero out
 	sqe := &s.sqes[idx]
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	sqe.Flags = IOSQE_BUFFER_SELECT
-	sqe.OpcodeFlags = IORING_RECV_MULTISHOT | (bufferGroup << 16)
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize])))
+	sqe.Len = bufferSize
+	sqe.Off = 0
+	sqe.Flags = 0
+	sqe.OpcodeFlags = 0
 	sqe.UserData = uint64(fd)
 
 	s.sqArray[idx] = idx
@@ -188,6 +173,10 @@ func (s *HybridServer) submitMultishotRecv(fd int) {
 }
 
 func (s *HybridServer) submitSend(fd int, data []byte) {
+	if state, ok := s.connState[fd]; ok {
+		state.inflightBuffers = append(state.inflightBuffers, data)
+	}
+
 	tail := *s.sqTail
 	idx := tail & s.sqMask
 
@@ -197,22 +186,6 @@ func (s *HybridServer) submitSend(fd int, data []byte) {
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
 	sqe.Len = uint32(len(data))
 	sqe.UserData = uint64(fd) | (1 << 32)
-
-	s.sqArray[idx] = idx
-	*s.sqTail = tail + 1
-}
-
-func (s *HybridServer) reprovideBuffer(bufIdx int) {
-	tail := *s.sqTail
-	idx := tail & s.sqMask
-
-	sqe := &s.sqes[idx]
-	sqe.Opcode = IORING_OP_PROVIDE_BUFFERS
-	sqe.Fd = 1
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[bufIdx*bufferSize])))
-	sqe.Len = bufferSize
-	sqe.Off = uint64(bufIdx)
-	sqe.OpcodeFlags = bufferGroup
 
 	s.sqArray[idx] = idx
 	*s.sqTail = tail + 1
@@ -238,17 +211,37 @@ func (s *HybridServer) eventLoop() error {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO}
-					s.submitMultishotRecv(connFd)
+
+					// Submit first recv
+					// Ensure FD is within buffer limits
+					if connFd < bufferCount {
+						s.submitRecv(connFd)
+					} else {
+						unix.Close(connFd)
+					}
+
+					// Re-arm accept
+					s.submitAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					bufIdx := int((cqe.Flags >> 16) & 0xFFFF)
 					dataLen := int(cqe.Res)
-					data := s.buffers[bufIdx*bufferSize : bufIdx*bufferSize+dataLen]
+					data := s.buffers[fd*bufferSize : fd*bufferSize+dataLen]
 
 					s.handleData(fd, data)
-					s.reprovideBuffer(bufIdx)
+
+					// Keep reading
+					s.submitRecv(fd)
 				} else if cqe.Res <= 0 {
+					_ = unix.Close(fd)
+					delete(s.connState, fd)
+				}
+			} else if isSend {
+				// Send completion
+				if state, ok := s.connState[fd]; ok && len(state.inflightBuffers) > 0 {
+					state.inflightBuffers = state.inflightBuffers[1:]
+				}
+				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				}
@@ -309,9 +302,8 @@ func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridioConnState) {
 	upgradeResponse := []byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
 	s.submitSend(fd, upgradeResponse)
 
-	settingsFrame := make([]byte, 9)
-	settingsFrame[3] = h2FrameTypeSettings
-	s.submitSend(fd, settingsFrame)
+	// Settings Frame
+	s.submitSend(fd, frameSettings)
 	state.settingsSent = true
 }
 
@@ -324,9 +316,7 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 			offset = h2PrefaceLen
 
 			if !state.settingsSent {
-				settingsFrame := make([]byte, 9)
-				settingsFrame[3] = h2FrameTypeSettings
-				s.submitSend(fd, settingsFrame)
+				s.submitSend(fd, frameSettings)
 				state.settingsSent = true
 			}
 		}
@@ -350,10 +340,7 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 		switch frameType {
 		case h2FrameTypeSettings:
 			if flags&h2FlagAck == 0 {
-				ack := make([]byte, 9)
-				ack[3] = h2FrameTypeSettings
-				ack[4] = h2FlagAck
-				s.submitSend(fd, ack)
+				s.submitSend(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
 			s.handleH2Request(fd, streamID, frameData)
