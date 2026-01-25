@@ -47,12 +47,11 @@ type HTTP2Server struct {
 
 type h2ConnState struct {
 	buf          []byte
+	pos          int
 	prefaceRecv  bool
 	settingsSent bool
 	// Stream tracking
-	activeStreamID uint32
-	activePath     string
-	streamOpen     bool
+	streams map[uint32]string
 }
 
 // NewHTTP2Server creates a new barebones epoll H2C server.
@@ -150,7 +149,9 @@ func (s *HTTP2Server) acceptConnections() {
 		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
 		s.connState[connFd] = &h2ConnState{
-			buf: make([]byte, 16384),
+			buf:     make([]byte, 16384),
+			pos:     0,
+			streams: make(map[uint32]string),
 		}
 	}
 }
@@ -163,7 +164,8 @@ func (s *HTTP2Server) handleRead(fd int) {
 	}
 
 	for {
-		n, err := unix.Read(fd, state.buf)
+		// Read into remaining space
+		n, err := unix.Read(fd, state.buf[state.pos:])
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
@@ -176,32 +178,66 @@ func (s *HTTP2Server) handleRead(fd int) {
 			return
 		}
 
-		s.processH2Data(fd, state, state.buf[:n])
+		state.pos += n
+
+		// Process buffer loop
+		for {
+			consumed, closed := s.processH2Data(fd, state, state.buf[:state.pos])
+			if closed {
+				// Connection closed inside process
+				return
+			}
+			if consumed > 0 {
+				// Shift remaining
+				remaining := state.pos - consumed
+				copy(state.buf, state.buf[consumed:state.pos])
+				state.pos = remaining
+				// Continue processing if we have data left?
+				// Actually, continue processing until consumed == 0
+			} else {
+				// Need more data
+				break
+			}
+		}
+
+		// If buffer full and not consumed, we are in trouble (stream too big?)
+		// For benchmark, 16K should be enough.
+		if state.pos == len(state.buf) {
+			// Expand buffer or drop
+			newBuf := make([]byte, len(state.buf)*2)
+			copy(newBuf, state.buf)
+			state.buf = newBuf
+		}
 	}
 }
 
-func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
+// processH2Data attempts to consume ONE frame or preface.
+// Returns (bytesConsumed, closed).
+func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (int, bool) {
 	offset := 0
 
 	// Check for HTTP/2 connection preface
 	if !state.prefaceRecv {
-		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
-			state.prefaceRecv = true
-			offset = h2PrefaceLen
+		if len(data) >= h2PrefaceLen {
+			if string(data[:h2PrefaceLen]) == h2Preface {
+				state.prefaceRecv = true
+				offset = h2PrefaceLen
 
-			// Send server settings
-			if !state.settingsSent {
-				s.sendSettings(fd)
-				state.settingsSent = true
+				// Send server settings
+				if !state.settingsSent {
+					s.sendSettings(fd)
+					state.settingsSent = true
+				}
+				return offset, false
+			} else {
+				// Legacy HTTP/1.1 fallback check (removed for Pure H2)
+				// Just close if not matching preface
+				s.closeConnection(fd)
+				return 0, true
 			}
 		} else {
-			// Handle HTTP/1.1 health check fallback for root only
-			if bytes.HasPrefix(data, []byte("GET / ")) {
-				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!")
-				_, _ = unix.Write(fd, response)
-			}
-			s.closeConnection(fd)
-			return
+			// Not enough data for preface
+			return 0, false
 		}
 	}
 
@@ -213,14 +249,13 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 		flags := data[offset+4]
 		streamID := binary.BigEndian.Uint32(data[offset+5:offset+9]) & 0x7fffffff
 
-		offset += h2FrameHeaderLen
+		totalLen := h2FrameHeaderLen + length
 
-		if offset+length > len(data) {
+		if offset+totalLen > len(data) {
 			break // Incomplete frame
 		}
 
-		frameData := data[offset : offset+length]
-		offset += length
+		frameData := data[offset+h2FrameHeaderLen : offset+totalLen]
 
 		switch frameType {
 		case h2FrameTypeSettings:
@@ -238,13 +273,18 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				state := s.connState[fd]
-				if state != nil && state.activeStreamID == streamID && state.streamOpen {
-					s.sendH2Response(fd, streamID, state.activePath)
-					state.streamOpen = false
+				// Lookup stream
+				if path, ok := state.streams[streamID]; ok {
+					s.sendH2Response(fd, streamID, path)
+					delete(state.streams, streamID)
 				}
 			}
 		}
+
+		offset += totalLen
 	}
+
+	return offset, false
 }
 
 func (s *HTTP2Server) sendSettings(fd int) {
@@ -350,9 +390,7 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 		s.sendH2Response(fd, streamID, path)
 	} else {
 		if state, ok := s.connState[fd]; ok {
-			state.activeStreamID = streamID
-			state.activePath = path
-			state.streamOpen = true
+			state.streams[streamID] = path
 		}
 	}
 }

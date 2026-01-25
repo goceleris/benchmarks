@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -238,9 +239,10 @@ func waitForServer(ctx context.Context, port string, timeout time.Duration) erro
 		default:
 		}
 
-		// Try to connect
-		resp, err := httpGet(fmt.Sprintf("http://localhost:%s/", port))
-		if err == nil && resp {
+		// Try TCP connection
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%s", port), 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
 			return nil
 		}
 
@@ -248,15 +250,4 @@ func waitForServer(ctx context.Context, port string, timeout time.Duration) erro
 	}
 
 	return fmt.Errorf("timeout waiting for server on port %s", port)
-}
-
-func httpGet(url string) (bool, error) {
-	// Simple HTTP GET without importing net/http to avoid import cycle
-	// This is a workaround - in practice we'd use http.Get
-	cmd := exec.Command("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", url)
-	out, err := cmd.Output()
-	if err != nil {
-		return false, err
-	}
-	return strings.TrimSpace(string(out)) == "200", nil
 }

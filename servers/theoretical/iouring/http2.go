@@ -64,9 +64,7 @@ type h2ioConnState struct {
 	inflightBuffers [][]byte // Keep buffers alive until completion
 	pos             int      // Current buffer position
 	// Stream tracking
-	activeStreamID uint32
-	activePath     string
-	streamOpen     bool
+	streams map[uint32]string
 }
 
 // NewHTTP2Server creates a new barebones io_uring H2C server.
@@ -286,7 +284,10 @@ func (s *HTTP2Server) eventLoop() error {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					s.connState[connFd] = &h2ioConnState{pos: 0}
+					s.connState[connFd] = &h2ioConnState{
+						pos:     0,
+						streams: make(map[uint32]string),
+					}
 
 					if connFd < bufferCount {
 						s.submitRecv(connFd)
@@ -420,13 +421,13 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 
 		case h2FrameTypeData:
 			// Consume data
-			// Check for EndStream
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				state := s.connState[fd]
-				if state != nil && state.activeStreamID == streamID && state.streamOpen {
-					s.sendH2Response(fd, streamID, state.activePath)
-					state.streamOpen = false
+				// Lookup stream
+				if path, ok := state.streams[streamID]; ok {
+					s.sendH2Response(fd, streamID, path)
+					delete(state.streams, streamID)
 				}
 			}
 		}
@@ -504,9 +505,7 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	} else {
 		// Wait for data
 		if state, ok := s.connState[fd]; ok {
-			state.activeStreamID = streamID
-			state.activePath = path
-			state.streamOpen = true
+			state.streams[streamID] = path
 		}
 	}
 }
