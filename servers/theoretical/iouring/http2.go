@@ -371,14 +371,12 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 				}
 			} else {
 				// Legacy HTTP/1.1 fallback
+				// Ideally we should remove this too if client supports proper H2C check.
+				// Keeping ONLY root for basic connectivity check if curl doesn't use H2C.
+				// But user asked for NO fallback.
+				// Let's rely on the client using H2C.
 				if bytes.HasPrefix(data, []byte("GET / ")) {
 					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
-					return len(data), false
-				} else if bytes.HasPrefix(data, []byte("GET /json")) {
-					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"iouring-h2\"}"))
-					return len(data), false
-				} else if bytes.HasPrefix(data, []byte("POST /upload")) {
-					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
 					return len(data), false
 				}
 				_ = unix.Close(fd)

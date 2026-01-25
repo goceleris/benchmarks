@@ -195,15 +195,9 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 				state.settingsSent = true
 			}
 		} else {
-			// Handle HTTP/1.1 health check fallback
+			// Handle HTTP/1.1 health check fallback for root only
 			if bytes.HasPrefix(data, []byte("GET / ")) {
 				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!")
-				_, _ = unix.Write(fd, response)
-			} else if bytes.HasPrefix(data, []byte("GET /json")) {
-				response := []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"epoll-h2\"}")
-				_, _ = unix.Write(fd, response)
-			} else if bytes.HasPrefix(data, []byte("POST /upload")) {
-				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
 				_, _ = unix.Write(fd, response)
 			}
 			s.closeConnection(fd)

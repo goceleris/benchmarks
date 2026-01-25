@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // Config holds benchmark configuration.
@@ -25,6 +27,7 @@ type Config struct {
 	Workers     int
 	WarmupTime  time.Duration
 	KeepAlive   bool
+	H2C         bool
 }
 
 // DefaultConfig returns sensible defaults for benchmarking.
@@ -59,6 +62,24 @@ type Benchmarker struct {
 
 // New creates a new Benchmarker with the given configuration.
 func New(cfg Config) *Benchmarker {
+	if cfg.H2C {
+		// HTTP/2 Cleartext (H2C) configuration
+		h2Transport := &http2.Transport{
+			AllowHTTP: true,
+			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+		}
+		return &Benchmarker{
+			config: cfg,
+			client: &http.Client{
+				Transport: h2Transport,
+				Timeout:   30 * time.Second,
+			},
+			latencies: NewLatencyRecorder(),
+		}
+	}
+
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
