@@ -375,8 +375,6 @@ func (s *HTTP1Server) eventLoop() error {
 					}
 
 					s.submitMultishotAccept()
-				} else {
-
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
@@ -436,8 +434,6 @@ func (s *HTTP1Server) eventLoop() error {
 
 							s.submitRecv(fd)
 						}
-					} else {
-
 					}
 				} else if cqe.Res <= 0 {
 

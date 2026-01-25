@@ -321,10 +321,9 @@ func (s *HybridServer) eventLoop() error {
 				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
-				} else if fd < bufferCount {
-					// Do NOT submitRecv here. We keep the read loop active via Read Completion.
-					// This avoids double-submission race conditions.
 				}
+				// Note: We do NOT submitRecv here for valid fds to avoid double-submission races.
+				// The read loop is kept active via Read Completions.
 			}
 		}
 
@@ -626,13 +625,14 @@ func (s *HybridServer) send100Continue(fd int, streamID uint32) {
 func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
 	var headerBytes, dataBytes []byte
 
-	if path == "/json" {
+	switch path {
+	case "/json":
 		headerBytes = hpackHeadersJSON
 		dataBytes = bodyJSON
-	} else if path == "/upload" {
+	case "/upload":
 		headerBytes = hpackHeadersSimple
 		dataBytes = []byte("OK")
-	} else {
+	default:
 		headerBytes = hpackHeadersSimple
 		dataBytes = bodySimple
 	}
