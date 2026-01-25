@@ -172,9 +172,9 @@ def generate_latency_chart(results: Dict[str, Any], output_dir: str):
     x = np.arange(len(servers))
     width = 0.25
     
-    bars1 = ax.bar(x - width, p50_values, width, label='p50', color='#3498db', alpha=0.8)
-    bars2 = ax.bar(x, p99_values, width, label='p99', color='#e74c3c', alpha=0.8)
-    bars3 = ax.bar(x + width, p999_values, width, label='p99.9', color='#f39c12', alpha=0.8)
+    ax.bar(x - width, p50_values, width, label='p50', color='#3498db', alpha=0.8)
+    ax.bar(x, p99_values, width, label='p99', color='#e74c3c', alpha=0.8)
+    ax.bar(x + width, p999_values, width, label='p99.9', color='#f39c12', alpha=0.8)
     
     ax.set_xlabel('Server Implementation', fontsize=12)
     ax.set_ylabel('Latency (microseconds)', fontsize=12)
