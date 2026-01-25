@@ -6,23 +6,27 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is a baseline HTTP/1.1 server using Echo.
 type Server struct {
-	port string
-	e    *echo.Echo
+	port   string
+	e      *echo.Echo
+	useH2C bool
 }
 
 // NewServer creates a new Echo baseline server.
-func NewServer(port string) *Server {
+func NewServer(port string, useH2C bool) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
 
 	s := &Server{
-		port: port,
-		e:    e,
+		port:   port,
+		e:      e,
+		useH2C: useH2C,
 	}
 
 	s.registerRoutes()
@@ -31,6 +35,14 @@ func NewServer(port string) *Server {
 
 // Run starts the Echo server.
 func (s *Server) Run() error {
+	if s.useH2C {
+		h2cHandler := h2c.NewHandler(s.e, &http2.Server{})
+		server := &http.Server{
+			Addr:    ":" + s.port,
+			Handler: h2cHandler,
+		}
+		return server.ListenAndServe()
+	}
 	return s.e.Start(":" + s.port)
 }
 

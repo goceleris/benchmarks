@@ -2,17 +2,22 @@
 package gin
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is a baseline HTTP/1.1 server using Gin.
 type Server struct {
 	port   string
 	engine *gin.Engine
+	useH2C bool
 }
 
 // NewServer creates a new Gin baseline server.
-func NewServer(port string) *Server {
+func NewServer(port string, useH2C bool) *Server {
 	gin.SetMode(gin.ReleaseMode)
 
 	engine := gin.New()
@@ -22,6 +27,7 @@ func NewServer(port string) *Server {
 	s := &Server{
 		port:   port,
 		engine: engine,
+		useH2C: useH2C,
 	}
 
 	s.registerRoutes()
@@ -30,6 +36,14 @@ func NewServer(port string) *Server {
 
 // Run starts the Gin server.
 func (s *Server) Run() error {
+	if s.useH2C {
+		h2cHandler := h2c.NewHandler(s.engine, &http2.Server{})
+		server := &http.Server{
+			Addr:    ":" + s.port,
+			Handler: h2cHandler,
+		}
+		return server.ListenAndServe()
+	}
 	return s.engine.Run(":" + s.port)
 }
 

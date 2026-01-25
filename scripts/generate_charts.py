@@ -22,14 +22,12 @@ except ImportError:
 # Color schemes for different server categories
 COLORS = {
     # Baseline servers
-    "stdhttp-h1": "#3498db",
-    "stdhttp-h2": "#2980b9",
-    "stdhttp-hybrid": "#1abc9c",
+    "stdhttp-h1": "#3498db", "stdhttp-h2": "#2980b9", "stdhttp-hybrid": "#1abc9c",
     "fiber-h1": "#e74c3c",
-    "iris-h2": "#9b59b6",
-    "gin-h1": "#e91e63",
-    "chi-h1": "#00bcd4",
-    "echo-h1": "#ff5722",
+    "iris-h1": "#8e44ad", "iris-h2": "#9b59b6", "iris-hybrid": "#af7ac5",
+    "gin-h1": "#e91e63", "gin-h2": "#f06292", "gin-hybrid": "#f48fb1",
+    "chi-h1": "#00bcd4", "chi-h2": "#4dd0e1", "chi-hybrid": "#80deea",
+    "echo-h1": "#ff5722", "echo-h2": "#ff8a65", "echo-hybrid": "#ffab91",
     # Theoretical - epoll
     "epoll-h1": "#27ae60",
     "epoll-h2": "#229954",
@@ -41,9 +39,18 @@ COLORS = {
 }
 
 CATEGORIES = {
-    "baseline": ["stdhttp-h1", "stdhttp-h2", "stdhttp-hybrid", "fiber-h1", "iris-h2", "gin-h1", "chi-h1", "echo-h1"],
-    "epoll": ["epoll-h1", "epoll-h2", "epoll-hybrid"],
-    "iouring": ["iouring-h1", "iouring-h2", "iouring-hybrid"],
+    "HTTP/1.1": [
+        "stdhttp-h1", "fiber-h1", "gin-h1", "chi-h1", "echo-h1", "iris-h1", 
+        "epoll-h1", "iouring-h1"
+    ],
+    "HTTP/2": [
+        "stdhttp-h2", "gin-h2", "chi-h2", "echo-h2", "iris-h2", 
+        "epoll-h2", "iouring-h2"
+    ],
+    "Hybrid": [
+        "stdhttp-hybrid", "gin-hybrid", "chi-hybrid", "echo-hybrid", "iris-hybrid", 
+        "epoll-hybrid", "iouring-hybrid"
+    ]
 }
 
 
@@ -76,7 +83,7 @@ def generate_throughput_chart(results: Dict[str, Any], benchmark_type: str, outp
     reqs_per_sec = []
     colors = []
     
-    for category in ["baseline", "epoll", "iouring"]:
+    for category in ["HTTP/1.1", "HTTP/2", "Hybrid"]:
         for server in CATEGORIES.get(category, []):
             for result in benchmark_results:
                 if result.get("server") == server:
@@ -111,17 +118,20 @@ def generate_throughput_chart(results: Dict[str, Any], benchmark_type: str, outp
     ax.set_xticklabels(servers, rotation=45, ha='right')
     
     # Add category separators
-    # Add category separators
-    # Baseline (8 servers) -> Split at 7.5
-    # Epoll (3 servers) -> Split at 10.5
+    # Separators between protocol groups
+    # Calculate positions based on group sizes (which are static mostly)
+    # H1 group size: 8 -> split at 7.5
+    # H2 group size: 7 -> 8 + 7 = 15 -> split at 14.5
     ax.axvline(x=7.5, color='gray', linestyle='--', alpha=0.5)
-    ax.axvline(x=10.5, color='gray', linestyle='--', alpha=0.5)
+    ax.axvline(x=14.5, color='gray', linestyle='--', alpha=0.5)
     
     # Legend
     legend_patches = [
-        mpatches.Patch(color='#3498db', label='Baseline'),
-        mpatches.Patch(color='#27ae60', label='Theoretical (epoll)'),
-        mpatches.Patch(color='#f39c12', label='Theoretical (io_uring)'),
+        mpatches.Patch(color='#3498db', label='HTTP/1.1'),
+        mpatches.Patch(color='#2980b9', label='HTTP/2'),
+        mpatches.Patch(color='#1abc9c', label='Hybrid'),
+        mpatches.Patch(color='#27ae60', label='Epoll (Ref)'),
+        mpatches.Patch(color='#f39c12', label='IoUring (Ref)'),
     ]
     ax.legend(handles=legend_patches, loc='upper right')
     
@@ -156,7 +166,7 @@ def generate_latency_chart(results: Dict[str, Any], output_dir: str):
     p999_values = []
     colors = []
     
-    for category in ["baseline", "epoll", "iouring"]:
+    for category in ["HTTP/1.1", "HTTP/2", "Hybrid"]:
         for server in CATEGORIES.get(category, []):
             for result in latency_results:
                 if result.get("server") == server:
@@ -241,7 +251,7 @@ def generate_summary_table(results: Dict[str, Any], output_dir: str):
         f.write("|--------|--------|------|------|-------------|\n")
         
         benchmark_types = ["simple", "json", "path", "big-request"]
-        all_servers = CATEGORIES["baseline"] + CATEGORIES["epoll"] + CATEGORIES["iouring"]
+        all_servers = CATEGORIES["HTTP/1.1"] + CATEGORIES["HTTP/2"] + CATEGORIES["Hybrid"]
         
         # First pass: collect servers that have at least one result
         servers_with_data = set()

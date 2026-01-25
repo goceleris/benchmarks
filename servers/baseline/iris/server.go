@@ -12,36 +12,45 @@ import (
 // Server is a baseline H2C server using Iris.
 // Iris supports HTTP/2 cleartext via its configuration.
 type Server struct {
-	port string
-	app  *iris.Application
+	port   string
+	app    *iris.Application
+	useH2C bool
 }
 
-// NewServer creates a new Iris baseline H2C server.
-func NewServer(port string) *Server {
+// NewServer creates a new Iris baseline server.
+func NewServer(port string, useH2C bool) *Server {
 	app := iris.New()
 	app.Logger().SetLevel("warn") // Reduce logging noise
 
 	s := &Server{
-		port: port,
-		app:  app,
+		port:   port,
+		app:    app,
+		useH2C: useH2C,
 	}
 
 	s.registerRoutes()
 	return s
 }
 
-// Run starts the Iris H2C server with prior knowledge.
+// Run starts the Iris server.
 func (s *Server) Run() error {
-	// Configure H2C (HTTP/2 Cleartext)
-	h2cHandler := h2c.NewHandler(s.app, &http2.Server{})
+	if s.useH2C {
+		// Configure H2C (HTTP/2 Cleartext)
+		h2cHandler := h2c.NewHandler(s.app, &http2.Server{})
 
-	srv := &http.Server{
-		Addr:    ":" + s.port,
-		Handler: h2cHandler,
+		srv := &http.Server{
+			Addr:    ":" + s.port,
+			Handler: h2cHandler,
+		}
+		return srv.ListenAndServe()
 	}
 
-	// Use iris.WithoutServerError to ignore expected errors on shutdown
-	return srv.ListenAndServe()
+	// Standard HTTP/1.1
+	return s.app.Listen(":"+s.port,
+		iris.WithOptimizations,
+		iris.WithoutServerError(iris.ErrServerClosed),
+		iris.WithoutStartupLog,
+	)
 }
 
 func (s *Server) registerRoutes() {

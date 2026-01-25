@@ -42,20 +42,36 @@ func main() {
 		server := fiber.NewServer(*port)
 		err = server.Run()
 
-	case "iris-h2":
-		server := irisserver.NewServer(*port)
+	case "iris-h1":
+		server := irisserver.NewServer(*port, false)
+		err = server.Run()
+
+	case "iris-h2", "iris-hybrid":
+		server := irisserver.NewServer(*port, true)
 		err = server.Run()
 
 	case "gin-h1":
-		server := gin.NewServer(*port)
+		server := gin.NewServer(*port, false)
+		err = server.Run()
+
+	case "gin-h2", "gin-hybrid":
+		server := gin.NewServer(*port, true)
 		err = server.Run()
 
 	case "chi-h1":
-		server := chi.NewServer(*port)
+		server := chi.NewServer(*port, false)
+		err = server.Run()
+
+	case "chi-h2", "chi-hybrid":
+		server := chi.NewServer(*port, true)
 		err = server.Run()
 
 	case "echo-h1":
-		server := echo.NewServer(*port)
+		server := echo.NewServer(*port, false)
+		err = server.Run()
+
+	case "echo-h2", "echo-hybrid":
+		server := echo.NewServer(*port, true)
 		err = server.Run()
 
 	// Theoretical servers will be added here

@@ -26,10 +26,18 @@ var baselineServers = []string{
 	"stdhttp-h2",
 	"stdhttp-hybrid",
 	"fiber-h1",
+	"iris-h1",
 	"iris-h2",
+	"iris-hybrid",
 	"gin-h1",
+	"gin-h2",
+	"gin-hybrid",
 	"chi-h1",
+	"chi-h2",
+	"chi-hybrid",
 	"echo-h1",
+	"echo-h2",
+	"echo-hybrid",
 }
 
 var theoreticalServers = []string{

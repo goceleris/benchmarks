@@ -6,21 +6,25 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is a baseline HTTP/1.1 server using Chi router.
 type Server struct {
 	port   string
 	router chi.Router
+	useH2C bool
 }
 
 // NewServer creates a new Chi baseline server.
-func NewServer(port string) *Server {
+func NewServer(port string, useH2C bool) *Server {
 	router := chi.NewRouter()
 
 	s := &Server{
 		port:   port,
 		router: router,
+		useH2C: useH2C,
 	}
 
 	s.registerRoutes()
@@ -29,7 +33,11 @@ func NewServer(port string) *Server {
 
 // Run starts the Chi server.
 func (s *Server) Run() error {
-	return http.ListenAndServe(":"+s.port, s.router)
+	var handler http.Handler = s.router
+	if s.useH2C {
+		handler = h2c.NewHandler(s.router, &http2.Server{})
+	}
+	return http.ListenAndServe(":"+s.port, handler)
 }
 
 func (s *Server) registerRoutes() {
