@@ -35,6 +35,12 @@ func NewServer(port string, useH2C bool) *Server {
 // Run starts the Iris server.
 func (s *Server) Run() error {
 	if s.useH2C {
+		// Ensure Iris application is built (routes registered, internal state set)
+		// since we are skipping app.Listen
+		if err := s.app.Build(); err != nil {
+			return err
+		}
+
 		// Configure H2C (HTTP/2 Cleartext)
 		h2cHandler := h2c.NewHandler(s.app, &http2.Server{})
 

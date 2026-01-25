@@ -351,17 +351,27 @@ func (s *HybridServer) handleData(fd int, data []byte) (consumed int, closed boo
 		if len(data) >= h2PrefaceLen && bytes.Equal(data[:h2PrefaceLen], []byte(h2Preface)) {
 			state.protocol = protoH2CIO
 		} else if len(data) > 0 {
-			// Infer HTTP/1.1 from method
-			// Check "GET ", "POST", "HEAD" etc.
-			// Simple check: Is it ASCII? Just default to HTTP/1.1 for now if H2 check fails
-			// and let the handler validate.
-			// But maintain Upgrade check logic just in case.
-			if bytes.Contains(data, []byte("Upgrade: h2c")) {
-				state.protocol = protoH2CIO
-				s.handleH2CUpgrade(fd, state)
-				return len(data), false
+			// Check for H1 prefixes to differentiate from partial H2 preface
+			if bytes.HasPrefix(data, []byte("GET ")) || bytes.HasPrefix(data, []byte("POST ")) ||
+				bytes.HasPrefix(data, []byte("PUT ")) || bytes.HasPrefix(data, []byte("DELETE ")) {
+				state.protocol = protoHTTP1IO
+			} else {
+				// Not a clear H1 request.
+				// If we have less than H2 preface length, wait for more data to decide.
+				if len(data) < h2PrefaceLen {
+					return 0, false
+				}
+				// If >= 24 bytes and didn't match H2 preface (checked above) or H1 prefix,
+				// it might be Upgrade or garbage.
+				// Check for HTTP/1.1 upgrade to H2C (Only on GET to avoid body handling complexity)
+				if bytes.HasPrefix(data, []byte("GET ")) && bytes.Contains(data, []byte("Upgrade: h2c")) {
+					state.protocol = protoH2CIO
+					s.handleH2CUpgrade(fd, state)
+					return len(data), false
+				}
+				// Default to H1 which will likely 404/fail if invalid
+				state.protocol = protoHTTP1IO
 			}
-			state.protocol = protoHTTP1IO
 		} else {
 			return 0, false
 		}

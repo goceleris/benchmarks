@@ -169,8 +169,8 @@ func (s *HybridServer) handleRead(fd int) {
 				bytes.HasPrefix(data, []byte("POST ")) ||
 				bytes.HasPrefix(data, []byte("PUT ")) ||
 				bytes.HasPrefix(data, []byte("DELETE ")) {
-				// Check for HTTP/1.1 upgrade to H2C
-				if bytes.Contains(data, []byte("Upgrade: h2c")) {
+				// Check for HTTP/1.1 upgrade to H2C (Only on GET to avoid body handling complexity)
+				if bytes.HasPrefix(data, []byte("GET ")) && bytes.Contains(data, []byte("Upgrade: h2c")) {
 					state.protocol = protoH2C
 					state.h2state = &h2ConnState{
 						buf:     state.buf,
@@ -182,6 +182,11 @@ func (s *HybridServer) handleRead(fd int) {
 				}
 				state.protocol = protoHTTP1
 			} else {
+				// If we have less than H2 preface length (24 bytes) and didn't match H1prefixes,
+				// we might have a split packet. Wait for more data.
+				if state.pos < h2PrefaceLen {
+					return
+				}
 				s.closeConnection(fd)
 				return
 			}
