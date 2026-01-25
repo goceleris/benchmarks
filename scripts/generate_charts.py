@@ -111,8 +111,11 @@ def generate_throughput_chart(results: Dict[str, Any], benchmark_type: str, outp
     ax.set_xticklabels(servers, rotation=45, ha='right')
     
     # Add category separators
-    ax.axvline(x=4.5, color='gray', linestyle='--', alpha=0.5)
+    # Add category separators
+    # Baseline (8 servers) -> Split at 7.5
+    # Epoll (3 servers) -> Split at 10.5
     ax.axvline(x=7.5, color='gray', linestyle='--', alpha=0.5)
+    ax.axvline(x=10.5, color='gray', linestyle='--', alpha=0.5)
     
     # Legend
     legend_patches = [
@@ -137,8 +140,10 @@ def generate_latency_chart(results: Dict[str, Any], output_dir: str):
     """Generate a latency distribution chart for all servers."""
     
     # Filter latency results
+    # Filter latency results
+    # Go benchmark output includes latency in the main result object, so we verify specific fields exist
     latency_results = [r for r in results.get("results", []) 
-                      if "_latency" in r.get("benchmark", "")]
+                      if r.get("latency")]
     
     if not latency_results:
         print("No latency results found")
@@ -204,7 +209,7 @@ def parse_latency(latency_str: str) -> float:
     
     if latency_str.endswith('ms'):
         return float(latency_str[:-2]) * 1000
-    elif latency_str.endswith('us'):
+    elif latency_str.endswith('us') or latency_str.endswith('µs'):
         return float(latency_str[:-2])
     elif latency_str.endswith('s'):
         return float(latency_str[:-1]) * 1000000
@@ -228,7 +233,7 @@ def generate_summary_table(results: Dict[str, Any], output_dir: str):
         f.write(f"**Configuration:**\n")
         f.write(f"- Duration: {config.get('duration', 'N/A')}\n")
         f.write(f"- Connections: {config.get('connections', 'N/A')}\n")
-        f.write(f"- Threads: {config.get('threads', 'N/A')}\n\n")
+        f.write(f"- Workers: {config.get('workers', 'N/A')}\n\n")
         
         # Throughput table
         f.write("## Throughput (requests/sec)\n\n")

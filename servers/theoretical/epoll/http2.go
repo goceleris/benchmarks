@@ -277,7 +277,6 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
-				state := s.connState[fd]
 				// Lookup stream
 				if path, ok := state.streams[streamID]; ok {
 					s.sendH2Response(fd, streamID, path)

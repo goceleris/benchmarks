@@ -161,7 +161,10 @@ func (s *HybridServer) handleRead(fd int) {
 		if state.protocol == protoUnknown {
 			if state.pos >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
 				state.protocol = protoH2C
-				state.h2state = &h2ConnState{buf: state.buf}
+				state.h2state = &h2ConnState{
+					buf:     state.buf,
+					streams: make(map[uint32]string),
+				}
 			} else if bytes.HasPrefix(data, []byte("GET ")) ||
 				bytes.HasPrefix(data, []byte("POST ")) ||
 				bytes.HasPrefix(data, []byte("PUT ")) ||
@@ -169,7 +172,10 @@ func (s *HybridServer) handleRead(fd int) {
 				// Check for HTTP/1.1 upgrade to H2C
 				if bytes.Contains(data, []byte("Upgrade: h2c")) {
 					state.protocol = protoH2C
-					state.h2state = &h2ConnState{buf: state.buf}
+					state.h2state = &h2ConnState{
+						buf:     state.buf,
+						streams: make(map[uint32]string),
+					}
 					s.handleH2CUpgrade(fd, state, data)
 					state.pos = 0
 					continue

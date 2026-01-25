@@ -158,7 +158,7 @@ func main() {
 				Workers:     *workers,
 				WarmupTime:  *warmup,
 				KeepAlive:   true,
-				H2C:         strings.Contains(serverType, "-h2") && (strings.Contains(serverType, "epoll") || strings.Contains(serverType, "iouring")),
+				H2C:         strings.Contains(serverType, "-h2") || strings.Contains(serverType, "-hybrid"),
 			}
 
 			benchmarker := bench.New(cfg)

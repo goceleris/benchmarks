@@ -147,7 +147,12 @@ func (b *Benchmarker) warmup(ctx context.Context) {
 
 	b.running.Store(true)
 
-	for i := 0; i < b.config.Workers/2; i++ {
+	warmupWorkers := b.config.Workers / 2
+	if warmupWorkers < 1 {
+		warmupWorkers = 1
+	}
+
+	for i := 0; i < warmupWorkers; i++ {
 		b.wg.Add(1)
 		go b.worker(warmupCtx)
 	}

@@ -2,7 +2,11 @@
 package iris
 
 import (
+	"net/http"
+
 	"github.com/kataras/iris/v12"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is a baseline H2C server using Iris.
@@ -28,12 +32,16 @@ func NewServer(port string) *Server {
 
 // Run starts the Iris H2C server with prior knowledge.
 func (s *Server) Run() error {
+	// Configure H2C (HTTP/2 Cleartext)
+	h2cHandler := h2c.NewHandler(s.app, &http2.Server{})
+
+	srv := &http.Server{
+		Addr:    ":" + s.port,
+		Handler: h2cHandler,
+	}
+
 	// Use iris.WithoutServerError to ignore expected errors on shutdown
-	return s.app.Listen(":"+s.port,
-		iris.WithOptimizations,
-		iris.WithoutServerError(iris.ErrServerClosed),
-		iris.WithoutStartupLog,
-	)
+	return srv.ListenAndServe()
 }
 
 func (s *Server) registerRoutes() {

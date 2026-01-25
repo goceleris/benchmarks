@@ -54,7 +54,7 @@ func WritePath(w http.ResponseWriter, id string) {
 }
 
 // WriteBigRequest handles the big request benchmark (reads body, writes OK).
-func WriteBigRequest(w http.ResponseWriter, bodySize int) {
+func WriteBigRequest(w http.ResponseWriter, _ int) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
