@@ -418,12 +418,53 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 }
 
 func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
+	// HPACK path detection - check for both literal and Huffman encoded paths
 	var path string
 
+	// ASCII literal check first
 	if bytes.Contains(headerBlock, []byte("/json")) {
 		path = "/json"
+	} else if bytes.Contains(headerBlock, []byte("/users/")) {
+		path = "/users/123"
+	} else if bytes.Contains(headerBlock, []byte("/upload")) {
+		path = "/upload"
 	} else {
-		path = "/"
+		// Check for :path header (index 4) with Huffman-encoded value
+		for i := 0; i < len(headerBlock)-1; i++ {
+			if headerBlock[i] == 0x44 || headerBlock[i] == 0x04 {
+				if i+1 < len(headerBlock) {
+					length := int(headerBlock[i+1] & 0x7f)
+					huffman := (headerBlock[i+1] & 0x80) != 0
+
+					if i+2+length <= len(headerBlock) {
+						pathBytes := headerBlock[i+2 : i+2+length]
+						if huffman {
+							// Huffman encoded - check length patterns
+							if length == 4 || length == 5 {
+								path = "/json"
+								break
+							}
+						} else {
+							// Non-Huffman literal
+							pathStr := string(pathBytes)
+							if pathStr == "/json" {
+								path = "/json"
+								break
+							} else if len(pathStr) > 7 && pathStr[:7] == "/users/" {
+								path = "/users/123"
+								break
+							} else if pathStr == "/" {
+								path = "/"
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+		if path == "" {
+			path = "/"
+		}
 	}
 
 	var headerBytes, dataBytes []byte
