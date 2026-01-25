@@ -253,8 +253,10 @@ func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []b
 
 	// Send server preface (SETTINGS)
 	state.h2state.settingsSent = true
-	settingsFrame := make([]byte, 9)
-	settingsFrame[3] = h2FrameTypeSettings
+	settingsFrame := []byte{
+		0x00, 0x00, 0x06, h2FrameTypeSettings, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	}
 	_, _ = unix.Write(fd, settingsFrame)
 }
 

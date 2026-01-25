@@ -14,21 +14,22 @@ import (
 
 // HybridServer is a barebones server that muxes HTTP/1.1 and H2C using io_uring.
 type HybridServer struct {
-	port      string
-	ringFd    int
-	listenFd  int
-	sqHead    *uint32
-	sqTail    *uint32
-	cqHead    *uint32
-	cqTail    *uint32
-	sqMask    uint32
-	cqMask    uint32
-	sqeTail   uint32 // Local tracking
-	sqes      []IoUringSqe
-	cqes      []IoUringCqe
-	sqArray   []uint32
-	buffers   []byte
-	connState map[int]*hybridioConnState
+	port          string
+	ringFd        int
+	listenFd      int
+	sqHead        *uint32
+	sqTail        *uint32
+	cqHead        *uint32
+	cqTail        *uint32
+	sqMask        uint32
+	cqMask        uint32
+	sqeTail       uint32 // Local tracking
+	submittedTail uint32 // Track submitted entries
+	sqes          []IoUringSqe
+	cqes          []IoUringCqe
+	sqArray       []uint32
+	buffers       []byte
+	connState     map[int]*hybridioConnState
 }
 
 type hybridioConnState struct {
@@ -144,6 +145,7 @@ func (s *HybridServer) setupRing() error {
 	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
 	s.sqeTail = atomic.LoadUint32(s.sqTail)
+	s.submittedTail = s.sqeTail
 
 	return nil
 }
@@ -172,8 +174,7 @@ func (s *HybridServer) submitAccept() {
 	}
 	atomic.StoreUint32(s.sqTail, tail)
 
-	// Immediate submit
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
+	// Immediate submit removed for batching
 }
 
 func (s *HybridServer) submitRecv(fd int) {
@@ -208,8 +209,7 @@ func (s *HybridServer) submitRecv(fd int) {
 	}
 	atomic.StoreUint32(s.sqTail, tail)
 
-	// Immediate submit pattern
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
+	// Immediate submit removed for batching
 }
 
 func (s *HybridServer) submitSend(fd int, data []byte) {
@@ -242,13 +242,12 @@ func (s *HybridServer) submitSend(fd int, data []byte) {
 	}
 	atomic.StoreUint32(s.sqTail, tail)
 
-	// Immediate submit pattern
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
+	// Immediate submit removed for batching
 }
 
 func (s *HybridServer) eventLoop() error {
 	for {
-		// Process all available CQEs first (PoC pattern)
+		// Process all available CQEs first
 		for {
 			head := atomic.LoadUint32(s.cqHead)
 			tail := atomic.LoadUint32(s.cqTail)
@@ -294,18 +293,15 @@ func (s *HybridServer) eventLoop() error {
 						consumed, closed := s.handleData(fd, data)
 
 						if closed {
-							// Connection closed
 							_ = unix.Close(fd)
 							delete(s.connState, fd)
 						} else {
-							// Compact buffer if needed
 							if consumed > 0 {
 								copy(s.buffers[fd*bufferSize:], s.buffers[fd*bufferSize+consumed:fd*bufferSize+state.pos])
 								state.pos -= consumed
 							}
 
 							if state.pos >= bufferSize {
-								// Overflow
 								_ = unix.Close(fd)
 								delete(s.connState, fd)
 							} else {
@@ -330,9 +326,14 @@ func (s *HybridServer) eventLoop() error {
 				}
 			}
 		}
-		// Wait for at least 1 CQE (submit 0 - all submits done inline)
+
+		// Batch submit pending
+		tail := atomic.LoadUint32(s.sqTail)
+		toSubmit := tail - s.submittedTail
+		s.submittedTail = tail
+
 		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
-			0, 1, IORING_ENTER_GETEVENTS, 0, 0)
+			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
 		}
@@ -494,7 +495,12 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 			s.handleH2Request(fd, streamID, frameData, flags, endStream)
 
 		case h2FrameTypeData:
-			// Consume data
+			// Consume data and send Window Update
+			if length > 0 {
+				s.submitWindowUpdate(fd, 0, uint32(length))        // Connection flow control
+				s.submitWindowUpdate(fd, streamID, uint32(length)) // Stream flow control
+			}
+
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				state := s.connState[fd]
@@ -524,21 +530,55 @@ func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []by
 	} else if bytes.Contains(headerBlock, []byte("/upload")) {
 		path = "/upload"
 	} else {
-		// Attempt fallback robust matching
+		// Check for :path header (index 4) with Huffman-encoded value
+		// Look for name index 4 (:path) or 5 (:path)
+		// Masks:
+		// - 0x80 (Indexed) -> 1xxxxxxx. Index = val & 0x7f. (Check 4 or 5)
+		// - 0x40 (Literal Incr Enum) -> 01xxxxxx. Index = val & 0x3f. (Check 4 or 5)
+		// - 0x00/0x10 (Literal No/Never Index) -> 00xxxxxx. Index = val & 0x0f. (Check 4 or 5)
+
 		for i := 0; i < len(headerBlock)-1; i++ {
-			if headerBlock[i] == 0x44 || headerBlock[i] == 0x04 {
+			b := headerBlock[i]
+			var idx int
+			isMatch := false
+
+			if b&0x80 != 0 {
+				// Indexed field - skip (no value) unless 0x84/0x85 (default path)
+				if b == 0x84 {
+					if path == "" {
+						path = "/"
+					}
+				}
+				continue
+			} else if b&0xC0 == 0x40 {
+				// Literal with Incremental Indexing (01xxxxxx)
+				idx = int(b & 0x3F)
+				if idx == 4 || idx == 5 {
+					isMatch = true
+				}
+			} else if b&0xF0 == 0x00 || b&0xF0 == 0x10 {
+				// Literal without Indexing (0000xxxx) or Never Indexed (0001xxxx)
+				idx = int(b & 0x0F)
+				if idx == 4 || idx == 5 {
+					isMatch = true
+				}
+			}
+
+			if isMatch {
+				// Next byte is the length (possibly with Huffman bit)
 				if i+1 < len(headerBlock) {
 					length := int(headerBlock[i+1] & 0x7f)
 					huffman := (headerBlock[i+1] & 0x80) != 0
+
 					if i+2+length <= len(headerBlock) {
 						pathBytes := headerBlock[i+2 : i+2+length]
 						if huffman {
+							// Huffman encoded matching
+							// /json = 63 a2 0f 57 (curl/Go?) or 63 8d 31 69
 							if length == 4 && (bytes.Equal(pathBytes, []byte{0x63, 0x8d, 0x31, 0x69}) || bytes.Equal(pathBytes, []byte{0x63, 0xa2, 0x0f, 0x57})) {
 								path = "/json"
-								break
 							} else if length == 5 && bytes.Equal(pathBytes, []byte{0x62, 0xda, 0xe8, 0x38, 0xe4}) {
 								path = "/upload"
-								break
 							}
 						}
 					}
@@ -558,8 +598,29 @@ func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []by
 			state.activeStreamID = streamID
 			state.activePath = path
 			state.streamOpen = true
+
+			// For upload, assume Expect: 100-continue is desired by typical Go clients
+			if path == "/upload" {
+				s.send100Continue(fd, streamID)
+			}
 		}
 	}
+}
+
+func (s *HybridServer) send100Continue(fd int, streamID uint32) {
+	// :status 100 -> 0x08 0x03 "100"
+	h100 := []byte{0x08, 0x03, 0x31, 0x30, 0x30}
+
+	frame := make([]byte, 9+len(h100))
+	frame[0] = 0
+	frame[1] = 0
+	frame[2] = byte(len(h100))
+	frame[3] = h2FrameTypeHeaders
+	frame[4] = h2FlagEndHeaders
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	copy(frame[9:], h100)
+
+	s.submitSend(fd, frame)
 }
 
 func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
@@ -597,4 +658,18 @@ func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
 	binary.BigEndian.PutUint32(dHead[5:], streamID)
 
 	s.submitSend(fd, append(dHead, dataBytes...))
+}
+
+func (s *HybridServer) submitWindowUpdate(fd int, streamID uint32, increment uint32) {
+	// Frame Header (9 bytes) + Window Size Increment (4 bytes)
+	frame := make([]byte, 13)
+	frame[0] = 0x00
+	frame[1] = 0x00
+	frame[2] = 0x04 // Length 4
+	frame[3] = 0x08 // Type WINDOW_UPDATE
+	frame[4] = 0x00 // Flags
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	binary.BigEndian.PutUint32(frame[9:13], increment)
+
+	s.submitSend(fd, frame)
 }

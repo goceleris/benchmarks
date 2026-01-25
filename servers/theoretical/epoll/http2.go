@@ -269,7 +269,12 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 			s.handleH2Request(fd, streamID, frameData, flags, endStream)
 
 		case h2FrameTypeData:
-			// Consume data
+			// Consume data and send Window Update
+			if length > 0 {
+				s.sendWindowUpdate(fd, 0, uint32(length))        // Connection flow control
+				s.sendWindowUpdate(fd, streamID, uint32(length)) // Stream flow control
+			}
+
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				state := s.connState[fd]
@@ -288,9 +293,31 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 }
 
 func (s *HTTP2Server) sendSettings(fd int) {
-	// Empty SETTINGS frame
-	frame := make([]byte, 9)
-	frame[3] = h2FrameTypeSettings
+	// Settings Frame: Length=12, Type=4, Flags=0, Stream=0
+	// SETTINGS_HEADER_TABLE_SIZE (1) = 0
+	// SETTINGS_INITIAL_WINDOW_SIZE (4) = 1,048,576 (1MB)
+	frame := []byte{
+		0x00, 0x00, 0x0C,
+		h2FrameTypeSettings,
+		0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x04, 0x00, 0x10, 0x00, 0x00,
+	}
+	_, _ = unix.Write(fd, frame)
+}
+
+func (s *HTTP2Server) sendWindowUpdate(fd int, streamID uint32, increment uint32) {
+	// Frame Header (9 bytes) + Window Size Increment (4 bytes)
+	frame := make([]byte, 13)
+	frame[0] = 0x00
+	frame[1] = 0x00
+	frame[2] = 0x04 // Length 4
+	frame[3] = 0x08 // Type WINDOW_UPDATE
+	frame[4] = 0x00 // Flags
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	binary.BigEndian.PutUint32(frame[9:13], increment)
+
 	_, _ = unix.Write(fd, frame)
 }
 
@@ -332,12 +359,46 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 		// Common pattern: look for bytes that decode to /json
 
 		// Check if we have a :path header with value
-		// Look for index 4 (literal header with indexing, name index 4)
-		// 0x44 = literal header, index 4 (:path)
+		// Look for name index 4 (:path) or 5 (:path)
+		// Masks:
+		// - 0x80 (Indexed) -> 1xxxxxxx. Index = val & 0x7f. (Check 4 or 5)
+		// - 0x40 (Literal Incr Enum) -> 01xxxxxx. Index = val & 0x3f. (Check 4 or 5)
+		// - 0x00/0x10 (Literal No/Never Index) -> 00xxxxxx. Index = val & 0x0f. (Check 4 or 5)
+
 		for i := 0; i < len(headerBlock)-1; i++ {
-			// Look for :path (index 4) as literal header
-			// 0x44 = literal (incremental index), 0x04 = literal (no index), 0x14 = literal (never index)
-			if headerBlock[i] == 0x44 || headerBlock[i] == 0x04 || headerBlock[i] == 0x14 {
+			b := headerBlock[i]
+			var idx int
+			isMatch := false
+
+			if b&0x80 != 0 {
+				// Indexed field - we technically care if it IS path (Index 4 or 5)
+				// But an indexed field has NO value content following it.
+				// The path is "implicitly" / or /index.html.
+				// We need to find Literals with New Values.
+				// So skip pure Indexed fields (unless we want to detect default path).
+				// 0x84 = :path /
+				// 0x85 = :path /index.html
+				if b == 0x84 {
+					if path == "" {
+						path = "/"
+					}
+				}
+				continue
+			} else if b&0xC0 == 0x40 {
+				// Literal with Incremental Indexing (01xxxxxx)
+				idx = int(b & 0x3F)
+				if idx == 4 || idx == 5 {
+					isMatch = true
+				}
+			} else if b&0xF0 == 0x00 || b&0xF0 == 0x10 {
+				// Literal without Indexing (0000xxxx) or Never Indexed (0001xxxx)
+				idx = int(b & 0x0F)
+				if idx == 4 || idx == 5 {
+					isMatch = true
+				}
+			}
+
+			if isMatch {
 				// Next byte is the length (possibly with Huffman bit)
 				if i+1 < len(headerBlock) {
 					length := int(headerBlock[i+1] & 0x7f)
@@ -350,29 +411,22 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 							// /json = 63 a2 0f 57 (curl/Go?) or 63 8d 31 69
 							if length == 4 && (bytes.Equal(pathBytes, []byte{0x63, 0x8d, 0x31, 0x69}) || bytes.Equal(pathBytes, []byte{0x63, 0xa2, 0x0f, 0x57})) {
 								path = "/json"
-								break
 							} else if length == 5 && bytes.Equal(pathBytes, []byte{0x62, 0xda, 0xe8, 0x38, 0xe4}) {
 								path = "/upload"
-								break
 							} else if length >= 6 && bytes.HasPrefix(pathBytes, []byte{0x63, 0x05, 0x68, 0xdf, 0x5c, 0x22}) {
 								path = "/users/123"
-								break
 							}
 						} else {
 							// Non-Huffman literal
 							pathStr := string(pathBytes)
 							if pathStr == "/json" {
 								path = "/json"
-								break
 							} else if len(pathStr) > 7 && pathStr[:7] == "/users/" {
 								path = "/users/123"
-								break
 							} else if pathStr == "/upload" {
 								path = "/upload"
-								break
 							} else if pathStr == "/" {
 								path = "/"
-								break
 							}
 						}
 					}
@@ -391,8 +445,28 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	} else {
 		if state, ok := s.connState[fd]; ok {
 			state.streams[streamID] = path
+			// For upload, assume Expect: 100-continue is desired by typical Go clients
+			if path == "/upload" {
+				s.send100Continue(fd, streamID)
+			}
 		}
 	}
+}
+
+func (s *HTTP2Server) send100Continue(fd int, streamID uint32) {
+	// :status 100 -> 0x08 0x03 "100" (Literal Header Field without Indexing, Name Index 8)
+	h100 := []byte{0x08, 0x03, 0x31, 0x30, 0x30}
+
+	frame := make([]byte, 9+len(h100))
+	frame[0] = 0
+	frame[1] = 0
+	frame[2] = byte(len(h100))
+	frame[3] = h2FrameTypeHeaders
+	frame[4] = h2FlagEndHeaders
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	copy(frame[9:], h100)
+
+	_, _ = unix.Write(fd, frame)
 }
 
 func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
