@@ -6,7 +6,6 @@ Generates comparison charts for throughput and latency across all server impleme
 
 import json
 import sys
-import os
 from pathlib import Path
 from typing import Dict, List, Any
 
