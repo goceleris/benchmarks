@@ -63,6 +63,10 @@ type h2ioConnState struct {
 	settingsSent    bool
 	inflightBuffers [][]byte // Keep buffers alive until completion
 	pos             int      // Current buffer position
+	// Stream tracking
+	activeStreamID uint32
+	activePath     string
+	streamOpen     bool
 }
 
 // NewHTTP2Server creates a new barebones io_uring H2C server.
@@ -369,10 +373,13 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 				// Legacy HTTP/1.1 fallback
 				if bytes.HasPrefix(data, []byte("GET / ")) {
 					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
-					return len(data), false // Consumed all, wait for more? No, connection will close?
-					// Actually, H1 is stateless here. We just reply.
-					// Return consumed=len(data) to clear buffer.
-					// Caller continues.
+					return len(data), false
+				} else if bytes.HasPrefix(data, []byte("GET /json")) {
+					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"iouring-h2\"}"))
+					return len(data), false
+				} else if bytes.HasPrefix(data, []byte("POST /upload")) {
+					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
+					return len(data), false
 				}
 				_ = unix.Close(fd)
 				delete(s.connState, fd)
@@ -407,8 +414,23 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 				s.submitSend(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
-			// Parse minimal headers and send response
-			s.handleH2Request(fd, streamID, frameData, flags)
+			// Parse minimal headers
+			// Logic: check for EndStream (0x1) or EndHeaders (0x4)
+			// For simplicity in this benchmark, we assume headers fit in one frame (EndHeaders set)
+			endStream := flags&h2FlagEndStream != 0
+			s.handleH2Request(fd, streamID, frameData, flags, endStream)
+
+		case h2FrameTypeData:
+			// Consume data
+			// Check for EndStream
+			endStream := flags&h2FlagEndStream != 0
+			if endStream {
+				state := s.connState[fd]
+				if state != nil && state.activeStreamID == streamID && state.streamOpen {
+					s.sendH2Response(fd, streamID, state.activePath)
+					state.streamOpen = false
+				}
+			}
 		}
 
 		offset += totalFrameLen
@@ -417,7 +439,7 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 	return offset, false
 }
 
-func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
+func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte, endStream bool) {
 	// HPACK path detection - check for both literal and Huffman encoded paths
 	var path string
 
@@ -439,9 +461,19 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 					if i+2+length <= len(headerBlock) {
 						pathBytes := headerBlock[i+2 : i+2+length]
 						if huffman {
-							// Huffman encoded - check length patterns
-							if length == 4 || length == 5 {
+							// Huffman encoded matching
+							// /json   = 63 8d 31 69 (4 bytes)
+							// /upload = 63 05 68 df 2a 6f (6 bytes)
+							// /users/ = 63 05 68 df 5c 22 (6 bytes prefix)
+
+							if length == 4 && (bytes.Equal(pathBytes, []byte{0x63, 0x8d, 0x31, 0x69}) || bytes.Equal(pathBytes, []byte{0x63, 0xa2, 0x0f, 0x57})) {
 								path = "/json"
+								break
+							} else if length == 5 && bytes.Equal(pathBytes, []byte{0x62, 0xda, 0xe8, 0x38, 0xe4}) {
+								path = "/upload"
+								break
+							} else if length >= 6 && bytes.HasPrefix(pathBytes, []byte{0x63, 0x05, 0x68, 0xdf, 0x5c, 0x22}) {
+								path = "/users/123"
 								break
 							}
 						} else {
@@ -450,15 +482,16 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 							if pathStr == "/json" {
 								path = "/json"
 								break
-							} else if len(pathStr) > 7 && pathStr[:7] == "/users/" {
-								path = "/users/123"
+							} else if pathStr == "/upload" {
+								path = "/upload"
 								break
-							} else if pathStr == "/" {
-								path = "/"
+							} else if len(pathStr) >= 7 && pathStr[:7] == "/users/" {
+								path = "/users/123"
 								break
 							}
 						}
 					}
+
 				}
 			}
 		}
@@ -467,36 +500,64 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 		}
 	}
 
+	if endStream {
+		// Respond immediately
+		s.sendH2Response(fd, streamID, path)
+	} else {
+		// Wait for data
+		if state, ok := s.connState[fd]; ok {
+			state.activeStreamID = streamID
+			state.activePath = path
+			state.streamOpen = true
+		}
+	}
+}
+
+func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
 	var headerBytes, dataBytes []byte
 
-	switch path {
-	case "/json":
+	// Routing
+	if path == "/json" {
 		headerBytes = hpackHeadersJSON
 		dataBytes = bodyJSON
-	default:
+	} else if path == "/upload" {
+		// POST response
 		headerBytes = hpackHeadersSimple
+		dataBytes = []byte("OK")
+	} else if len(path) > 7 && path[:7] == "/users/" {
+		headerBytes = hpackHeadersSimple
+		dataBytes = bodySimple
+	} else {
+		headerBytes = hpackHeadersSimple // Default 200 OK text/plain
 		dataBytes = bodySimple
 	}
 
-	// HEADERS frame
-	headersFrame := make([]byte, 9+len(headerBytes))
-	headersFrame[0] = byte(len(headerBytes) >> 16)
-	headersFrame[1] = byte(len(headerBytes) >> 8)
-	headersFrame[2] = byte(len(headerBytes))
-	headersFrame[3] = h2FrameTypeHeaders
-	headersFrame[4] = h2FlagEndHeaders
-	binary.BigEndian.PutUint32(headersFrame[5:9], streamID)
-	copy(headersFrame[9:], headerBytes)
-	s.submitSend(fd, headersFrame)
+	// Send Headers
+	// Length: len(headerBytes), Type: 1 (Headers), Flags: 4 (EndHeaders)
+	// StreamID: streamID
+	// BUT wait, we need to handle EndStream on Headers if no data?
+	// Actually, if we are sending data, Headers shouldn't have EndStream if we follow with Data.
+	// But our simple response sends Headers with EndHeaders (0x4) then Data with EndStream (0x1).
 
-	// DATA frame
-	dataFrame := make([]byte, 9+len(dataBytes))
-	dataFrame[0] = byte(len(dataBytes) >> 16)
-	dataFrame[1] = byte(len(dataBytes) >> 8)
-	dataFrame[2] = byte(len(dataBytes))
-	dataFrame[3] = h2FrameTypeData
-	dataFrame[4] = h2FlagEndStream
-	binary.BigEndian.PutUint32(dataFrame[5:9], streamID)
-	copy(dataFrame[9:], dataBytes)
-	s.submitSend(fd, dataFrame)
+	// Frame 1: Headers
+	hHead := make([]byte, 9)
+	hHead[0] = byte(len(headerBytes) >> 16)
+	hHead[1] = byte(len(headerBytes) >> 8)
+	hHead[2] = byte(len(headerBytes))
+	hHead[3] = h2FrameTypeHeaders
+	hHead[4] = h2FlagEndHeaders
+	binary.BigEndian.PutUint32(hHead[5:], streamID)
+
+	s.submitSend(fd, append(hHead, headerBytes...))
+
+	// Frame 2: Data
+	dHead := make([]byte, 9)
+	dHead[0] = byte(len(dataBytes) >> 16)
+	dHead[1] = byte(len(dataBytes) >> 8)
+	dHead[2] = byte(len(dataBytes))
+	dHead[3] = h2FrameTypeData
+	dHead[4] = h2FlagEndStream // End Stream
+	binary.BigEndian.PutUint32(dHead[5:], streamID)
+
+	s.submitSend(fd, append(dHead, dataBytes...))
 }

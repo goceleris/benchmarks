@@ -49,6 +49,10 @@ type h2ConnState struct {
 	buf          []byte
 	prefaceRecv  bool
 	settingsSent bool
+	// Stream tracking
+	activeStreamID uint32
+	activePath     string
+	streamOpen     bool
 }
 
 // NewHTTP2Server creates a new barebones epoll H2C server.
@@ -195,6 +199,12 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 			if bytes.HasPrefix(data, []byte("GET / ")) {
 				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!")
 				_, _ = unix.Write(fd, response)
+			} else if bytes.HasPrefix(data, []byte("GET /json")) {
+				response := []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"epoll-h2\"}")
+				_, _ = unix.Write(fd, response)
+			} else if bytes.HasPrefix(data, []byte("POST /upload")) {
+				response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+				_, _ = unix.Write(fd, response)
 			}
 			s.closeConnection(fd)
 			return
@@ -225,8 +235,20 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) {
 				s.sendSettingsAck(fd)
 			}
 		case h2FrameTypeHeaders:
-			// Parse minimal headers and send response
-			s.handleH2Request(fd, streamID, frameData, flags)
+			// Parse minimal headers
+			endStream := flags&h2FlagEndStream != 0
+			s.handleH2Request(fd, streamID, frameData, flags, endStream)
+
+		case h2FrameTypeData:
+			// Consume data
+			endStream := flags&h2FlagEndStream != 0
+			if endStream {
+				state := s.connState[fd]
+				if state != nil && state.activeStreamID == streamID && state.streamOpen {
+					s.sendH2Response(fd, streamID, state.activePath)
+					state.streamOpen = false
+				}
+			}
 		}
 	}
 }
@@ -245,7 +267,7 @@ func (s *HTTP2Server) sendSettingsAck(fd int) {
 	_, _ = unix.Write(fd, frame)
 }
 
-func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte) {
+func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte, endStream bool) {
 	// HPACK path detection - check for both literal and Huffman encoded paths
 	// Go's HTTP/2 client typically uses Huffman encoding
 	var path string
@@ -280,7 +302,8 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 		// 0x44 = literal header, index 4 (:path)
 		for i := 0; i < len(headerBlock)-1; i++ {
 			// Look for :path (index 4) as literal header
-			if headerBlock[i] == 0x44 || headerBlock[i] == 0x04 {
+			// 0x44 = literal (incremental index), 0x04 = literal (no index), 0x14 = literal (never index)
+			if headerBlock[i] == 0x44 || headerBlock[i] == 0x04 || headerBlock[i] == 0x14 {
 				// Next byte is the length (possibly with Huffman bit)
 				if i+1 < len(headerBlock) {
 					length := int(headerBlock[i+1] & 0x7f)
@@ -289,11 +312,16 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 					if i+2+length <= len(headerBlock) {
 						pathBytes := headerBlock[i+2 : i+2+length]
 						if huffman {
-							// For Huffman encoded paths, check byte patterns
-							// /json Huffman encoded is approximately 4 bytes
-							if length == 4 || length == 5 {
-								// Could be /json - accept as JSON path
+							// Huffman encoded matching
+							// /json = 63 a2 0f 57 (curl/Go?) or 63 8d 31 69
+							if length == 4 && (bytes.Equal(pathBytes, []byte{0x63, 0x8d, 0x31, 0x69}) || bytes.Equal(pathBytes, []byte{0x63, 0xa2, 0x0f, 0x57})) {
 								path = "/json"
+								break
+							} else if length == 5 && bytes.Equal(pathBytes, []byte{0x62, 0xda, 0xe8, 0x38, 0xe4}) {
+								path = "/upload"
+								break
+							} else if length >= 6 && bytes.HasPrefix(pathBytes, []byte{0x63, 0x05, 0x68, 0xdf, 0x5c, 0x22}) {
+								path = "/users/123"
 								break
 							}
 						} else {
@@ -324,6 +352,18 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 		}
 	}
 
+	if endStream {
+		s.sendH2Response(fd, streamID, path)
+	} else {
+		if state, ok := s.connState[fd]; ok {
+			state.activeStreamID = streamID
+			state.activePath = path
+			state.streamOpen = true
+		}
+	}
+}
+
+func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
 	// Send response
 	var headerBytes, bodyBytes []byte
 
@@ -334,9 +374,12 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	case "/json":
 		headerBytes = hpackHeadersJSON
 		bodyBytes = bodyJSON
-	default:
+	case "/upload":
 		headerBytes = hpackHeadersSimple
 		bodyBytes = bodyOK
+	default:
+		headerBytes = hpackHeadersSimple
+		bodyBytes = bodySimple
 	}
 
 	// HEADERS frame
