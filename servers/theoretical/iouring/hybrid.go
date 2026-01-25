@@ -174,7 +174,8 @@ func (s *HybridServer) submitAccept() {
 	}
 	atomic.StoreUint32(s.sqTail, tail)
 
-	// Immediate submit removed for batching
+	// Immediate submit pattern (like http1.go)
+	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
 }
 
 func (s *HybridServer) submitRecv(fd int) {
@@ -321,8 +322,8 @@ func (s *HybridServer) eventLoop() error {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
 				} else if fd < bufferCount {
-					// Wait for next request
-					s.submitRecv(fd)
+					// Do NOT submitRecv here. We keep the read loop active via Read Completion.
+					// This avoids double-submission race conditions.
 				}
 			}
 		}
@@ -347,10 +348,15 @@ func (s *HybridServer) handleData(fd int, data []byte) (consumed int, closed boo
 	}
 
 	if state.protocol == protoUnknownIO {
-		if len(data) >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
+		// Fast check for HTTP/2 Preface (PRI * ...)
+		if len(data) >= h2PrefaceLen && bytes.Equal(data[:h2PrefaceLen], []byte(h2Preface)) {
 			state.protocol = protoH2CIO
-		} else if bytes.HasPrefix(data, []byte("GET ")) ||
-			bytes.HasPrefix(data, []byte("POST ")) {
+		} else if len(data) > 0 {
+			// Infer HTTP/1.1 from method
+			// Check "GET ", "POST", "HEAD" etc.
+			// Simple check: Is it ASCII? Just default to HTTP/1.1 for now if H2 check fails
+			// and let the handler validate.
+			// But maintain Upgrade check logic just in case.
 			if bytes.Contains(data, []byte("Upgrade: h2c")) {
 				state.protocol = protoH2CIO
 				s.handleH2CUpgrade(fd, state)
@@ -358,13 +364,7 @@ func (s *HybridServer) handleData(fd int, data []byte) (consumed int, closed boo
 			}
 			state.protocol = protoHTTP1IO
 		} else {
-			if bytes.Contains(data, []byte("GET /")) {
-				state.protocol = protoHTTP1IO
-			} else {
-				_ = unix.Close(fd)
-				delete(s.connState, fd)
-				return 0, true
-			}
+			return 0, false
 		}
 	}
 

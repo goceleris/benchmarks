@@ -37,9 +37,7 @@ terraform/*.tfplan
 # Results
 # Keep official results (latest/ and version folders like v0.1.0/)
 # Ignore temporary test results and raw benchmark output
-results/test/
-results/*.json
-results/charts/
+results/
 
 # Logs
 *.log
