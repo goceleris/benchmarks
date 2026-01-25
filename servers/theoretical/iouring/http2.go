@@ -220,6 +220,9 @@ func (s *HTTP2Server) submitRecv(fd int) {
 		s.sqArray[i&s.sqMask] = i & s.sqMask
 	}
 	atomic.StoreUint32(s.sqTail, tail)
+
+	// Immediate submit (from PoC pattern)
+	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
 }
 
 func (s *HTTP2Server) submitSend(fd int, data []byte) {
@@ -251,22 +254,14 @@ func (s *HTTP2Server) submitSend(fd int, data []byte) {
 		s.sqArray[i&s.sqMask] = i & s.sqMask
 	}
 	atomic.StoreUint32(s.sqTail, tail)
+
+	// Immediate submit (from PoC pattern)
+	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
 }
 
 func (s *HTTP2Server) eventLoop() error {
 	for {
-		// Calculate pending submissions
-		sqTail := atomic.LoadUint32(s.sqTail)
-		sqHead := atomic.LoadUint32(s.sqHead)
-		toSubmit := sqTail - sqHead
-
-		// Enter kernel: submit pending SQEs and wait for at least 1 CQE
-		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
-			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
-		if errno != 0 && errno != unix.EINTR {
-			return fmt.Errorf("io_uring_enter: %w", errno)
-		}
-
+		// Process all available CQEs first (PoC pattern)
 		for {
 			head := atomic.LoadUint32(s.cqHead)
 			tail := atomic.LoadUint32(s.cqTail)
@@ -343,7 +338,12 @@ func (s *HTTP2Server) eventLoop() error {
 				}
 			}
 		}
-
+		// Wait for at least 1 CQE (submit 0 - all submits done inline)
+		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
+			0, 1, IORING_ENTER_GETEVENTS, 0, 0)
+		if errno != 0 && errno != unix.EINTR {
+			return fmt.Errorf("io_uring_enter: %w", errno)
+		}
 	}
 }
 
