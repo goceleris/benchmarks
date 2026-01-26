@@ -7,12 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// HTTP/2 constants (same as epoll)
+// HTTP/2 constants
 const (
 	h2Preface           = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 	h2PrefaceLen        = 24
@@ -33,70 +34,59 @@ var (
 	bodyJSON           = []byte(`{"message":"Hello, World!","server":"iouring-h2"}`)
 	bodyOK             = []byte("OK")
 
-	// Global static frames (Stream ID 0)
-	// Settings Frame: Length=12, Type=4, Flags=0, Stream=0
-	// Parameter: SETTINGS_HEADER_TABLE_SIZE (1) = 0 (Disable dynamic table)
-	// Parameter: SETTINGS_INITIAL_WINDOW_SIZE (4) = 1,048,576 (1MB)
 	frameSettings = []byte{
-		0x00, 0x00, 0x0C, // Length 12
-		0x04,                   // Type Settings
-		0x00,                   // Flags
-		0x00, 0x00, 0x00, 0x00, // Stream 0
-		0x00, 0x01, // ID 1 (Header Table Size)
-		0x00, 0x00, 0x00, 0x00, // Value 0
-		0x00, 0x04, // ID 4 (Initial Window Size)
-		0x00, 0x10, 0x00, 0x00, // Value 1MB
+		0x00, 0x00, 0x0C,
+		h2FrameTypeSettings,
+		0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x04, 0x00, 0x10, 0x00, 0x00,
 	}
-	// Settings Ack: Length=0, Type=4, Flags=1 (Ack), Stream=0
 	frameSettingsAck = []byte{0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00}
 )
 
-// HTTP2Server is a barebones H2C server using io_uring with multishot.
-type HTTP2Server struct {
-	port      string
-	ringFd    int
-	listenFd  int
-	sqHead    *uint32
-	sqTail    *uint32
-	cqHead    *uint32
-	cqTail    *uint32
-	sqMask    uint32
-	cqMask    uint32
-	sqeTail   uint32 // Local tracking
-	sqes      []IoUringSqe
-	cqes      []IoUringCqe
-	sqArray   []uint32
-	buffers   []byte
-	connState map[int]*h2ioConnState
+// h2ioConnState tracks HTTP/2 connection state
+type h2ioConnState struct {
+	prefaceRecv  bool
+	settingsSent bool
+	streams      map[uint32]string
 }
 
-type h2ioConnState struct {
-	prefaceRecv     bool
-	settingsSent    bool
-	inflightBuffers [][]byte // Keep buffers alive until completion
-	pos             int      // Current buffer position
-	// Stream tracking
-	streams map[uint32]string
+// HTTP2Server is a barebones H2C server using io_uring.
+type HTTP2Server struct {
+	port          string
+	ringFd        int
+	listenFd      int
+	sqHead        *uint32
+	sqTail        *uint32
+	cqHead        *uint32
+	cqTail        *uint32
+	sqMask        uint32
+	cqMask        uint32
+	sqeTail       uint32
+	submittedTail uint32
+	sqes          []IoUringSqe
+	cqes          []IoUringCqe
+	sqArray       []uint32
+	// Pre-allocated buffers indexed by fd
+	buffers [bufferCount][]byte
+	connPos [bufferCount]int
+	connH2  [bufferCount]*h2ioConnState
 }
 
 // NewHTTP2Server creates a new barebones io_uring H2C server.
 func NewHTTP2Server(port string) *HTTP2Server {
-	return &HTTP2Server{
-		port:      port,
-		connState: make(map[int]*h2ioConnState),
+	s := &HTTP2Server{
+		port: port,
 	}
+	for i := 0; i < bufferCount; i++ {
+		s.buffers[i] = make([]byte, bufferSize)
+	}
+	return s
 }
 
 // Run starts the io_uring event loop for H2C.
 func (s *HTTP2Server) Run() error {
-	// Allocate buffers using mmap (pinned memory)
-	bufSize := bufferCount * bufferSize
-	bufPtr, err := unix.Mmap(-1, 0, bufSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
-	if err != nil {
-		return fmt.Errorf("mmap buffers: %w", err)
-	}
-	s.buffers = (*[1 << 30]byte)(unsafe.Pointer(&bufPtr[0]))[:bufSize:bufSize]
-
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
@@ -115,7 +105,7 @@ func (s *HTTP2Server) Run() error {
 		return fmt.Errorf("bind: %w", err)
 	}
 
-	if err := unix.Listen(listenFd, 4096); err != nil {
+	if err := unix.Listen(listenFd, 65535); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 
@@ -124,15 +114,11 @@ func (s *HTTP2Server) Run() error {
 	}
 
 	s.submitAccept()
-
 	return s.eventLoop()
 }
 
 func (s *HTTP2Server) setupRing() error {
-	params := &IoUringParams{
-		Flags: 0,
-	}
-
+	params := &IoUringParams{Flags: 0}
 	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
 		return fmt.Errorf("io_uring_setup: %w", errno)
@@ -142,151 +128,83 @@ func (s *HTTP2Server) setupRing() error {
 	sqSize := params.SqOff.Array + params.SqEntries*4
 	cqSize := params.CqOff.Cqes + params.CqEntries*uint32(unsafe.Sizeof(IoUringCqe{}))
 
-	sqPtr, err := unix.Mmap(s.ringFd, 0, int(sqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
-	if err != nil {
-		return fmt.Errorf("mmap sq: %w", err)
-	}
-
-	cqPtr, err := unix.Mmap(s.ringFd, 0x8000000, int(cqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
-	if err != nil {
-		return fmt.Errorf("mmap cq: %w", err)
-	}
-
+	sqPtr, _ := unix.Mmap(s.ringFd, 0, int(sqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	cqPtr, _ := unix.Mmap(s.ringFd, 0x8000000, int(cqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	sqeSize := params.SqEntries * uint32(unsafe.Sizeof(IoUringSqe{}))
-	sqePtr, err := unix.Mmap(s.ringFd, 0x10000000, int(sqeSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
-	if err != nil {
-		return fmt.Errorf("mmap sqes: %w", err)
-	}
+	sqePtr, _ := unix.Mmap(s.ringFd, 0x10000000, int(sqeSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 
 	s.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
 	s.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	s.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
 	s.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
-
 	s.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	s.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
 	s.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
 	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
-
 	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
-
 	s.sqeTail = atomic.LoadUint32(s.sqTail)
+	s.submittedTail = s.sqeTail
 
 	return nil
 }
 
-func (s *HTTP2Server) submitAccept() {
+func (s *HTTP2Server) getSqe() *IoUringSqe {
 	head := atomic.LoadUint32(s.sqHead)
 	next := s.sqeTail + 1
-
 	if next-head > uint32(sqeCount) {
+		return nil
+	}
+	idx := s.sqeTail & s.sqMask
+	s.sqeTail = next
+	sqe := &s.sqes[idx]
+	*sqe = IoUringSqe{}
+	return sqe
+}
+
+func (s *HTTP2Server) flushSq() {
+	tail := s.sqeTail
+	sqTail := atomic.LoadUint32(s.sqTail)
+	for i := sqTail; i < tail; i++ {
+		s.sqArray[i&s.sqMask] = i & s.sqMask
+	}
+	atomic.StoreUint32(s.sqTail, tail)
+}
+
+func (s *HTTP2Server) submitAccept() {
+	sqe := s.getSqe()
+	if sqe == nil {
 		return
 	}
-
-	idx := s.sqeTail & s.sqMask
-	sqe := &s.sqes[idx]
-	s.sqeTail = next
-
-	*sqe = IoUringSqe{}
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(s.listenFd)
 	sqe.UserData = uint64(s.listenFd)
-
-	tail := s.sqeTail
-	sqTail := atomic.LoadUint32(s.sqTail)
-	for i := sqTail; i < tail; i++ {
-		s.sqArray[i&s.sqMask] = i & s.sqMask
-	}
-	atomic.StoreUint32(s.sqTail, tail)
-
-	// Immediate submit
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
+	s.flushSq()
 }
 
 func (s *HTTP2Server) submitRecv(fd int) {
-	state := s.connState[fd]
-	if state == nil {
+	sqe := s.getSqe()
+	if sqe == nil {
 		return
 	}
-
-	head := atomic.LoadUint32(s.sqHead)
-	next := s.sqeTail + 1
-
-	if next-head > uint32(sqeCount) {
-		return
-	}
-
-	idx := s.sqeTail & s.sqMask
-	sqe := &s.sqes[idx]
-	s.sqeTail = next
-
-	*sqe = IoUringSqe{}
+	pos := s.connPos[fd]
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	// Read into buffer at current position
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd*bufferSize+state.pos])))
-	sqe.Len = uint32(bufferSize - state.pos)
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd][pos])))
+	sqe.Len = uint32(bufferSize - pos)
 	sqe.UserData = uint64(fd)
-
-	tail := s.sqeTail
-	sqTail := atomic.LoadUint32(s.sqTail)
-	for i := sqTail; i < tail; i++ {
-		s.sqArray[i&s.sqMask] = i & s.sqMask
-	}
-	atomic.StoreUint32(s.sqTail, tail)
-
-	// Immediate submit (from PoC pattern)
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
-}
-
-func (s *HTTP2Server) submitSend(fd int, data []byte) {
-	if state, ok := s.connState[fd]; ok {
-		state.inflightBuffers = append(state.inflightBuffers, data)
-	}
-
-	head := atomic.LoadUint32(s.sqHead)
-	next := s.sqeTail + 1
-
-	if next-head > uint32(sqeCount) {
-		return
-	}
-
-	idx := s.sqeTail & s.sqMask
-	sqe := &s.sqes[idx]
-	s.sqeTail = next
-
-	*sqe = IoUringSqe{}
-	sqe.Opcode = IORING_OP_SEND
-	sqe.Fd = int32(fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
-	sqe.Len = uint32(len(data))
-	sqe.UserData = uint64(fd) | (1 << 32)
-
-	tail := s.sqeTail
-	sqTail := atomic.LoadUint32(s.sqTail)
-	for i := sqTail; i < tail; i++ {
-		s.sqArray[i&s.sqMask] = i & s.sqMask
-	}
-	atomic.StoreUint32(s.sqTail, tail)
-
-	// Immediate submit (from PoC pattern)
-	_, _, _ = unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd), 1, 0, 0, 0, 0)
+	s.flushSq()
 }
 
 func (s *HTTP2Server) eventLoop() error {
 	for {
-		// Process all available CQEs first (PoC pattern)
 		for {
 			head := atomic.LoadUint32(s.cqHead)
 			tail := atomic.LoadUint32(s.cqTail)
-
 			if head == tail {
 				break
 			}
 
-			idx := head & s.cqMask
-			cqe := &s.cqes[idx]
-
+			cqe := &s.cqes[head&s.cqMask]
 			atomic.StoreUint32(s.cqHead, head+1)
 
 			fd := int(cqe.UserData & 0xFFFFFFFF)
@@ -295,81 +213,76 @@ func (s *HTTP2Server) eventLoop() error {
 			if fd == s.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					s.connState[connFd] = &h2ioConnState{
-						pos:     0,
-						streams: make(map[uint32]string),
-					}
-
 					if connFd < bufferCount {
+						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+						s.connPos[connFd] = 0
+						s.connH2[connFd] = &h2ioConnState{streams: make(map[uint32]string)}
 						s.submitRecv(connFd)
 					} else {
 						_ = unix.Close(connFd)
 					}
-
 					s.submitAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					n := int(cqe.Res)
-					state := s.connState[fd]
-					if state != nil {
-						state.pos += n
-						// Process available data
-						data := s.buffers[fd*bufferSize : fd*bufferSize+state.pos]
-						consumed, closed := s.handleH2Data(fd, data)
-
-						if closed {
-							// Connection closed by handler
-							_ = unix.Close(fd)
-							delete(s.connState, fd)
-						} else {
-							// Compact buffer if needed
-							if consumed > 0 {
-								copy(s.buffers[fd*bufferSize:], s.buffers[fd*bufferSize+consumed:fd*bufferSize+state.pos])
-								state.pos -= consumed
-							}
-
-							// If buffer full, we have a problem (frame too large)
-							// For benchmark, assume we recover space.
-							if state.pos >= bufferSize {
-								// Overflow protection: close connection
-								_ = unix.Close(fd)
-								delete(s.connState, fd)
-							} else {
-								s.submitRecv(fd)
-							}
-						}
-					}
-				} else if cqe.Res <= 0 {
-					_ = unix.Close(fd)
-					delete(s.connState, fd)
+					s.handleData(fd, int(cqe.Res))
+				} else {
+					s.closeConn(fd)
 				}
-			} else if isSend {
-				if state, ok := s.connState[fd]; ok && len(state.inflightBuffers) > 0 {
-					state.inflightBuffers = state.inflightBuffers[1:]
-				}
+			} else {
 				if cqe.Res < 0 {
-					_ = unix.Close(fd)
-					delete(s.connState, fd)
+					s.closeConn(fd)
 				}
 			}
 		}
-		// Wait for at least 1 CQE (submit 0 - all submits done inline)
+
+		tail := atomic.LoadUint32(s.sqTail)
+		toSubmit := tail - s.submittedTail
+		s.submittedTail = tail
 		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
-			0, 1, IORING_ENTER_GETEVENTS, 0, 0)
+			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
 		}
 	}
 }
 
-func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bool) {
-	state := s.connState[fd]
+func (s *HTTP2Server) handleData(fd int, n int) {
+	s.connPos[fd] += n
+	buf := s.buffers[fd]
+	pos := s.connPos[fd]
+	state := s.connH2[fd]
 	if state == nil {
-		return 0, true
+		s.closeConn(fd)
+		return
 	}
 
+	for {
+		consumed, closed := s.processH2(fd, state, buf[:pos])
+		if closed {
+			return
+		}
+		if consumed > 0 {
+			if consumed < pos {
+				copy(buf, buf[consumed:pos])
+				pos -= consumed
+			} else {
+				pos = 0
+			}
+		} else {
+			break
+		}
+	}
+
+	s.connPos[fd] = pos
+	if pos < bufferSize {
+		s.submitRecv(fd)
+	} else {
+		s.closeConn(fd)
+	}
+}
+
+func (s *HTTP2Server) processH2(fd int, state *h2ioConnState, data []byte) (int, bool) {
 	offset := 0
 
 	if !state.prefaceRecv {
@@ -377,71 +290,45 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 			if string(data[:h2PrefaceLen]) == h2Preface {
 				state.prefaceRecv = true
 				offset = h2PrefaceLen
-
 				if !state.settingsSent {
-					s.submitSend(fd, frameSettings)
+					rawWriteIO(fd, frameSettings)
 					state.settingsSent = true
 				}
-			} else {
-				// Legacy HTTP/1.1 fallback
-				// Ideally we should remove this too if client supports proper H2C check.
-				// Keeping ONLY root for basic connectivity check if curl doesn't use H2C.
-				// But user asked for NO fallback.
-				// Let's rely on the client using H2C.
-				if bytes.HasPrefix(data, []byte("GET / ")) {
-					s.submitSend(fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"))
-					return len(data), false
-				}
-				_ = unix.Close(fd)
-				delete(s.connState, fd)
-				return 0, true
+				return offset, false
 			}
-		} else {
-			// Not enough data for preface, wait
-			return 0, false
+			s.closeConn(fd)
+			return 0, true
 		}
+		return 0, false
 	}
 
-	// Process frames
 	for offset+h2FrameHeaderLen <= len(data) {
 		length := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
-
-		totalFrameLen := h2FrameHeaderLen + length
-
-		if offset+totalFrameLen > len(data) {
-			break // Incomplete frame
-		}
-
 		frameType := data[offset+3]
 		flags := data[offset+4]
 		streamID := binary.BigEndian.Uint32(data[offset+5:offset+9]) & 0x7fffffff
 
-		frameData := data[offset+h2FrameHeaderLen : offset+totalFrameLen]
+		totalLen := h2FrameHeaderLen + length
+		if offset+totalLen > len(data) {
+			break
+		}
+
+		frameData := data[offset+h2FrameHeaderLen : offset+totalLen]
 
 		switch frameType {
 		case h2FrameTypeSettings:
 			if flags&h2FlagAck == 0 {
-				// Send settings ACK
-				s.submitSend(fd, frameSettingsAck)
+				rawWriteIO(fd, frameSettingsAck)
 			}
 		case h2FrameTypeHeaders:
-			// Parse minimal headers
-			// Logic: check for EndStream (0x1) or EndHeaders (0x4)
-			// For simplicity in this benchmark, we assume headers fit in one frame (EndHeaders set)
 			endStream := flags&h2FlagEndStream != 0
-			s.handleH2Request(fd, streamID, frameData, flags, endStream)
-
+			s.handleH2Request(fd, streamID, frameData, endStream, state)
 		case h2FrameTypeData:
-			// Consume data and send Window Update
 			if length > 0 {
-				s.submitWindowUpdate(fd, 0, uint32(length))        // Connection flow control
-				s.submitWindowUpdate(fd, streamID, uint32(length)) // Stream flow control
+				s.sendWindowUpdates(fd, streamID, uint32(length))
 			}
-
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
-				state := s.connState[fd]
-				// Lookup stream
 				if path, ok := state.streams[streamID]; ok {
 					s.sendH2Response(fd, streamID, path)
 					delete(state.streams, streamID)
@@ -449,17 +336,14 @@ func (s *HTTP2Server) handleH2Data(fd int, data []byte) (consumed int, closed bo
 			}
 		}
 
-		offset += totalFrameLen
+		offset += totalLen
 	}
 
 	return offset, false
 }
 
-func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, flags byte, endStream bool) {
-	// HPACK path detection - check for both literal and Huffman encoded paths
+func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, endStream bool, state *h2ioConnState) {
 	var path string
-
-	// ASCII literal check first
 	if bytes.Contains(headerBlock, []byte("/json")) {
 		path = "/json"
 	} else if bytes.Contains(headerBlock, []byte("/users/")) {
@@ -467,170 +351,91 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	} else if bytes.Contains(headerBlock, []byte("/upload")) {
 		path = "/upload"
 	} else {
-		// Check for :path header (index 4) with Huffman-encoded value
-		// Look for name index 4 (:path) or 5 (:path)
-		// Masks:
-		// - 0x80 (Indexed) -> 1xxxxxxx. Index = val & 0x7f. (Check 4 or 5)
-		// - 0x40 (Literal Incr Enum) -> 01xxxxxx. Index = val & 0x3f. (Check 4 or 5)
-		// - 0x00/0x10 (Literal No/Never Index) -> 00xxxxxx. Index = val & 0x0f. (Check 4 or 5)
-
-		for i := 0; i < len(headerBlock)-1; i++ {
-			b := headerBlock[i]
-			var idx int
-			isMatch := false
-
-			if b&0x80 != 0 {
-				// Indexed field - skip (no value) unless 0x84/0x85 (default path)
-				if b == 0x84 {
-					if path == "" {
-						path = "/"
-					}
-				}
-				continue
-			} else if b&0xC0 == 0x40 {
-				// Literal with Incremental Indexing (01xxxxxx)
-				idx = int(b & 0x3F)
-				if idx == 4 || idx == 5 {
-					isMatch = true
-				}
-			} else if b&0xF0 == 0x00 || b&0xF0 == 0x10 {
-				// Literal without Indexing (0000xxxx) or Never Indexed (0001xxxx)
-				idx = int(b & 0x0F)
-				if idx == 4 || idx == 5 {
-					isMatch = true
-				}
-			}
-
-			if isMatch {
-				// Next byte is the length (possibly with Huffman bit)
-				if i+1 < len(headerBlock) {
-					length := int(headerBlock[i+1] & 0x7f)
-					huffman := (headerBlock[i+1] & 0x80) != 0
-
-					if i+2+length <= len(headerBlock) {
-						pathBytes := headerBlock[i+2 : i+2+length]
-						if huffman {
-							// Huffman encoded matching
-							// /json = 63 a2 0f 57 (curl/Go?) or 63 8d 31 69
-							if length == 4 && (bytes.Equal(pathBytes, []byte{0x63, 0x8d, 0x31, 0x69}) || bytes.Equal(pathBytes, []byte{0x63, 0xa2, 0x0f, 0x57})) {
-								path = "/json"
-							} else if length == 5 && bytes.Equal(pathBytes, []byte{0x62, 0xda, 0xe8, 0x38, 0xe4}) {
-								path = "/upload"
-							} else if length >= 6 && bytes.HasPrefix(pathBytes, []byte{0x63, 0x05, 0x68, 0xdf, 0x5c, 0x22}) {
-								path = "/users/123"
-							}
-						} else {
-							// Non-Huffman literal
-							pathStr := string(pathBytes)
-							if pathStr == "/json" {
-								path = "/json"
-							} else if len(pathStr) > 7 && pathStr[:7] == "/users/" {
-								path = "/users/123"
-							} else if pathStr == "/upload" {
-								path = "/upload"
-							} else if pathStr == "/" {
-								path = "/"
-							}
-						}
-					}
-				}
-			}
-		}
-		if path == "" {
-			path = "/"
-		}
+		path = "/"
 	}
 
 	if endStream {
-		// Respond immediately
 		s.sendH2Response(fd, streamID, path)
 	} else {
-		// Wait for data
-		if state, ok := s.connState[fd]; ok {
-			state.streams[streamID] = path
-			// For upload, assume Expect: 100-continue is desired by typical Go clients
-			if path == "/upload" {
-				s.send100Continue(fd, streamID)
-			}
+		state.streams[streamID] = path
+		if path == "/upload" {
+			s.send100Continue(fd, streamID)
 		}
 	}
 }
 
 func (s *HTTP2Server) send100Continue(fd int, streamID uint32) {
-	// :status 100 -> 0x08 0x03 "100"
 	h100 := []byte{0x08, 0x03, 0x31, 0x30, 0x30}
-
 	frame := make([]byte, 9+len(h100))
-	frame[0] = 0
-	frame[1] = 0
 	frame[2] = byte(len(h100))
 	frame[3] = h2FrameTypeHeaders
 	frame[4] = h2FlagEndHeaders
 	binary.BigEndian.PutUint32(frame[5:9], streamID)
 	copy(frame[9:], h100)
-
-	s.submitSend(fd, frame)
+	rawWriteIO(fd, frame)
 }
 
-func (s *HTTP2Server) submitWindowUpdate(fd int, streamID uint32, increment uint32) {
-	// Frame Header (9 bytes) + Window Size Increment (4 bytes)
-	frame := make([]byte, 13)
-	frame[0] = 0x00
-	frame[1] = 0x00
-	frame[2] = 0x04 // Length 4
-	frame[3] = 0x08 // Type WINDOW_UPDATE
-	frame[4] = 0x00 // Flags
-	binary.BigEndian.PutUint32(frame[5:9], streamID)
+func (s *HTTP2Server) sendWindowUpdates(fd int, streamID uint32, increment uint32) {
+	frame := make([]byte, 26)
+	frame[2] = 0x04
+	frame[3] = 0x08
 	binary.BigEndian.PutUint32(frame[9:13], increment)
-
-	s.submitSend(fd, frame)
+	frame[15] = 0x04
+	frame[16] = 0x08
+	binary.BigEndian.PutUint32(frame[18:22], streamID)
+	binary.BigEndian.PutUint32(frame[22:26], increment)
+	rawWriteIO(fd, frame)
 }
 
 func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
-	var headerBytes, dataBytes []byte
-
-	// Routing
-	if path == "/json" {
+	var headerBytes, bodyBytes []byte
+	switch path {
+	case "/json":
 		headerBytes = hpackHeadersJSON
-		dataBytes = bodyJSON
-	} else if path == "/upload" {
-		// POST response
+		bodyBytes = bodyJSON
+	case "/upload":
 		headerBytes = hpackHeadersSimple
-		dataBytes = []byte("OK")
-	} else if len(path) > 7 && path[:7] == "/users/" {
+		bodyBytes = bodyOK
+	default:
 		headerBytes = hpackHeadersSimple
-		dataBytes = bodySimple
-	} else {
-		headerBytes = hpackHeadersSimple // Default 200 OK text/plain
-		dataBytes = bodySimple
+		bodyBytes = bodySimple
 	}
 
-	// Send Headers
-	// Length: len(headerBytes), Type: 1 (Headers), Flags: 4 (EndHeaders)
-	// StreamID: streamID
-	// BUT wait, we need to handle EndStream on Headers if no data?
-	// Actually, if we are sending data, Headers shouldn't have EndStream if we follow with Data.
-	// But our simple response sends Headers with EndHeaders (0x4) then Data with EndStream (0x1).
+	totalLen := 9 + len(headerBytes) + 9 + len(bodyBytes)
+	frame := make([]byte, totalLen)
 
-	// Frame 1: Headers
-	hHead := make([]byte, 9)
-	hHead[0] = byte(len(headerBytes) >> 16)
-	hHead[1] = byte(len(headerBytes) >> 8)
-	hHead[2] = byte(len(headerBytes))
-	hHead[3] = h2FrameTypeHeaders
-	hHead[4] = h2FlagEndHeaders
-	binary.BigEndian.PutUint32(hHead[5:], streamID)
+	frame[0] = byte(len(headerBytes) >> 16)
+	frame[1] = byte(len(headerBytes) >> 8)
+	frame[2] = byte(len(headerBytes))
+	frame[3] = h2FrameTypeHeaders
+	frame[4] = h2FlagEndHeaders
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	copy(frame[9:], headerBytes)
 
-	s.submitSend(fd, append(hHead, headerBytes...))
+	off := 9 + len(headerBytes)
+	frame[off] = byte(len(bodyBytes) >> 16)
+	frame[off+1] = byte(len(bodyBytes) >> 8)
+	frame[off+2] = byte(len(bodyBytes))
+	frame[off+3] = h2FrameTypeData
+	frame[off+4] = h2FlagEndStream
+	binary.BigEndian.PutUint32(frame[off+5:off+9], streamID)
+	copy(frame[off+9:], bodyBytes)
 
-	// Frame 2: Data
-	dHead := make([]byte, 9)
-	dHead[0] = byte(len(dataBytes) >> 16)
-	dHead[1] = byte(len(dataBytes) >> 8)
-	dHead[2] = byte(len(dataBytes))
-	dHead[3] = h2FrameTypeData
-	dHead[4] = h2FlagEndStream // End Stream
-	binary.BigEndian.PutUint32(dHead[5:], streamID)
+	rawWriteIO(fd, frame)
+}
 
-	s.submitSend(fd, append(dHead, dataBytes...))
+func (s *HTTP2Server) closeConn(fd int) {
+	_ = unix.Close(fd)
+	s.connPos[fd] = 0
+	s.connH2[fd] = nil
+}
+
+func rawWriteH2(fd int, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	_, _, _ = syscall.Syscall(syscall.SYS_WRITE,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)))
 }
