@@ -1,0 +1,432 @@
+name: Benchmark (Fast)
+
+# Fast mode: Runs on PRs for quick trend validation
+# Uses cheaper virtualized instances (c5.large, c6g.medium)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Benchmark duration (e.g., 15s, 30s)'
+        required: false
+        default: '15s'
+      benchmark_mode:
+        description: 'Benchmark servers to test'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - baseline
+          - theoretical
+          - all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
+  TF_VAR_benchmark_mode: fast
+
+jobs:
+  # ============================================================
+  # Phase 1: Launch Fast Infrastructure
+  # ============================================================
+  launch:
+    name: Launch Fast Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      arm64_launched: ${{ steps.launch_arm64.outputs.launched }}
+      x86_launched: ${{ steps.launch_x86.outputs.launched }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+      
+      - name: Launch x86 Instance
+        id: launch_x86
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "Launching x86 benchmark instance..."
+          if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_x86; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "[OK] x86 instance launched successfully"
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "[WARN] x86 instance failed to launch (Spot capacity issue)"
+          fi
+      
+      - name: Launch ARM64 Instance
+        id: launch_arm64
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "Launching ARM64 benchmark instance..."
+          if terraform apply -auto-approve -target=aws_spot_instance_request.benchmark_arm64; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "[OK] ARM64 instance launched successfully"
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "[WARN] ARM64 instance failed to launch (Spot capacity issue)"
+          fi
+      
+      - name: Check At Least One Launched
+        run: |
+          if [[ "${{ steps.launch_x86.outputs.launched }}" != "true" && "${{ steps.launch_arm64.outputs.launched }}" != "true" ]]; then
+            echo "[ERROR] BOTH instances failed to launch!"
+            exit 1
+          fi
+          echo "[OK] At least one instance launched successfully"
+      
+      - name: Wait for Runners
+        run: |
+          echo "Waiting for fast runners to register (60s)..."
+          sleep 60
+
+  # ============================================================
+  # Phase 2: Fast Benchmark (ARM64)
+  # ============================================================
+  benchmark-arm64:
+    name: Fast Benchmark (ARM64)
+    needs: launch
+    if: needs.launch.outputs.arm64_launched == 'true'
+    runs-on: [self-hosted, fast-arm64]
+    timeout-minutes: 30
+    continue-on-error: true
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server and Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+      
+      - name: Run Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+      
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-arm64
+          path: results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ============================================================
+  # Phase 2: Fast Benchmark (x86)
+  # ============================================================
+  benchmark-x86:
+    name: Fast Benchmark (x86)
+    needs: launch
+    if: needs.launch.outputs.x86_launched == 'true'
+    runs-on: [self-hosted, fast-x86]
+    timeout-minutes: 30
+    continue-on-error: true
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server and Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+      
+      - name: Run Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+      
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-x86
+          path: results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ============================================================
+  # Phase 3: Generate PR Comment
+  # ============================================================
+  report:
+    name: Generate Report
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download ARM64 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-arm64
+          path: results/arm64
+        continue-on-error: true
+      
+      - name: Download x86 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-x86
+          path: results/x86
+        continue-on-error: true
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Debug Artifact Structure
+        run: |
+          echo "=== Checking downloaded artifact structure ==="
+          echo "ARM64 results:"
+          find results/arm64 -name "*.json" 2>/dev/null || echo "  No JSON files found"
+          ls -laR results/arm64 2>/dev/null || echo "  Directory not found"
+          echo ""
+          echo "x86 results:"
+          find results/x86 -name "*.json" 2>/dev/null || echo "  No JSON files found"
+          ls -laR results/x86 2>/dev/null || echo "  Directory not found"
+      
+      - name: Generate Charts
+        run: |
+          pip install matplotlib numpy
+          
+          # Find and use JSON files wherever they are in the download structure
+          ARM64_JSON=$(find results/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
+          X86_JSON=$(find results/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
+          
+          # Generate charts for ARM64
+          if [ -n "$ARM64_JSON" ]; then
+            ARM64_DIR=$(dirname "$ARM64_JSON")
+            echo "Found ARM64 results in: $ARM64_DIR"
+            mkdir -p results/charts/arm64
+            python scripts/generate_charts.py "$ARM64_DIR" results/charts/arm64
+          else
+            echo "No ARM64 JSON results found"
+          fi
+          
+          # Generate charts for x86
+          if [ -n "$X86_JSON" ]; then
+            X86_DIR=$(dirname "$X86_JSON")
+            echo "Found x86 results in: $X86_DIR"
+            mkdir -p results/charts/x86
+            python scripts/generate_charts.py "$X86_DIR" results/charts/x86
+          else
+            echo "No x86 JSON results found"
+          fi
+      
+      - name: Upload Charts Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-charts
+          path: results/charts/
+          retention-days: 30
+      
+      - name: Generate PR Comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Build PR comment body
+          COMMENT_BODY="## Fast Benchmark Results (Preview)
+          
+          > **Note**: These are quick validation results using virtualized instances.
+          > For official results, run the Metal benchmark after merge.
+          
+          ---
+          "
+          
+          # Add ARM64 results
+          if [ -f "results/charts/arm64/summary_arm64.md" ]; then
+            COMMENT_BODY+="
+          ### ARM64 (Graviton)
+          
+          $(cat results/charts/arm64/summary_arm64.md | tail -n +2)
+          
+          <details>
+          <summary>View ARM64 Raw Data</summary>
+          
+          \`\`\`json
+          $(cat results/arm64/*.json 2>/dev/null | head -200)
+          \`\`\`
+          
+          </details>
+          
+          ---
+          "
+          else
+            COMMENT_BODY+="
+          ### ARM64 (Graviton)
+          
+          [WARN] No ARM64 results available (benchmark may have failed)
+          
+          ---
+          "
+          fi
+          
+          # Add x86 results
+          if [ -f "results/charts/x86/summary_x86.md" ]; then
+            COMMENT_BODY+="
+          ### x86 (Intel)
+          
+          $(cat results/charts/x86/summary_x86.md | tail -n +2)
+          
+          <details>
+          <summary>View x86 Raw Data</summary>
+          
+          \`\`\`json
+          $(cat results/x86/*.json 2>/dev/null | head -200)
+          \`\`\`
+          
+          </details>
+          
+          ---
+          "
+          else
+            COMMENT_BODY+="
+          ### x86 (Intel)
+          
+          [WARN] No x86 results available (benchmark may have failed)
+          
+          ---
+          "
+          fi
+          
+          # Add chart artifacts link
+          COMMENT_BODY+="
+          ### Charts
+          
+          Download the full benchmark charts from the [workflow artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          
+          | Chart Type | ARM64 | x86 |
+          |------------|-------|-----|"
+          
+          for chart_type in simple json path big-request; do
+            COMMENT_BODY+="
+          | ${chart_type} throughput | OK | OK |"
+          done
+          
+          COMMENT_BODY+="
+          | latency distribution | OK | OK |
+          
+          ---
+          
+          <sub>Generated by [Celeris Benchmark Suite](https://github.com/${{ github.repository }}) • Run ID: ${{ github.run_id }}</sub>
+          "
+          
+          # Post or update comment
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          
+          # Find existing comment
+          EXISTING_COMMENT=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq '.[] | select(.body | contains("Fast Benchmark Results")) | .id' | head -1)
+          
+          if [ -n "$EXISTING_COMMENT" ]; then
+            # Update existing comment
+            gh api repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT} \
+              -X PATCH \
+              -f body="$COMMENT_BODY"
+            echo "Updated existing comment: $EXISTING_COMMENT"
+          else
+            # Create new comment
+            gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+              -f body="$COMMENT_BODY"
+            echo "Created new comment on PR #${PR_NUMBER}"
+          fi
+      
+      - name: Create Summary
+        run: |
+          echo "# Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note**: These are quick validation results using virtualized instances." >> $GITHUB_STEP_SUMMARY
+          echo "> For official results, run the Metal benchmark after merge." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f "results/charts/arm64/summary_arm64.md" ]; then
+            cat results/charts/arm64/summary_arm64.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No ARM64 results available" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## x86 Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f "results/charts/x86/summary_x86.md" ]; then
+            cat results/charts/x86/summary_x86.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No x86 results available" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================================
+  # Cleanup
+  # ============================================================
+  cleanup:
+    name: Cleanup Infrastructure
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Destroy
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          terraform init
+          terraform destroy -auto-approve || true

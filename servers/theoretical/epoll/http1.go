@@ -1,0 +1,314 @@
+//go:build linux
+
+// Package epoll provides barebones HTTP servers using raw epoll for maximum throughput.
+// These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
+package epoll
+
+import (
+	"bytes"
+	"fmt"
+	"log"
+	"net"
+	"runtime"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	maxEvents   = 4096
+	maxConns    = 4096
+	readBufSize = 8192
+)
+
+// HTTP/1.1 response templates (pre-formatted for zero-allocation)
+var (
+	responseSimple = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
+	responseJSON   = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 47\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"epoll-h1\"}")
+	responseOK     = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
+	response404    = []byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nNot Found")
+	responseUser   = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
+)
+
+// epollWorker represents a single event loop worker
+type epollWorker struct {
+	id       int
+	port     int
+	epollFd  int
+	listenFd int
+	connBuf  [][]byte
+	connPos  []int
+}
+
+// HTTP1Server is a multi-threaded HTTP/1.1 server using raw epoll.
+type HTTP1Server struct {
+	port       string
+	numWorkers int
+	workers    []*epollWorker
+}
+
+// NewHTTP1Server creates a new multi-threaded epoll HTTP/1.1 server.
+func NewHTTP1Server(port string) *HTTP1Server {
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	return &HTTP1Server{
+		port:       port,
+		numWorkers: numWorkers,
+		workers:    make([]*epollWorker, numWorkers),
+	}
+}
+
+// Run starts multiple epoll event loops.
+func (s *HTTP1Server) Run() error {
+	var portNum int
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
+
+	errCh := make(chan error, s.numWorkers)
+
+	for i := 0; i < s.numWorkers; i++ {
+		w := &epollWorker{
+			id:      i,
+			port:    portNum,
+			connBuf: make([][]byte, maxConns),
+			connPos: make([]int, maxConns),
+		}
+		// Pre-allocate buffers for this worker
+		for j := 0; j < maxConns; j++ {
+			w.connBuf[j] = make([]byte, readBufSize)
+		}
+		s.workers[i] = w
+
+		go func(worker *epollWorker) {
+			runtime.LockOSThread()
+			if err := worker.run(); err != nil {
+				errCh <- err
+			}
+		}(w)
+	}
+
+	log.Printf("epoll-h1 server listening on port %s with %d workers", s.port, s.numWorkers)
+
+	// Wait for any worker to fail
+	return <-errCh
+}
+
+func (w *epollWorker) run() error {
+	// Each worker creates its own listening socket with SO_REUSEPORT
+	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("socket: %w", err)
+	}
+	w.listenFd = listenFd
+
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
+
+	addr := &unix.SockaddrInet4{Port: w.port}
+	if err := unix.Bind(listenFd, addr); err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
+
+	if err := unix.Listen(listenFd, 65535); err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+
+	epollFd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("epoll_create1: %w", err)
+	}
+	w.epollFd = epollFd
+
+	event := &unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     int32(listenFd),
+	}
+	if err := unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event); err != nil {
+		return fmt.Errorf("epoll_ctl add listen: %w", err)
+	}
+
+	return w.eventLoop()
+}
+
+func (w *epollWorker) eventLoop() error {
+	events := make([]unix.EpollEvent, maxEvents)
+
+	for {
+		n, err := unix.EpollWait(w.epollFd, events, -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return fmt.Errorf("epoll_wait: %w", err)
+		}
+
+		for i := 0; i < n; i++ {
+			fd := int(events[i].Fd)
+
+			if fd == w.listenFd {
+				w.acceptConnections()
+			} else if events[i].Events&unix.EPOLLIN != 0 {
+				w.handleRead(fd)
+			} else if events[i].Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
+				w.closeConnection(fd)
+			}
+		}
+	}
+}
+
+func (w *epollWorker) acceptConnections() {
+	for {
+		connFd, _, err := unix.Accept4(w.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				break
+			}
+			continue
+		}
+
+		if connFd >= maxConns {
+			_ = unix.Close(connFd)
+			continue
+		}
+
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+
+		event := &unix.EpollEvent{
+			Events: unix.EPOLLIN | unix.EPOLLET,
+			Fd:     int32(connFd),
+		}
+		_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+
+		w.connPos[connFd] = 0
+	}
+}
+
+func (w *epollWorker) handleRead(fd int) {
+	buf := w.connBuf[fd]
+	pos := w.connPos[fd]
+
+	for {
+		n, err := unix.Read(fd, buf[pos:])
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				break
+			}
+			w.closeConnection(fd)
+			return
+		}
+		if n == 0 {
+			w.closeConnection(fd)
+			return
+		}
+		pos += n
+
+		// Process all complete requests (pipelining support)
+		for {
+			consumed := processHTTP1Request(fd, buf[:pos])
+			if consumed == 0 {
+				break
+			}
+			if consumed < pos {
+				copy(buf, buf[consumed:pos])
+				pos -= consumed
+			} else {
+				pos = 0
+				break
+			}
+		}
+	}
+
+	w.connPos[fd] = pos
+}
+
+func processHTTP1Request(fd int, data []byte) int {
+	headerEnd := -1
+	if len(data) >= 4 {
+		for i := 0; i <= len(data)-4; i++ {
+			if data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
+				headerEnd = i
+				break
+			}
+		}
+	}
+	if headerEnd < 0 {
+		return 0
+	}
+
+	requestLen := headerEnd + 4
+
+	// Check for POST with body
+	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
+		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
+		if clIdx > 0 {
+			clEnd := bytes.IndexByte(data[clIdx+16:headerEnd], '\r')
+			if clEnd > 0 {
+				cl := parseContentLength(data[clIdx+16 : clIdx+16+clEnd])
+				requestLen += cl
+				if len(data) < requestLen {
+					return 0
+				}
+			}
+		}
+	}
+
+	// Ultra-fast path matching
+	var response []byte
+	switch data[0] {
+	case 'G':
+		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
+			response = responseSimple
+		} else if len(data) > 9 && data[5] == 'j' {
+			response = responseJSON
+		} else if len(data) > 11 && data[5] == 'u' {
+			response = responseUser
+		} else {
+			response = response404
+		}
+	case 'P':
+		response = responseOK
+	default:
+		response = response404
+	}
+
+	rawWrite(fd, response)
+	return requestLen
+}
+
+func parseContentLength(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c >= '0' && c <= '9' {
+			n = n*10 + int(c-'0')
+		}
+	}
+	return n
+}
+
+func rawWrite(fd int, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	_, _, _ = syscall.Syscall(syscall.SYS_WRITE,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)))
+}
+
+func (w *epollWorker) closeConnection(fd int) {
+	_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+	_ = unix.Close(fd)
+	w.connPos[fd] = 0
+}
+
+// ListenAddr returns the server's listen address.
+func (s *HTTP1Server) ListenAddr() net.Addr {
+	return nil
+}

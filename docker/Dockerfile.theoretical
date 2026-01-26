@@ -1,0 +1,48 @@
+# Theoretical maximum servers Dockerfile
+# Requires Linux with kernel 6.15+ for optimal io_uring multishot support
+
+FROM golang:1.25.5-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    linux-headers-generic \
+    liburing-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy go mod files
+COPY go.mod go.sum* ./
+
+# Download dependencies
+RUN go mod download || true
+
+# Copy source code
+COPY . .
+
+# Build with CGO enabled for io_uring
+RUN GOOS=linux go build -ldflags="-s -w" -o /server ./cmd/server
+
+# Runtime image - needs modern kernel
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    liburing2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /server /usr/local/bin/server
+
+EXPOSE 8080
+
+# Note: io_uring servers require:
+# - Linux kernel 6.15+
+# - --privileged flag or appropriate capabilities
+# - seccomp profile allowing io_uring syscalls
+
+ENV SERVER_TYPE=epoll-h1
+ENV PORT=8080
+
+ENTRYPOINT ["/usr/local/bin/server"]
+CMD ["-server", "epoll-h1", "-port", "8080"]

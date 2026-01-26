@@ -1,0 +1,332 @@
+name: Benchmark (Metal)
+
+# Metal mode: Official benchmarks on bare-metal instances
+# Triggered manually by maintainers/owners or on new releases
+# Uses c5.metal (x86) and c6g.metal (ARM64)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Benchmark duration (e.g., 30s, 60s)'
+        required: false
+        default: '30s'
+
+      benchmark_mode:
+        description: 'Benchmark servers to test'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - baseline
+          - theoretical
+          - all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Restrict to repository maintainers and owners only
+env:
+  TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
+  TF_VAR_benchmark_mode: metal
+
+jobs:
+  # ============================================================
+  # Authorize: Only maintainers/owners can trigger
+  # ============================================================
+  authorize:
+    name: Authorize Caller
+    runs-on: ubuntu-latest
+    # Skip authorization for release events (already requires write access)
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Check Permissions
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+          
+          echo "User: ${{ github.actor }}"
+          echo "Permission level: $PERMISSION"
+          
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" && "$PERMISSION" != "write" ]]; then
+            echo "::error::Unauthorized: Only maintainers and owners can trigger metal benchmarks"
+            exit 1
+          fi
+          
+          echo "✅ User ${{ github.actor }} authorized with permission: $PERMISSION"
+
+  # ============================================================
+  # Phase 1: Launch Metal Infrastructure
+  # ============================================================
+  launch:
+    name: Launch Metal Infrastructure
+    runs-on: ubuntu-latest
+    needs: authorize
+    outputs:
+      arm64_launched: ${{ steps.apply.outputs.arm64_launched }}
+      x86_launched: ${{ steps.apply.outputs.x86_launched }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+      
+      - name: Terraform Apply (Metal Mode)
+        id: apply
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "🔥 Launching METAL benchmark infrastructure (c5.metal, c6g.metal)"
+          terraform apply -auto-approve
+          
+          echo "arm64_launched=true" >> $GITHUB_OUTPUT
+          echo "x86_launched=true" >> $GITHUB_OUTPUT
+      
+      - name: Wait for Metal Runners
+        run: |
+          echo "Waiting for metal runners to boot and register (120s)..."
+          sleep 120
+
+  # ============================================================
+  # Phase 2: Metal Benchmark (ARM64)
+  # ============================================================
+  benchmark-arm64:
+    name: Metal Benchmark (ARM64 Graviton)
+    needs: launch
+    runs-on: [self-hosted, metal-arm64]
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server and Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+      
+      - name: Run Official Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          echo "🔥 Running OFFICIAL metal benchmarks"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+      
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-results-arm64
+          path: results/
+          retention-days: 90
+
+  # ============================================================
+  # Phase 2: Metal Benchmark (x86)
+  # ============================================================
+  benchmark-x86:
+    name: Metal Benchmark (x86 Intel)
+    needs: launch
+    runs-on: [self-hosted, metal-x86]
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Build Server and Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+      
+      - name: Run Official Benchmarks
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          echo "🔥 Running OFFICIAL metal benchmarks"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+      
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-results-x86
+          path: results/
+          retention-days: 90
+
+  # ============================================================
+  # Phase 3: Generate Official Results
+  # ============================================================
+  report:
+    name: Generate Official Report
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download ARM64 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: metal-results-arm64
+          path: results/arm64
+        continue-on-error: true
+      
+      - name: Download x86 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: metal-results-x86
+          path: results/x86
+        continue-on-error: true
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Generate Charts
+        run: |
+          pip install matplotlib numpy
+          
+          # Generate charts for each architecture
+          if [ -d "results/arm64" ]; then
+            python scripts/generate_charts.py results/arm64 results/charts/arm64
+          fi
+          
+          if [ -d "results/x86" ]; then
+            python scripts/generate_charts.py results/x86 results/charts/x86
+          fi
+      
+      - name: Upload Official Charts
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-benchmark-charts
+          path: results/charts/
+          retention-days: 365
+      
+      - name: Commit Results to Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Always update results/latest with the most recent results
+          mkdir -p results/latest/arm64 results/latest/x86
+          
+          # Copy ARM64 results
+          if [ -d "results/charts/arm64" ]; then
+            cp -r results/charts/arm64/* results/latest/arm64/ 2>/dev/null || true
+          fi
+          
+          # Copy x86 results
+          if [ -d "results/charts/x86" ]; then
+            cp -r results/charts/x86/* results/latest/x86/ 2>/dev/null || true
+          fi
+          
+          # Add timestamp file
+          echo "Last updated: $(date -u)" > results/latest/TIMESTAMP
+          echo "Triggered by: ${{ github.actor }}" >> results/latest/TIMESTAMP
+          echo "Event: ${{ github.event_name }}" >> results/latest/TIMESTAMP
+          
+          # If this is a release, also create a version-specific folder
+          if [ "${{ github.event_name }}" == "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            mkdir -p "results/${VERSION}/arm64" "results/${VERSION}/x86"
+            
+            if [ -d "results/charts/arm64" ]; then
+              cp -r results/charts/arm64/* "results/${VERSION}/arm64/" 2>/dev/null || true
+            fi
+            
+            if [ -d "results/charts/x86" ]; then
+              cp -r results/charts/x86/* "results/${VERSION}/x86/" 2>/dev/null || true
+            fi
+            
+            echo "Release: ${VERSION}" > "results/${VERSION}/RELEASE_INFO"
+            echo "Date: $(date -u)" >> "results/${VERSION}/RELEASE_INFO"
+            
+            git add "results/${VERSION}/"
+          fi
+          
+          git add results/latest/
+          git commit -m "chore: update benchmark results [skip ci]" || echo "No changes to commit"
+          git push || echo "Push failed (may need permissions)"
+      
+      - name: Create Summary
+        run: |
+          echo "# 🔥 Official Metal Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release**: ${{ github.event.release.tag_name || 'Manual Run' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event_name }}" == "release" ]; then
+            echo "> 📦 Results committed to \`results/latest/\` and \`results/${{ github.event.release.tag_name }}/\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> 📦 Results committed to \`results/latest/\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## ARM64 (Graviton c6g.metal)" >> $GITHUB_STEP_SUMMARY
+          [ -f "results/charts/arm64/summary_arm64.md" ] && cat results/charts/arm64/summary_arm64.md >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## x86 (Intel c5.metal)" >> $GITHUB_STEP_SUMMARY
+          [ -f "results/charts/x86/summary_x86.md" ] && cat results/charts/x86/summary_x86.md >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # Cleanup
+  # ============================================================
+  cleanup:
+    name: Cleanup Infrastructure
+    needs: [benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+      
+      - name: Terraform Destroy
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          terraform init
+          terraform destroy -auto-approve || true
