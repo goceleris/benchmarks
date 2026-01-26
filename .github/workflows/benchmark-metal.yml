@@ -60,7 +60,7 @@ jobs:
             exit 1
           fi
           
-          echo "✅ User ${{ github.actor }} authorized with permission: $PERMISSION"
+          echo "User ${{ github.actor }} authorized with permission: $PERMISSION"
 
   # ============================================================
   # Phase 1: Launch Metal Infrastructure
@@ -94,7 +94,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
-          echo "🔥 Launching METAL benchmark infrastructure (c5.metal, c6g.metal)"
+          echo "Launching METAL benchmark infrastructure (c5.metal, c6g.metal)"
           terraform apply -auto-approve
           
           echo "arm64_launched=true" >> $GITHUB_OUTPUT
@@ -134,7 +134,7 @@ jobs:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
-          echo "🔥 Running OFFICIAL metal benchmarks"
+          echo "Running OFFICIAL metal benchmarks"
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
       
       - name: Upload Results
@@ -173,7 +173,7 @@ jobs:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
-          echo "🔥 Running OFFICIAL metal benchmarks"
+          echo "Running OFFICIAL metal benchmarks"
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
       
       - name: Upload Results
@@ -285,16 +285,16 @@ jobs:
       
       - name: Create Summary
         run: |
-          echo "# 🔥 Official Metal Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "# Official Metal Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Release**: ${{ github.event.release.tag_name || 'Manual Run' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ github.event_name }}" == "release" ]; then
-            echo "> 📦 Results committed to \`results/latest/\` and \`results/${{ github.event.release.tag_name }}/\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Results committed to \`results/latest/\` and \`results/${{ github.event.release.tag_name }}/\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "> 📦 Results committed to \`results/latest/\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Results committed to \`results/latest/\`" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           
