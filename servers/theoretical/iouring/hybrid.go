@@ -111,7 +111,6 @@ func (w *hybridioWorker) run() error {
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	// Tune socket buffers for better throughput
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
 
@@ -194,7 +193,6 @@ func (w *hybridioWorker) getSqe() *IoUringSqe {
 	return sqe
 }
 
-// flushAndSubmit batches all pending SQEs and submits them to the kernel
 func (w *hybridioWorker) flushAndSubmit() {
 	tail := w.sqeTail
 	for i := w.lastFlushed; i < tail; i++ {
@@ -272,7 +270,6 @@ func (w *hybridioWorker) eventLoop() error {
 			}
 		}
 
-		// Batch flush all pending SQEs
 		w.flushAndSubmit()
 
 		tail := atomic.LoadUint32(w.sqTail)
@@ -357,7 +354,6 @@ func (w *hybridioWorker) handleData(fd int, n int) {
 }
 
 func (w *hybridioWorker) handleHTTP1(fd int, data []byte) int {
-	// Fast manual search for \r\n\r\n - faster than bytes.Index for small buffers
 	headerEnd := -1
 	if len(data) >= 4 {
 		for i := 0; i <= len(data)-4; i++ {
@@ -388,7 +384,8 @@ func (w *hybridioWorker) handleHTTP1(fd int, data []byte) int {
 	}
 
 	var response []byte
-	if data[0] == 'G' {
+	switch data[0] {
+	case 'G':
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
 			response = responseSimple
 		} else if len(data) > 9 && data[5] == 'j' {
@@ -398,9 +395,9 @@ func (w *hybridioWorker) handleHTTP1(fd int, data []byte) int {
 		} else {
 			response = response404
 		}
-	} else if data[0] == 'P' {
+	case 'P':
 		response = responseOK
-	} else {
+	default:
 		response = response404
 	}
 

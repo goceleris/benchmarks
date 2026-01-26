@@ -138,7 +138,6 @@ func (w *h2ioWorker) run() error {
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	// Tune socket buffers for better throughput
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
 
@@ -220,7 +219,6 @@ func (w *h2ioWorker) getSqe() *IoUringSqe {
 	return sqe
 }
 
-// flushAndSubmit batches all pending SQEs and submits them to the kernel
 func (w *h2ioWorker) flushAndSubmit() {
 	tail := w.sqeTail
 	for i := w.lastFlushed; i < tail; i++ {
@@ -295,7 +293,6 @@ func (w *h2ioWorker) eventLoop() error {
 			}
 		}
 
-		// Batch flush all pending SQEs
 		w.flushAndSubmit()
 
 		tail := atomic.LoadUint32(w.sqTail)

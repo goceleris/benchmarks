@@ -101,7 +101,6 @@ func (w *hybridWorker) run() error {
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	// Tune socket buffers for better throughput
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
 
@@ -278,7 +277,6 @@ func (w *hybridWorker) handleRead(fd int) {
 }
 
 func (w *hybridWorker) handleHTTP1(fd int, data []byte) int {
-	// Fast manual search for \r\n\r\n - faster than bytes.Index for small buffers
 	headerEnd := -1
 	if len(data) >= 4 {
 		for i := 0; i <= len(data)-4; i++ {

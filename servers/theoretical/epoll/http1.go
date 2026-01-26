@@ -18,8 +18,8 @@ import (
 
 const (
 	maxEvents   = 4096
-	maxConns    = 4096 // Reduced from 65536 to save memory
-	readBufSize = 8192 // Sufficient for most HTTP requests including POST with body
+	maxConns    = 4096
+	readBufSize = 8192
 )
 
 // HTTP/1.1 response templates (pre-formatted for zero-allocation)
@@ -107,7 +107,6 @@ func (w *epollWorker) run() error {
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	// Tune socket buffers for better throughput
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
 
@@ -230,7 +229,6 @@ func (w *epollWorker) handleRead(fd int) {
 }
 
 func processHTTP1Request(fd int, data []byte) int {
-	// Fast manual search for \r\n\r\n - faster than bytes.Index for small buffers
 	headerEnd := -1
 	if len(data) >= 4 {
 		for i := 0; i <= len(data)-4; i++ {

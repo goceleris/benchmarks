@@ -149,14 +149,12 @@ func (s *HTTP1Server) Run() error {
 			buffers: make([][]byte, bufferCount),
 			connPos: make([]int, bufferCount),
 		}
-		// Pre-allocate buffers
 		for j := 0; j < bufferCount; j++ {
 			w.buffers[j] = make([]byte, bufferSize)
 		}
 		s.workers[i] = w
 
 		go func(worker *ioWorker) {
-			// Pin this goroutine to an OS thread for consistent performance
 			runtime.LockOSThread()
 			if err := worker.run(); err != nil {
 				errCh <- err
@@ -178,7 +176,6 @@ func (w *ioWorker) run() error {
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	// Tune socket buffers for better throughput
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
 
@@ -263,10 +260,8 @@ func (w *ioWorker) getSqe() *IoUringSqe {
 	return sqe
 }
 
-// flushAndSubmit batches all pending SQEs and submits them to the kernel
 func (w *ioWorker) flushAndSubmit() {
 	tail := w.sqeTail
-	// Update SQ array for new entries
 	for i := w.lastFlushed; i < tail; i++ {
 		w.sqArray[i&w.sqMask] = i & w.sqMask
 	}
@@ -299,7 +294,6 @@ func (w *ioWorker) prepareRecv(fd int) {
 
 func (w *ioWorker) eventLoop() error {
 	for {
-		// Process all available completions
 		processed := 0
 		for {
 			head := atomic.LoadUint32(w.cqHead)
@@ -343,14 +337,12 @@ func (w *ioWorker) eventLoop() error {
 			}
 		}
 
-		// Batch flush all pending SQEs
 		w.flushAndSubmit()
 
 		tail := atomic.LoadUint32(w.sqTail)
 		toSubmit := tail - w.submittedTail
 		w.submittedTail = tail
 
-		// Enter kernel: submit new ops and wait for at least 1 completion
 		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
 			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
@@ -388,7 +380,6 @@ func (w *ioWorker) handleData(fd int, n int) {
 }
 
 func (w *ioWorker) processRequest(fd int, data []byte) int {
-	// Fast manual search for \r\n\r\n - faster than bytes.Index for small buffers
 	headerEnd := -1
 	if len(data) >= 4 {
 		for i := 0; i <= len(data)-4; i++ {
@@ -436,7 +427,6 @@ func (w *ioWorker) processRequest(fd int, data []byte) int {
 		response = response404
 	}
 
-	// Direct write for responses - faster than io_uring for small writes
 	rawWriteIO(fd, response)
 	return requestLen
 }
