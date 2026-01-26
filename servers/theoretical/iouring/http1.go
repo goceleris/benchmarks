@@ -1,12 +1,13 @@
 //go:build linux
 
 // Package iouring provides barebones HTTP servers using io_uring for maximum throughput.
-// These implementations are intentionally minimal to test the theoretical I/O limits.
+// These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
 package iouring
 
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -15,25 +16,17 @@ import (
 )
 
 const (
-	// io_uring constants
-	IORING_OP_NOP     = 0
-	IORING_OP_ACCEPT  = 13
-	IORING_OP_RECV    = 27
-	IORING_OP_SEND    = 26
-	IORING_OP_CLOSE   = 19
-	IORING_OP_SENDMSG = 9
+	IORING_OP_ACCEPT = 13
+	IORING_OP_RECV   = 27
+	IORING_OP_SEND   = 26
 
 	IORING_ENTER_GETEVENTS = 1 << 0
 
-	// Ring sizes - power of 2
 	sqeCount    = 4096
-	bufferCount = 65536
-	bufferSize  = 16384
-
-	UserDataBufferProvision = ^uint64(0)
+	bufferCount = 4096 // Reduced from 65536 - matches sqeCount
+	bufferSize  = 4096 // Reduced from 16384 - sufficient for HTTP requests
 )
 
-// Pre-built HTTP/1.1 responses
 var (
 	responseSimple = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
 	responseJSON   = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\",\"server\":\"iouring-h1\"}")
@@ -42,7 +35,6 @@ var (
 	responseUser   = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
 )
 
-// io_uring structures
 type IoUringSqe struct {
 	Opcode      uint8
 	Flags       uint8
@@ -102,9 +94,9 @@ type IoCqringOffsets struct {
 	Resv2       uint64
 }
 
-// HTTP1Server is a barebones HTTP/1.1 server using io_uring.
-type HTTP1Server struct {
-	port          string
+type ioWorker struct {
+	id            int
+	port          int
 	ringFd        int
 	listenFd      int
 	sqHead        *uint32
@@ -114,43 +106,80 @@ type HTTP1Server struct {
 	sqMask        uint32
 	cqMask        uint32
 	sqeTail       uint32
+	lastFlushed   uint32
 	submittedTail uint32
 	sqes          []IoUringSqe
 	cqes          []IoUringCqe
 	sqArray       []uint32
-	// Pre-allocated buffers indexed by fd
-	buffers [bufferCount][]byte
-	connPos [bufferCount]int
+	buffers       [][]byte
+	connPos       []int
 }
 
-// NewHTTP1Server creates a new barebones io_uring HTTP/1.1 server.
+// HTTP1Server is a multi-threaded HTTP/1.1 server using io_uring.
+type HTTP1Server struct {
+	port       string
+	numWorkers int
+	workers    []*ioWorker
+}
+
+// NewHTTP1Server creates a new multi-threaded io_uring HTTP/1.1 server.
 func NewHTTP1Server(port string) *HTTP1Server {
-	s := &HTTP1Server{
-		port: port,
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
-	// Pre-allocate all buffers
-	for i := 0; i < bufferCount; i++ {
-		s.buffers[i] = make([]byte, bufferSize)
+	return &HTTP1Server{
+		port:       port,
+		numWorkers: numWorkers,
+		workers:    make([]*ioWorker, numWorkers),
 	}
-	return s
 }
 
-// Run starts the io_uring event loop.
+// Run starts multiple io_uring event loops.
 func (s *HTTP1Server) Run() error {
+	var portNum int
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
+
+	errCh := make(chan error, s.numWorkers)
+
+	for i := 0; i < s.numWorkers; i++ {
+		w := &ioWorker{
+			id:      i,
+			port:    portNum,
+			buffers: make([][]byte, bufferCount),
+			connPos: make([]int, bufferCount),
+		}
+		// Pre-allocate buffers
+		for j := 0; j < bufferCount; j++ {
+			w.buffers[j] = make([]byte, bufferSize)
+		}
+		s.workers[i] = w
+
+		go func(worker *ioWorker) {
+			// Pin this goroutine to an OS thread for consistent performance
+			runtime.LockOSThread()
+			if err := worker.run(); err != nil {
+				errCh <- err
+			}
+		}(w)
+	}
+
+	return <-errCh
+}
+
+func (w *ioWorker) run() error {
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
 	}
-	s.listenFd = listenFd
+	w.listenFd = listenFd
 
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
-	var portNum int
-	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
-
-	addr := &unix.SockaddrInet4{Port: portNum}
+	addr := &unix.SockaddrInet4{Port: w.port}
 	if err := unix.Bind(listenFd, addr); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
@@ -159,16 +188,17 @@ func (s *HTTP1Server) Run() error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	if err := s.setupRing(); err != nil {
+	if err := w.setupRing(); err != nil {
 		return fmt.Errorf("setup ring: %w", err)
 	}
 
-	s.submitAccept()
+	w.prepareAccept()
+	w.flushAndSubmit()
 
-	return s.eventLoop()
+	return w.eventLoop()
 }
 
-func (s *HTTP1Server) setupRing() error {
+func (w *ioWorker) setupRing() error {
 	params := &IoUringParams{
 		Flags: 0,
 	}
@@ -177,154 +207,148 @@ func (s *HTTP1Server) setupRing() error {
 	if errno != 0 {
 		return fmt.Errorf("io_uring_setup: %w", errno)
 	}
-	s.ringFd = int(ringFd)
+	w.ringFd = int(ringFd)
 
 	sqSize := params.SqOff.Array + params.SqEntries*4
 	cqSize := params.CqOff.Cqes + params.CqEntries*uint32(unsafe.Sizeof(IoUringCqe{}))
 
-	sqPtr, err := unix.Mmap(s.ringFd, 0, int(sqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	sqPtr, err := unix.Mmap(w.ringFd, 0, int(sqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
 		return fmt.Errorf("mmap sq: %w", err)
 	}
 
-	cqPtr, err := unix.Mmap(s.ringFd, 0x8000000, int(cqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	cqPtr, err := unix.Mmap(w.ringFd, 0x8000000, int(cqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
 		return fmt.Errorf("mmap cq: %w", err)
 	}
 
 	sqeSize := params.SqEntries * uint32(unsafe.Sizeof(IoUringSqe{}))
-	sqePtr, err := unix.Mmap(s.ringFd, 0x10000000, int(sqeSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
+	sqePtr, err := unix.Mmap(w.ringFd, 0x10000000, int(sqeSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
 		return fmt.Errorf("mmap sqes: %w", err)
 	}
 
-	s.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
-	s.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
-	s.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
-	s.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
+	w.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Head]))
+	w.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
+	w.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
+	w.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
 
-	s.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
-	s.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
-	s.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
-	s.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
+	w.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
+	w.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
+	w.cqMask = *((*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.RingMask])))
+	w.cqes = unsafe.Slice((*IoUringCqe)(unsafe.Pointer(&cqPtr[params.CqOff.Cqes])), params.CqEntries)
 
-	s.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
+	w.sqes = unsafe.Slice((*IoUringSqe)(unsafe.Pointer(&sqePtr[0])), params.SqEntries)
 
-	s.sqeTail = atomic.LoadUint32(s.sqTail)
-	s.submittedTail = s.sqeTail
+	w.sqeTail = atomic.LoadUint32(w.sqTail)
+	w.lastFlushed = w.sqeTail
+	w.submittedTail = w.sqeTail
 
 	return nil
 }
 
-func (s *HTTP1Server) getSqe() *IoUringSqe {
-	head := atomic.LoadUint32(s.sqHead)
-	next := s.sqeTail + 1
+func (w *ioWorker) getSqe() *IoUringSqe {
+	head := atomic.LoadUint32(w.sqHead)
+	next := w.sqeTail + 1
 	if next-head > uint32(sqeCount) {
 		return nil
 	}
-	idx := s.sqeTail & s.sqMask
-	s.sqeTail = next
-	sqe := &s.sqes[idx]
+	idx := w.sqeTail & w.sqMask
+	w.sqeTail = next
+	sqe := &w.sqes[idx]
 	*sqe = IoUringSqe{}
 	return sqe
 }
 
-func (s *HTTP1Server) flushSq() {
-	tail := s.sqeTail
-	sqTail := atomic.LoadUint32(s.sqTail)
-	for i := sqTail; i < tail; i++ {
-		s.sqArray[i&s.sqMask] = i & s.sqMask
+// flushAndSubmit batches all pending SQEs and submits them to the kernel
+func (w *ioWorker) flushAndSubmit() {
+	tail := w.sqeTail
+	// Update SQ array for new entries
+	for i := w.lastFlushed; i < tail; i++ {
+		w.sqArray[i&w.sqMask] = i & w.sqMask
 	}
-	atomic.StoreUint32(s.sqTail, tail)
+	atomic.StoreUint32(w.sqTail, tail)
+	w.lastFlushed = tail
 }
 
-func (s *HTTP1Server) submitAccept() {
-	sqe := s.getSqe()
+func (w *ioWorker) prepareAccept() {
+	sqe := w.getSqe()
 	if sqe == nil {
 		return
 	}
 	sqe.Opcode = IORING_OP_ACCEPT
-	sqe.Fd = int32(s.listenFd)
-	sqe.UserData = uint64(s.listenFd)
-	s.flushSq()
+	sqe.Fd = int32(w.listenFd)
+	sqe.UserData = uint64(w.listenFd)
 }
 
-func (s *HTTP1Server) submitRecv(fd int) {
-	sqe := s.getSqe()
+func (w *ioWorker) prepareRecv(fd int) {
+	sqe := w.getSqe()
 	if sqe == nil {
 		return
 	}
-	pos := s.connPos[fd]
+	pos := w.connPos[fd]
 	sqe.Opcode = IORING_OP_RECV
 	sqe.Fd = int32(fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&s.buffers[fd][pos])))
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&w.buffers[fd][pos])))
 	sqe.Len = uint32(bufferSize - pos)
 	sqe.UserData = uint64(fd)
-	s.flushSq()
 }
 
-func (s *HTTP1Server) submitSend(fd int, data []byte) {
-	sqe := s.getSqe()
-	if sqe == nil {
-		return
-	}
-	sqe.Opcode = IORING_OP_SEND
-	sqe.Fd = int32(fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&data[0])))
-	sqe.Len = uint32(len(data))
-	sqe.UserData = uint64(fd) | (1 << 32)
-	s.flushSq()
-}
-
-func (s *HTTP1Server) eventLoop() error {
+func (w *ioWorker) eventLoop() error {
 	for {
-		// Process all available CQEs
+		// Process all available completions
+		processed := 0
 		for {
-			head := atomic.LoadUint32(s.cqHead)
-			tail := atomic.LoadUint32(s.cqTail)
+			head := atomic.LoadUint32(w.cqHead)
+			tail := atomic.LoadUint32(w.cqTail)
 			if head == tail {
 				break
 			}
 
-			cqe := &s.cqes[head&s.cqMask]
-			atomic.StoreUint32(s.cqHead, head+1)
+			cqe := &w.cqes[head&w.cqMask]
+			atomic.StoreUint32(w.cqHead, head+1)
+			processed++
 
 			fd := int(cqe.UserData & 0xFFFFFFFF)
 			isSend := (cqe.UserData>>32)&1 == 1
 
-			if fd == s.listenFd && !isSend {
+			if fd == w.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					if connFd < bufferCount {
+						// Set TCP_NODELAY for low latency
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-						s.connPos[connFd] = 0
-						s.submitRecv(connFd)
+						w.connPos[connFd] = 0
+						w.prepareRecv(connFd)
 					} else {
 						_ = unix.Close(connFd)
 					}
-					s.submitAccept()
+					w.prepareAccept()
 				}
 			} else if !isSend {
 				if cqe.Res > 0 {
-					s.handleData(fd, int(cqe.Res))
+					w.handleData(fd, int(cqe.Res))
 				} else {
 					_ = unix.Close(fd)
-					s.connPos[fd] = 0
+					w.connPos[fd] = 0
 				}
 			} else {
 				if cqe.Res < 0 {
 					_ = unix.Close(fd)
-					s.connPos[fd] = 0
+					w.connPos[fd] = 0
 				}
 			}
 		}
 
-		// Batch submit
-		tail := atomic.LoadUint32(s.sqTail)
-		toSubmit := tail - s.submittedTail
-		s.submittedTail = tail
+		// Batch flush all pending SQEs
+		w.flushAndSubmit()
 
-		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(s.ringFd),
+		tail := atomic.LoadUint32(w.sqTail)
+		toSubmit := tail - w.submittedTail
+		w.submittedTail = tail
+
+		// Enter kernel: submit new ops and wait for at least 1 completion
+		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
 			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
 		if errno != 0 && errno != unix.EINTR {
 			return fmt.Errorf("io_uring_enter: %w", errno)
@@ -332,15 +356,13 @@ func (s *HTTP1Server) eventLoop() error {
 	}
 }
 
-func (s *HTTP1Server) handleData(fd int, n int) {
-	s.connPos[fd] += n
-	buf := s.buffers[fd]
-	pos := s.connPos[fd]
+func (w *ioWorker) handleData(fd int, n int) {
+	w.connPos[fd] += n
+	buf := w.buffers[fd]
+	pos := w.connPos[fd]
 
-	// Process all complete requests
 	for {
-		data := buf[:pos]
-		consumed := s.processRequest(fd, data)
+		consumed := w.processRequest(fd, buf[:pos])
 		if consumed == 0 {
 			break
 		}
@@ -349,19 +371,20 @@ func (s *HTTP1Server) handleData(fd int, n int) {
 			pos -= consumed
 		} else {
 			pos = 0
+			break
 		}
 	}
 
-	s.connPos[fd] = pos
+	w.connPos[fd] = pos
 	if pos < bufferSize {
-		s.submitRecv(fd)
+		w.prepareRecv(fd)
 	} else {
 		_ = unix.Close(fd)
-		s.connPos[fd] = 0
+		w.connPos[fd] = 0
 	}
 }
 
-func (s *HTTP1Server) processRequest(fd int, data []byte) int {
+func (w *ioWorker) processRequest(fd int, data []byte) int {
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		return 0
@@ -369,7 +392,6 @@ func (s *HTTP1Server) processRequest(fd int, data []byte) int {
 
 	requestLen := headerEnd + 4
 
-	// Check for POST with body
 	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
 		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
 		if clIdx > 0 {
@@ -384,7 +406,6 @@ func (s *HTTP1Server) processRequest(fd int, data []byte) int {
 		}
 	}
 
-	// Route request
 	var response []byte
 	if data[0] == 'G' {
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
@@ -402,7 +423,7 @@ func (s *HTTP1Server) processRequest(fd int, data []byte) int {
 		response = response404
 	}
 
-	// Direct write for response
+	// Direct write for responses - faster than io_uring for small writes
 	rawWriteIO(fd, response)
 	return requestLen
 }

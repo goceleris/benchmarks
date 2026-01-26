@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -34,65 +35,100 @@ var (
 	bodyJSON   = []byte(`{"message":"Hello, World!","server":"epoll-h2"}`)
 	bodyOK     = []byte("OK")
 
-	// Pre-built settings frame
 	frameSettings = []byte{
 		0x00, 0x00, 0x0C,
 		h2FrameTypeSettings,
 		0x00,
 		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x04, 0x00, 0x10, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x10, 0x00, // MAX_CONCURRENT_STREAMS = 4096
+		0x00, 0x04, 0x00, 0x60, 0x00, 0x00, // INITIAL_WINDOW_SIZE = 6MB
 	}
 	frameSettingsAck = []byte{0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00}
 )
 
 // h2ConnState tracks HTTP/2 connection state
 type h2ConnState struct {
-	buf          []byte
-	pos          int
 	prefaceRecv  bool
 	settingsSent bool
 	streams      map[uint32]string
 }
 
-// HTTP2Server is a barebones H2C server using raw epoll.
-type HTTP2Server struct {
-	port     string
+// h2Worker represents a single HTTP/2 event loop worker
+type h2Worker struct {
+	id       int
+	port     int
 	epollFd  int
 	listenFd int
-	// Pre-allocated buffers indexed by fd
-	connBuf  [maxConns][]byte
-	connPos  [maxConns]int
-	connH2   [maxConns]*h2ConnState
+	connBuf  [][]byte
+	connPos  []int
+	connH2   []*h2ConnState
 }
 
-// NewHTTP2Server creates a new barebones epoll H2C server.
+// HTTP2Server is a multi-threaded H2C server using raw epoll.
+type HTTP2Server struct {
+	port       string
+	numWorkers int
+	workers    []*h2Worker
+}
+
+// NewHTTP2Server creates a new multi-threaded epoll H2C server.
 func NewHTTP2Server(port string) *HTTP2Server {
-	s := &HTTP2Server{
-		port: port,
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
-	for i := 0; i < maxConns; i++ {
-		s.connBuf[i] = make([]byte, readBufSize)
+	return &HTTP2Server{
+		port:       port,
+		numWorkers: numWorkers,
+		workers:    make([]*h2Worker, numWorkers),
 	}
-	return s
 }
 
-// Run starts the epoll event loop for H2C.
+// Run starts multiple epoll event loops for H2C.
 func (s *HTTP2Server) Run() error {
+	var portNum int
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
+
+	errCh := make(chan error, s.numWorkers)
+
+	for i := 0; i < s.numWorkers; i++ {
+		w := &h2Worker{
+			id:      i,
+			port:    portNum,
+			connBuf: make([][]byte, maxConns),
+			connPos: make([]int, maxConns),
+			connH2:  make([]*h2ConnState, maxConns),
+		}
+		for j := 0; j < maxConns; j++ {
+			w.connBuf[j] = make([]byte, readBufSize)
+		}
+		s.workers[i] = w
+
+		go func(worker *h2Worker) {
+			runtime.LockOSThread()
+			if err := worker.run(); err != nil {
+				errCh <- err
+			}
+		}(w)
+	}
+
+	log.Printf("epoll-h2 server listening on port %s with %d workers", s.port, s.numWorkers)
+	return <-errCh
+}
+
+func (w *h2Worker) run() error {
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
 	}
-	s.listenFd = listenFd
+	w.listenFd = listenFd
 
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
-	var portNum int
-	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
-
-	addr := &unix.SockaddrInet4{Port: portNum}
+	addr := &unix.SockaddrInet4{Port: w.port}
 	if err := unix.Bind(listenFd, addr); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
@@ -105,7 +141,7 @@ func (s *HTTP2Server) Run() error {
 	if err != nil {
 		return fmt.Errorf("epoll_create1: %w", err)
 	}
-	s.epollFd = epollFd
+	w.epollFd = epollFd
 
 	event := &unix.EpollEvent{
 		Events: unix.EPOLLIN,
@@ -113,15 +149,14 @@ func (s *HTTP2Server) Run() error {
 	}
 	_ = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
 
-	log.Printf("epoll-h2 server listening on port %s", s.port)
-	return s.eventLoop()
+	return w.eventLoop()
 }
 
-func (s *HTTP2Server) eventLoop() error {
+func (w *h2Worker) eventLoop() error {
 	events := make([]unix.EpollEvent, maxEvents)
 
 	for {
-		n, err := unix.EpollWait(s.epollFd, events, -1)
+		n, err := unix.EpollWait(w.epollFd, events, -1)
 		if err != nil {
 			if err == syscall.EINTR {
 				continue
@@ -132,20 +167,20 @@ func (s *HTTP2Server) eventLoop() error {
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
 
-			if fd == s.listenFd {
-				s.acceptConnections()
+			if fd == w.listenFd {
+				w.acceptConnections()
 			} else if events[i].Events&unix.EPOLLIN != 0 {
-				s.handleRead(fd)
+				w.handleRead(fd)
 			} else if events[i].Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
-				s.closeConnection(fd)
+				w.closeConnection(fd)
 			}
 		}
 	}
 }
 
-func (s *HTTP2Server) acceptConnections() {
+func (w *h2Worker) acceptConnections() {
 	for {
-		connFd, _, err := unix.Accept4(s.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		connFd, _, err := unix.Accept4(w.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
@@ -159,30 +194,30 @@ func (s *HTTP2Server) acceptConnections() {
 		}
 
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
 		event := &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
 		}
-		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+		_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
-		s.connPos[connFd] = 0
-		s.connH2[connFd] = &h2ConnState{
-			buf:     s.connBuf[connFd],
+		w.connPos[connFd] = 0
+		w.connH2[connFd] = &h2ConnState{
 			streams: make(map[uint32]string),
 		}
 	}
 }
 
-func (s *HTTP2Server) handleRead(fd int) {
-	state := s.connH2[fd]
+func (w *h2Worker) handleRead(fd int) {
+	state := w.connH2[fd]
 	if state == nil {
-		s.closeConnection(fd)
+		w.closeConnection(fd)
 		return
 	}
 
-	buf := s.connBuf[fd]
-	pos := s.connPos[fd]
+	buf := w.connBuf[fd]
+	pos := w.connPos[fd]
 
 	for {
 		n, err := unix.Read(fd, buf[pos:])
@@ -190,20 +225,17 @@ func (s *HTTP2Server) handleRead(fd int) {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
 			}
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return
 		}
 		if n == 0 {
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return
 		}
-
 		pos += n
-		state.pos = pos
 
-		// Process H2 data
 		for {
-			consumed, closed := s.processH2Data(fd, state, buf[:pos])
+			consumed, closed := w.processH2Data(fd, state, buf[:pos])
 			if closed {
 				return
 			}
@@ -213,18 +245,18 @@ func (s *HTTP2Server) handleRead(fd int) {
 					pos -= consumed
 				} else {
 					pos = 0
+					break
 				}
-				state.pos = pos
 			} else {
 				break
 			}
 		}
 	}
 
-	s.connPos[fd] = pos
+	w.connPos[fd] = pos
 }
 
-func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (int, bool) {
+func (w *h2Worker) processH2Data(fd int, state *h2ConnState, data []byte) (int, bool) {
 	offset := 0
 
 	if !state.prefaceRecv {
@@ -239,7 +271,7 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 				}
 				return offset, false
 			}
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return 0, true
 		}
 		return 0, false
@@ -265,18 +297,17 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 			}
 		case h2FrameTypeHeaders:
 			endStream := flags&h2FlagEndStream != 0
-			s.handleH2Request(fd, streamID, frameData, endStream, state)
+			w.handleH2Request(fd, streamID, frameData, endStream, state)
 
 		case h2FrameTypeData:
 			if length > 0 {
-				s.sendWindowUpdate(fd, 0, uint32(length))
-				s.sendWindowUpdate(fd, streamID, uint32(length))
+				w.sendWindowUpdates(fd, streamID, uint32(length))
 			}
 
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				if path, ok := state.streams[streamID]; ok {
-					s.sendH2Response(fd, streamID, path)
+					w.sendH2Response(fd, streamID, path)
 					delete(state.streams, streamID)
 				}
 			}
@@ -288,10 +319,9 @@ func (s *HTTP2Server) processH2Data(fd int, state *h2ConnState, data []byte) (in
 	return offset, false
 }
 
-func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byte, endStream bool, state *h2ConnState) {
+func (w *h2Worker) handleH2Request(fd int, streamID uint32, headerBlock []byte, endStream bool, state *h2ConnState) {
 	var path string
 
-	// Fast path detection
 	if bytes.Contains(headerBlock, []byte("/json")) {
 		path = "/json"
 	} else if bytes.Contains(headerBlock, []byte("/users/")) {
@@ -303,16 +333,16 @@ func (s *HTTP2Server) handleH2Request(fd int, streamID uint32, headerBlock []byt
 	}
 
 	if endStream {
-		s.sendH2Response(fd, streamID, path)
+		w.sendH2Response(fd, streamID, path)
 	} else {
 		state.streams[streamID] = path
 		if path == "/upload" {
-			s.send100Continue(fd, streamID)
+			w.send100Continue(fd, streamID)
 		}
 	}
 }
 
-func (s *HTTP2Server) send100Continue(fd int, streamID uint32) {
+func (w *h2Worker) send100Continue(fd int, streamID uint32) {
 	h100 := []byte{0x08, 0x03, 0x31, 0x30, 0x30}
 	frame := make([]byte, 9+len(h100))
 	frame[2] = byte(len(h100))
@@ -323,16 +353,19 @@ func (s *HTTP2Server) send100Continue(fd int, streamID uint32) {
 	rawWrite(fd, frame)
 }
 
-func (s *HTTP2Server) sendWindowUpdate(fd int, streamID uint32, increment uint32) {
-	frame := make([]byte, 13)
+func (w *h2Worker) sendWindowUpdates(fd int, streamID uint32, increment uint32) {
+	frame := make([]byte, 26)
 	frame[2] = 0x04
 	frame[3] = 0x08
-	binary.BigEndian.PutUint32(frame[5:9], streamID)
 	binary.BigEndian.PutUint32(frame[9:13], increment)
+	frame[15] = 0x04
+	frame[16] = 0x08
+	binary.BigEndian.PutUint32(frame[18:22], streamID)
+	binary.BigEndian.PutUint32(frame[22:26], increment)
 	rawWrite(fd, frame)
 }
 
-func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
+func (w *h2Worker) sendH2Response(fd int, streamID uint32, path string) {
 	var headerBytes, bodyBytes []byte
 
 	switch path {
@@ -347,11 +380,9 @@ func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
 		bodyBytes = bodySimple
 	}
 
-	// Coalesce headers + data into single write
 	totalLen := 9 + len(headerBytes) + 9 + len(bodyBytes)
 	frame := make([]byte, totalLen)
 
-	// Headers frame
 	frame[0] = byte(len(headerBytes) >> 16)
 	frame[1] = byte(len(headerBytes) >> 8)
 	frame[2] = byte(len(headerBytes))
@@ -360,7 +391,6 @@ func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
 	binary.BigEndian.PutUint32(frame[5:9], streamID)
 	copy(frame[9:], headerBytes)
 
-	// Data frame
 	off := 9 + len(headerBytes)
 	frame[off] = byte(len(bodyBytes) >> 16)
 	frame[off+1] = byte(len(bodyBytes) >> 8)
@@ -373,9 +403,9 @@ func (s *HTTP2Server) sendH2Response(fd int, streamID uint32, path string) {
 	rawWrite(fd, frame)
 }
 
-func (s *HTTP2Server) closeConnection(fd int) {
-	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+func (w *h2Worker) closeConnection(fd int) {
+	_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Close(fd)
-	s.connPos[fd] = 0
-	s.connH2[fd] = nil
+	w.connPos[fd] = 0
+	w.connH2[fd] = nil
 }

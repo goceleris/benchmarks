@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -21,47 +22,87 @@ const (
 // hybridConnState tracks per-connection state
 type hybridConnState struct {
 	protocol    int
-	h2state     *h2ConnState
+	prefaceRecv bool
+	settingsSent bool
+	streams     map[uint32]string
 }
 
-// HybridServer is a barebones server that muxes HTTP/1.1 and H2C.
+// hybridWorker represents a single event loop worker
+type hybridWorker struct {
+	id        int
+	port      int
+	epollFd   int
+	listenFd  int
+	connBuf   [][]byte
+	connPos   []int
+	connState []*hybridConnState
+}
+
+// HybridServer is a multi-threaded server that muxes HTTP/1.1 and H2C.
 type HybridServer struct {
-	port     string
-	epollFd  int
-	listenFd int
-	// Pre-allocated buffers indexed by fd
-	connBuf   [maxConns][]byte
-	connPos   [maxConns]int
-	connState [maxConns]*hybridConnState
+	port       string
+	numWorkers int
+	workers    []*hybridWorker
 }
 
-// NewHybridServer creates a new barebones hybrid mux server.
+// NewHybridServer creates a new multi-threaded hybrid mux server.
 func NewHybridServer(port string) *HybridServer {
-	s := &HybridServer{
-		port: port,
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
-	for i := 0; i < maxConns; i++ {
-		s.connBuf[i] = make([]byte, readBufSize)
+	return &HybridServer{
+		port:       port,
+		numWorkers: numWorkers,
+		workers:    make([]*hybridWorker, numWorkers),
 	}
-	return s
 }
 
-// Run starts the hybrid epoll event loop.
+// Run starts multiple hybrid epoll event loops.
 func (s *HybridServer) Run() error {
+	var portNum int
+	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
+
+	errCh := make(chan error, s.numWorkers)
+
+	for i := 0; i < s.numWorkers; i++ {
+		w := &hybridWorker{
+			id:        i,
+			port:      portNum,
+			connBuf:   make([][]byte, maxConns),
+			connPos:   make([]int, maxConns),
+			connState: make([]*hybridConnState, maxConns),
+		}
+		for j := 0; j < maxConns; j++ {
+			w.connBuf[j] = make([]byte, readBufSize)
+		}
+		s.workers[i] = w
+
+		go func(worker *hybridWorker) {
+			runtime.LockOSThread()
+			if err := worker.run(); err != nil {
+				errCh <- err
+			}
+		}(w)
+	}
+
+	log.Printf("epoll-hybrid server listening on port %s with %d workers", s.port, s.numWorkers)
+	return <-errCh
+}
+
+func (w *hybridWorker) run() error {
 	listenFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)
 	}
-	s.listenFd = listenFd
+	w.listenFd = listenFd
 
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
-	var portNum int
-	_, _ = fmt.Sscanf(s.port, "%d", &portNum)
-
-	addr := &unix.SockaddrInet4{Port: portNum}
+	addr := &unix.SockaddrInet4{Port: w.port}
 	if err := unix.Bind(listenFd, addr); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
@@ -74,7 +115,7 @@ func (s *HybridServer) Run() error {
 	if err != nil {
 		return fmt.Errorf("epoll_create1: %w", err)
 	}
-	s.epollFd = epollFd
+	w.epollFd = epollFd
 
 	event := &unix.EpollEvent{
 		Events: unix.EPOLLIN,
@@ -82,15 +123,14 @@ func (s *HybridServer) Run() error {
 	}
 	_ = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, listenFd, event)
 
-	log.Printf("epoll-hybrid server listening on port %s", s.port)
-	return s.eventLoop()
+	return w.eventLoop()
 }
 
-func (s *HybridServer) eventLoop() error {
+func (w *hybridWorker) eventLoop() error {
 	events := make([]unix.EpollEvent, maxEvents)
 
 	for {
-		n, err := unix.EpollWait(s.epollFd, events, -1)
+		n, err := unix.EpollWait(w.epollFd, events, -1)
 		if err != nil {
 			if err == syscall.EINTR {
 				continue
@@ -101,20 +141,20 @@ func (s *HybridServer) eventLoop() error {
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
 
-			if fd == s.listenFd {
-				s.acceptConnections()
+			if fd == w.listenFd {
+				w.acceptConnections()
 			} else if events[i].Events&unix.EPOLLIN != 0 {
-				s.handleRead(fd)
+				w.handleRead(fd)
 			} else if events[i].Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
-				s.closeConnection(fd)
+				w.closeConnection(fd)
 			}
 		}
 	}
 }
 
-func (s *HybridServer) acceptConnections() {
+func (w *hybridWorker) acceptConnections() {
 	for {
-		connFd, _, err := unix.Accept4(s.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		connFd, _, err := unix.Accept4(w.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
@@ -128,29 +168,30 @@ func (s *HybridServer) acceptConnections() {
 		}
 
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
 		event := &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
 		}
-		_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
+		_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_ADD, connFd, event)
 
-		s.connPos[connFd] = 0
-		s.connState[connFd] = &hybridConnState{
+		w.connPos[connFd] = 0
+		w.connState[connFd] = &hybridConnState{
 			protocol: protoUnknown,
 		}
 	}
 }
 
-func (s *HybridServer) handleRead(fd int) {
-	state := s.connState[fd]
+func (w *hybridWorker) handleRead(fd int) {
+	state := w.connState[fd]
 	if state == nil {
-		s.closeConnection(fd)
+		w.closeConnection(fd)
 		return
 	}
 
-	buf := s.connBuf[fd]
-	pos := s.connPos[fd]
+	buf := w.connBuf[fd]
+	pos := w.connPos[fd]
 
 	for {
 		n, err := unix.Read(fd, buf[pos:])
@@ -158,11 +199,11 @@ func (s *HybridServer) handleRead(fd int) {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				break
 			}
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return
 		}
 		if n == 0 {
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return
 		}
 		pos += n
@@ -181,18 +222,15 @@ func (s *HybridServer) handleRead(fd int) {
 				}
 				if string(data[:h2PrefaceLen]) == h2Preface {
 					state.protocol = protoH2C
-					state.h2state = &h2ConnState{
-						buf:     buf,
-						streams: make(map[uint32]string),
-					}
+					state.streams = make(map[uint32]string)
 				} else {
-					s.closeConnection(fd)
+					w.closeConnection(fd)
 					return
 				}
 			} else if data[0] == 'G' || data[0] == 'P' || data[0] == 'H' || data[0] == 'D' {
 				state.protocol = protoHTTP1
 			} else {
-				s.closeConnection(fd)
+				w.closeConnection(fd)
 				return
 			}
 		}
@@ -200,7 +238,7 @@ func (s *HybridServer) handleRead(fd int) {
 		switch state.protocol {
 		case protoHTTP1:
 			for {
-				consumed := s.handleHTTP1(fd, buf[:pos])
+				consumed := w.handleHTTP1(fd, buf[:pos])
 				if consumed == 0 {
 					break
 				}
@@ -214,7 +252,7 @@ func (s *HybridServer) handleRead(fd int) {
 			}
 		case protoH2C:
 			for {
-				consumed, closed := s.handleH2C(fd, state.h2state, buf[:pos])
+				consumed, closed := w.handleH2C(fd, state, buf[:pos])
 				if closed {
 					return
 				}
@@ -233,10 +271,10 @@ func (s *HybridServer) handleRead(fd int) {
 		}
 	}
 
-	s.connPos[fd] = pos
+	w.connPos[fd] = pos
 }
 
-func (s *HybridServer) handleHTTP1(fd int, data []byte) int {
+func (w *hybridWorker) handleHTTP1(fd int, data []byte) int {
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		return 0
@@ -244,7 +282,6 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) int {
 
 	reqLen := headerEnd + 4
 
-	// Check for POST with body
 	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
 		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
 		if clIdx > 0 {
@@ -259,7 +296,6 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) int {
 		}
 	}
 
-	// Route request
 	var response []byte
 	if data[0] == 'G' {
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
@@ -281,7 +317,7 @@ func (s *HybridServer) handleHTTP1(fd int, data []byte) int {
 	return reqLen
 }
 
-func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) (int, bool) {
+func (w *hybridWorker) handleH2C(fd int, state *hybridConnState, data []byte) (int, bool) {
 	offset := 0
 
 	if !state.prefaceRecv {
@@ -296,7 +332,7 @@ func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) (int, 
 				}
 				return offset, false
 			}
-			s.closeConnection(fd)
+			w.closeConnection(fd)
 			return 0, true
 		}
 		return 0, false
@@ -322,17 +358,17 @@ func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) (int, 
 			}
 		case h2FrameTypeHeaders:
 			endStream := flags&h2FlagEndStream != 0
-			s.handleH2Request(fd, streamID, frameData, endStream, state)
+			w.handleH2Request(fd, streamID, frameData, endStream, state)
 
 		case h2FrameTypeData:
 			if length > 0 {
-				s.sendWindowUpdates(fd, streamID, uint32(length))
+				w.sendWindowUpdates(fd, streamID, uint32(length))
 			}
 
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
 				if path, ok := state.streams[streamID]; ok {
-					s.sendH2Response(fd, streamID, path)
+					w.sendH2Response(fd, streamID, path)
 					delete(state.streams, streamID)
 				}
 			}
@@ -344,7 +380,7 @@ func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) (int, 
 	return offset, false
 }
 
-func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []byte, endStream bool, state *h2ConnState) {
+func (w *hybridWorker) handleH2Request(fd int, streamID uint32, headerBlock []byte, endStream bool, state *hybridConnState) {
 	var path string
 
 	if bytes.Contains(headerBlock, []byte("/json")) {
@@ -358,16 +394,16 @@ func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []by
 	}
 
 	if endStream {
-		s.sendH2Response(fd, streamID, path)
+		w.sendH2Response(fd, streamID, path)
 	} else {
 		state.streams[streamID] = path
 		if path == "/upload" {
-			s.send100Continue(fd, streamID)
+			w.send100Continue(fd, streamID)
 		}
 	}
 }
 
-func (s *HybridServer) send100Continue(fd int, streamID uint32) {
+func (w *hybridWorker) send100Continue(fd int, streamID uint32) {
 	h100 := []byte{0x08, 0x03, 0x31, 0x30, 0x30}
 	frame := make([]byte, 9+len(h100))
 	frame[2] = byte(len(h100))
@@ -378,8 +414,7 @@ func (s *HybridServer) send100Continue(fd int, streamID uint32) {
 	rawWrite(fd, frame)
 }
 
-func (s *HybridServer) sendWindowUpdates(fd int, streamID uint32, increment uint32) {
-	// Coalesce both window updates
+func (w *hybridWorker) sendWindowUpdates(fd int, streamID uint32, increment uint32) {
 	frame := make([]byte, 26)
 	frame[2] = 0x04
 	frame[3] = 0x08
@@ -391,7 +426,7 @@ func (s *HybridServer) sendWindowUpdates(fd int, streamID uint32, increment uint
 	rawWrite(fd, frame)
 }
 
-func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
+func (w *hybridWorker) sendH2Response(fd int, streamID uint32, path string) {
 	var headerBytes, bodyBytes []byte
 
 	switch path {
@@ -406,7 +441,6 @@ func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
 		bodyBytes = bodySimple
 	}
 
-	// Coalesce headers + data
 	totalLen := 9 + len(headerBytes) + 9 + len(bodyBytes)
 	frame := make([]byte, totalLen)
 
@@ -430,9 +464,9 @@ func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
 	rawWrite(fd, frame)
 }
 
-func (s *HybridServer) closeConnection(fd int) {
-	_ = unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
+func (w *hybridWorker) closeConnection(fd int) {
+	_ = unix.EpollCtl(w.epollFd, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Close(fd)
-	s.connPos[fd] = 0
-	s.connState[fd] = nil
+	w.connPos[fd] = 0
+	w.connState[fd] = nil
 }
