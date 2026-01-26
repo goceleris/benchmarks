@@ -159,18 +159,30 @@ func (s *HybridServer) handleRead(fd int) {
 
 		// Detect protocol on first read
 		if state.protocol == protoUnknown {
-			if state.pos >= h2PrefaceLen && string(data[:h2PrefaceLen]) == h2Preface {
-				state.protocol = protoH2C
-				state.h2state = &h2ConnState{
-					buf:     state.buf,
-					streams: make(map[uint32]string),
+			if state.pos < 4 {
+				continue // Need more data for minimum method/preface
+			}
+
+			if bytes.HasPrefix(data, []byte("PRI ")) {
+				if state.pos < h2PrefaceLen {
+					continue // Wait for full preface
+				}
+				if string(data[:h2PrefaceLen]) == h2Preface {
+					state.protocol = protoH2C
+					state.h2state = &h2ConnState{
+						buf:     state.buf,
+						streams: make(map[uint32]string),
+					}
+				} else {
+					s.closeConnection(fd)
+					return
 				}
 			} else if bytes.HasPrefix(data, []byte("GET ")) ||
 				bytes.HasPrefix(data, []byte("POST ")) ||
 				bytes.HasPrefix(data, []byte("PUT ")) ||
 				bytes.HasPrefix(data, []byte("DELETE ")) {
-				// Check for HTTP/1.1 upgrade to H2C (Only on GET to avoid body handling complexity)
-				if bytes.HasPrefix(data, []byte("GET ")) && bytes.Contains(data, []byte("Upgrade: h2c")) {
+				// Check for HTTP/1.1 upgrade to H2C
+				if bytes.Contains(data, []byte("Upgrade: h2c")) {
 					state.protocol = protoH2C
 					state.h2state = &h2ConnState{
 						buf:     state.buf,
@@ -182,11 +194,6 @@ func (s *HybridServer) handleRead(fd int) {
 				}
 				state.protocol = protoHTTP1
 			} else {
-				// If we have less than H2 preface length (24 bytes) and didn't match H1prefixes,
-				// we might have a split packet. Wait for more data.
-				if state.pos < h2PrefaceLen {
-					return
-				}
 				s.closeConnection(fd)
 				return
 			}
@@ -194,25 +201,62 @@ func (s *HybridServer) handleRead(fd int) {
 
 		switch state.protocol {
 		case protoHTTP1:
-			if s.handleHTTP1(fd, state) {
-				// Request handled, reset buffer for next request
-				state.pos = 0
+			// Process all complete requests in buffer
+			for {
+				consumed, complete := s.handleHTTP1(fd, state)
+				if !complete {
+					break
+				}
+				if consumed > 0 {
+					remaining := state.pos - consumed
+					if remaining > 0 {
+						copy(state.buf[:], state.buf[consumed:state.pos])
+						state.pos = remaining
+						// Continue loop to process next request
+					} else {
+						state.pos = 0
+						break
+					}
+				} else {
+					break // Should not happen if complete is true, but safety
+				}
 			}
 		case protoH2C:
-			s.handleH2C(fd, state.h2state, data)
-			state.pos = 0
+			for {
+				consumed, closed := s.handleH2C(fd, state.h2state, state.buf[:state.pos])
+
+				if closed {
+					s.closeConnection(fd)
+					return
+				}
+				if consumed > 0 {
+					remaining := state.pos - consumed
+					if remaining > 0 {
+						copy(state.buf[:], state.buf[consumed:state.pos])
+						state.pos = remaining
+						// Continue loop
+					} else {
+						state.pos = 0
+						break
+					}
+				} else {
+					break // Need more data
+				}
+			}
 		}
 	}
 }
 
-func (s *HybridServer) handleHTTP1(fd int, state *hybridConnState) bool {
+func (s *HybridServer) handleHTTP1(fd int, state *hybridConnState) (int, bool) {
 	data := state.buf[:state.pos]
 
 	// Wait for complete HTTP request (headers end with \r\n\r\n)
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
-		return false // Incomplete request
+		return 0, false // Incomplete request
 	}
+
+	reqLen := headerEnd + 4
 
 	// For POST requests with Content-Length, ensure body is received
 	if bytes.HasPrefix(data, []byte("POST")) {
@@ -222,10 +266,9 @@ func (s *HybridServer) handleHTTP1(fd int, state *hybridConnState) bool {
 			if clEnd > 0 {
 				var contentLen int
 				_, _ = fmt.Sscanf(string(data[clIdx+16:clIdx+clEnd]), "%d", &contentLen)
-				bodyStart := headerEnd + 4
-				bodyReceived := len(data) - bodyStart
-				if bodyReceived < contentLen {
-					return false // Body not fully received
+				reqLen += contentLen
+				if len(data) < reqLen {
+					return 0, false // Body not fully received
 				}
 			}
 		}
@@ -254,7 +297,7 @@ func (s *HybridServer) handleHTTP1(fd int, state *hybridConnState) bool {
 	}
 
 	_, _ = unix.Write(fd, response)
-	return true
+	return reqLen, true
 }
 
 func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []byte) {
@@ -271,10 +314,12 @@ func (s *HybridServer) handleH2CUpgrade(fd int, state *hybridConnState, data []b
 	_, _ = unix.Write(fd, settingsFrame)
 }
 
-func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) {
+func (s *HybridServer) handleH2C(fd int, state *h2ConnState, data []byte) (int, bool) {
 	// Reuse the HTTP2Server logic
+	// Note: We create a temporary HTTP2Server struct just to access the method.
+	// This is safe because HTTP2Server only uses epollFd which we provide.
 	h2s := &HTTP2Server{epollFd: s.epollFd}
-	h2s.processH2Data(fd, state, data)
+	return h2s.processH2Data(fd, state, data)
 }
 
 func (s *HybridServer) closeConnection(fd int) {

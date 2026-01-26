@@ -31,6 +31,7 @@ var (
 	hpackHeadersJSON   = []byte{0x88, 0x5f, 0x10, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73, 0x6f, 0x6e}
 	bodySimple         = []byte("Hello, World!")
 	bodyJSON           = []byte(`{"message":"Hello, World!","server":"iouring-h2"}`)
+	bodyOK             = []byte("OK")
 
 	// Global static frames (Stream ID 0)
 	// Settings Frame: Length=12, Type=4, Flags=0, Stream=0

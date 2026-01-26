@@ -39,10 +39,8 @@ type hybridioConnState struct {
 	inflightBuffers [][]byte
 
 	pos int // Current buffer position
-	// Stream tracking
-	activeStreamID uint32
-	activePath     string
-	streamOpen     bool
+	// Stream tracking - use map for proper H2 multiplexing
+	streams map[uint32]string
 }
 
 const (
@@ -273,9 +271,13 @@ func (s *HybridServer) eventLoop() error {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					s.connState[connFd] = &hybridioConnState{protocol: protoUnknownIO, pos: 0}
+					s.connState[connFd] = &hybridioConnState{
+					protocol: protoUnknownIO,
+					pos:      0,
+					streams:  make(map[uint32]string),
+				}
 
-					if connFd < bufferCount {
+				if connFd < bufferCount {
 						s.submitRecv(connFd)
 					} else {
 						_ = unix.Close(connFd)
@@ -289,19 +291,29 @@ func (s *HybridServer) eventLoop() error {
 					state := s.connState[fd]
 					if state != nil {
 						state.pos += n
-						// Process available data
-						data := s.buffers[fd*bufferSize : fd*bufferSize+state.pos]
-						consumed, closed := s.handleData(fd, data)
+						// Process all complete requests in buffer (pipelining fix)
+						for {
+							data := s.buffers[fd*bufferSize : fd*bufferSize+state.pos]
+							consumed, closed := s.handleData(fd, data)
 
-						if closed {
-							_ = unix.Close(fd)
-							delete(s.connState, fd)
-						} else {
+							if closed {
+								_ = unix.Close(fd)
+								delete(s.connState, fd)
+								state = nil
+								break
+							}
+
 							if consumed > 0 {
 								copy(s.buffers[fd*bufferSize:], s.buffers[fd*bufferSize+consumed:fd*bufferSize+state.pos])
 								state.pos -= consumed
+								// Continue to process next request in buffer
+							} else {
+								// Not enough data for a complete request
+								break
 							}
+						}
 
+						if state != nil {
 							if state.pos >= bufferSize {
 								_ = unix.Close(fd)
 								delete(s.connState, fd)
@@ -321,9 +333,10 @@ func (s *HybridServer) eventLoop() error {
 				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					delete(s.connState, fd)
+				} else if fd < bufferCount {
+					// Do NOT submitRecv here. We keep the read loop active via Read Completion.
+					// This avoids double-submission race conditions.
 				}
-				// Note: We do NOT submitRecv here for valid fds to avoid double-submission races.
-				// The read loop is kept active via Read Completions.
 			}
 		}
 
@@ -351,27 +364,17 @@ func (s *HybridServer) handleData(fd int, data []byte) (consumed int, closed boo
 		if len(data) >= h2PrefaceLen && bytes.Equal(data[:h2PrefaceLen], []byte(h2Preface)) {
 			state.protocol = protoH2CIO
 		} else if len(data) > 0 {
-			// Check for H1 prefixes to differentiate from partial H2 preface
-			if bytes.HasPrefix(data, []byte("GET ")) || bytes.HasPrefix(data, []byte("POST ")) ||
-				bytes.HasPrefix(data, []byte("PUT ")) || bytes.HasPrefix(data, []byte("DELETE ")) {
-				state.protocol = protoHTTP1IO
-			} else {
-				// Not a clear H1 request.
-				// If we have less than H2 preface length, wait for more data to decide.
-				if len(data) < h2PrefaceLen {
-					return 0, false
-				}
-				// If >= 24 bytes and didn't match H2 preface (checked above) or H1 prefix,
-				// it might be Upgrade or garbage.
-				// Check for HTTP/1.1 upgrade to H2C (Only on GET to avoid body handling complexity)
-				if bytes.HasPrefix(data, []byte("GET ")) && bytes.Contains(data, []byte("Upgrade: h2c")) {
-					state.protocol = protoH2CIO
-					s.handleH2CUpgrade(fd, state)
-					return len(data), false
-				}
-				// Default to H1 which will likely 404/fail if invalid
-				state.protocol = protoHTTP1IO
+			// Infer HTTP/1.1 from method
+			// Check "GET ", "POST", "HEAD" etc.
+			// Simple check: Is it ASCII? Just default to HTTP/1.1 for now if H2 check fails
+			// and let the handler validate.
+			// But maintain Upgrade check logic just in case.
+			if bytes.Contains(data, []byte("Upgrade: h2c")) {
+				state.protocol = protoH2CIO
+				s.handleH2CUpgrade(fd, state)
+				return len(data), false
 			}
+			state.protocol = protoHTTP1IO
 		} else {
 			return 0, false
 		}
@@ -504,18 +507,19 @@ func (s *HybridServer) handleH2C(fd int, state *hybridioConnState, data []byte) 
 			s.handleH2Request(fd, streamID, frameData, flags, endStream)
 
 		case h2FrameTypeData:
-			// Consume data and send Window Update
+			// Consume data and send Window Updates (coalesced)
 			if length > 0 {
-				s.submitWindowUpdate(fd, 0, uint32(length))        // Connection flow control
-				s.submitWindowUpdate(fd, streamID, uint32(length)) // Stream flow control
+				s.submitWindowUpdates(fd, streamID, uint32(length))
 			}
 
 			endStream := flags&h2FlagEndStream != 0
 			if endStream {
-				state := s.connState[fd]
-				if state != nil && state.activeStreamID == streamID && state.streamOpen {
-					s.sendH2Response(fd, streamID, state.activePath)
-					state.streamOpen = false
+				connState := s.connState[fd]
+				if connState != nil {
+					if path, ok := connState.streams[streamID]; ok {
+						s.sendH2Response(fd, streamID, path)
+						delete(connState.streams, streamID)
+					}
 				}
 			}
 		}
@@ -604,11 +608,10 @@ func (s *HybridServer) handleH2Request(fd int, streamID uint32, headerBlock []by
 		s.sendH2Response(fd, streamID, path)
 	} else {
 		if state, ok := s.connState[fd]; ok {
-			state.activeStreamID = streamID
-			state.activePath = path
-			state.streamOpen = true
+			// Store in streams map for proper multiplexing
+			state.streams[streamID] = path
 
-			// For upload, assume Expect: 100-continue is desired by typical Go clients
+			// For upload, send 100-continue for Go clients
 			if path == "/upload" {
 				s.send100Continue(fd, streamID)
 			}
@@ -635,51 +638,69 @@ func (s *HybridServer) send100Continue(fd int, streamID uint32) {
 func (s *HybridServer) sendH2Response(fd int, streamID uint32, path string) {
 	var headerBytes, dataBytes []byte
 
-	switch path {
-	case "/json":
+	if path == "/json" {
 		headerBytes = hpackHeadersJSON
 		dataBytes = bodyJSON
-	case "/upload":
+	} else if path == "/upload" {
 		headerBytes = hpackHeadersSimple
-		dataBytes = []byte("OK")
-	default:
+		dataBytes = bodyOK
+	} else {
 		headerBytes = hpackHeadersSimple
 		dataBytes = bodySimple
 	}
 
-	// Frame 1: Headers
-	hHead := make([]byte, 9)
-	hHead[0] = byte(len(headerBytes) >> 16)
-	hHead[1] = byte(len(headerBytes) >> 8)
-	hHead[2] = byte(len(headerBytes))
-	hHead[3] = h2FrameTypeHeaders
-	hHead[4] = h2FlagEndHeaders
-	binary.BigEndian.PutUint32(hHead[5:], streamID)
+	// Coalesce Headers + Data frames into single buffer
+	// Headers frame: 9 + len(headerBytes)
+	// Data frame: 9 + len(dataBytes)
+	totalLen := 9 + len(headerBytes) + 9 + len(dataBytes)
+	frame := make([]byte, totalLen)
 
-	s.submitSend(fd, append(hHead, headerBytes...))
+	// Headers frame
+	frame[0] = byte(len(headerBytes) >> 16)
+	frame[1] = byte(len(headerBytes) >> 8)
+	frame[2] = byte(len(headerBytes))
+	frame[3] = h2FrameTypeHeaders
+	frame[4] = h2FlagEndHeaders
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	copy(frame[9:], headerBytes)
 
-	// Frame 2: Data
-	dHead := make([]byte, 9)
-	dHead[0] = byte(len(dataBytes) >> 16)
-	dHead[1] = byte(len(dataBytes) >> 8)
-	dHead[2] = byte(len(dataBytes))
-	dHead[3] = h2FrameTypeData
-	dHead[4] = h2FlagEndStream
-	binary.BigEndian.PutUint32(dHead[5:], streamID)
+	// Data frame
+	dataOffset := 9 + len(headerBytes)
+	frame[dataOffset] = byte(len(dataBytes) >> 16)
+	frame[dataOffset+1] = byte(len(dataBytes) >> 8)
+	frame[dataOffset+2] = byte(len(dataBytes))
+	frame[dataOffset+3] = h2FrameTypeData
+	frame[dataOffset+4] = h2FlagEndStream
+	binary.BigEndian.PutUint32(frame[dataOffset+5:dataOffset+9], streamID)
+	copy(frame[dataOffset+9:], dataBytes)
 
-	s.submitSend(fd, append(dHead, dataBytes...))
+	s.submitSend(fd, frame)
 }
 
-func (s *HybridServer) submitWindowUpdate(fd int, streamID uint32, increment uint32) {
-	// Frame Header (9 bytes) + Window Size Increment (4 bytes)
-	frame := make([]byte, 13)
+// submitWindowUpdates sends both connection and stream window updates in a single buffer
+func (s *HybridServer) submitWindowUpdates(fd int, streamID uint32, increment uint32) {
+	// Two WINDOW_UPDATE frames coalesced: connection (stream 0) + stream
+	// Each frame: 9 bytes header + 4 bytes payload = 13 bytes
+	// Total: 26 bytes for both
+	frame := make([]byte, 26)
+
+	// Connection window update (stream 0)
 	frame[0] = 0x00
 	frame[1] = 0x00
 	frame[2] = 0x04 // Length 4
 	frame[3] = 0x08 // Type WINDOW_UPDATE
 	frame[4] = 0x00 // Flags
-	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	// frame[5:9] = 0 (stream 0)
 	binary.BigEndian.PutUint32(frame[9:13], increment)
+
+	// Stream window update
+	frame[13] = 0x00
+	frame[14] = 0x00
+	frame[15] = 0x04 // Length 4
+	frame[16] = 0x08 // Type WINDOW_UPDATE
+	frame[17] = 0x00 // Flags
+	binary.BigEndian.PutUint32(frame[18:22], streamID)
+	binary.BigEndian.PutUint32(frame[22:26], increment)
 
 	s.submitSend(fd, frame)
 }
