@@ -21,7 +21,6 @@ func NewServer(port string, useH2C bool) *Server {
 	gin.SetMode(gin.ReleaseMode)
 
 	engine := gin.New()
-	// Skip default middleware for maximum performance
 	engine.UseRawPath = true
 
 	s := &Server{
@@ -48,13 +47,11 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) registerRoutes() {
-	// Simple benchmark: plain text response
 	s.engine.GET("/", func(c *gin.Context) {
 		c.Header("Content-Type", "text/plain")
 		c.String(200, "Hello, World!")
 	})
 
-	// JSON benchmark: JSON serialization
 	s.engine.GET("/json", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"message": "Hello, World!",
@@ -62,16 +59,14 @@ func (s *Server) registerRoutes() {
 		})
 	})
 
-	// Path benchmark: path parameter extraction
 	s.engine.GET("/users/:id", func(c *gin.Context) {
 		id := c.Param("id")
 		c.Header("Content-Type", "text/plain")
 		c.String(200, "User ID: "+id)
 	})
 
-	// Big request benchmark: POST with body
 	s.engine.POST("/upload", func(c *gin.Context) {
-		_, _ = c.GetRawData() // Read body (benchmarks body parsing)
+		_, _ = c.GetRawData()
 		c.Header("Content-Type", "text/plain")
 		c.String(200, "OK")
 	})

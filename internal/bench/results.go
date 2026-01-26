@@ -122,7 +122,6 @@ func java_like_format(f float64, precision int) string {
 }
 
 func sprintf(format string, a ...interface{}) string {
-	// Simple implementation
 	switch format {
 	case "%.0f":
 		return sprintfInt(a[0].(float64))

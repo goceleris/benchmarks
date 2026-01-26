@@ -17,10 +17,9 @@ func NewServer(port string) *Server {
 	app := fiber.New(fiber.Config{
 		ServerHeader:          "fiber-benchmark",
 		DisableStartupMessage: true,
-		Prefork:               false, // Disable prefork for fair comparison
-		// Optimize for benchmarks
-		ReadBufferSize:  16384,
-		WriteBufferSize: 16384,
+		Prefork:               false,
+		ReadBufferSize:        16384,
+		WriteBufferSize:       16384,
 	})
 
 	s := &Server{
@@ -38,13 +37,11 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) registerRoutes() {
-	// Simple benchmark: plain text response
 	s.app.Get("/", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "text/plain")
 		return c.SendString("Hello, World!")
 	})
 
-	// JSON benchmark: JSON serialization
 	s.app.Get("/json", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"message": "Hello, World!",
@@ -52,16 +49,14 @@ func (s *Server) registerRoutes() {
 		})
 	})
 
-	// Path benchmark: path parameter extraction
 	s.app.Get("/users/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		c.Set("Content-Type", "text/plain")
 		return c.SendString("User ID: " + id)
 	})
 
-	// Big request benchmark: POST with body
 	s.app.Post("/upload", func(c *fiber.Ctx) error {
-		_ = c.Body() // Read body (benchmarks body parsing)
+		_ = c.Body()
 		c.Set("Content-Type", "text/plain")
 		return c.SendString("OK")
 	})

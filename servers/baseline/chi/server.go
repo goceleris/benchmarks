@@ -41,28 +41,24 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) registerRoutes() {
-	// Simple benchmark: plain text response
 	s.router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("Hello, World!"))
 	})
 
-	// JSON benchmark: JSON serialization
 	s.router.Get("/json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"message":"Hello, World!","server":"chi-h1"}`))
 	})
 
-	// Path benchmark: path parameter extraction
 	s.router.Get("/users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("User ID: " + id))
 	})
 
-	// Big request benchmark: POST with body
 	s.router.Post("/upload", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body) // Read body (benchmarks body parsing)
+		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("OK"))
 	})

@@ -20,7 +20,6 @@ import (
 	"github.com/goceleris/benchmarks/internal/bench"
 )
 
-// Server definitions
 var baselineServers = []string{
 	"stdhttp-h1",
 	"stdhttp-h2",
@@ -49,7 +48,6 @@ var theoreticalServers = []string{
 	"iouring-hybrid",
 }
 
-// Benchmark types
 var benchmarkTypes = []struct {
 	Name   string
 	Method string
@@ -74,7 +72,6 @@ func main() {
 
 	flag.Parse()
 
-	// Determine architecture
 	arch := runtime.GOARCH
 	if arch == "amd64" {
 		arch = "x86"
@@ -86,9 +83,7 @@ func main() {
 	log.Printf("Connections: %d", *connections)
 	log.Printf("Workers: %d", *workers)
 
-	// Find server binary
 	if *serverBin == "" {
-		// Try to find it
 		candidates := []string{
 			"./bin/server",
 			"./server",
@@ -105,7 +100,6 @@ func main() {
 		}
 	}
 
-	// Determine which servers to benchmark
 	var servers []string
 	switch *mode {
 	case "baseline":
@@ -118,7 +112,6 @@ func main() {
 		log.Fatalf("Unknown mode: %s", *mode)
 	}
 
-	// Create output
 	output := &bench.BenchmarkOutput{
 		Timestamp:    time.Now().UTC().Format("2006-01-02T15_04_05Z"),
 		Architecture: arch,
@@ -133,18 +126,15 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Run benchmarks
 	for _, serverType := range servers {
 		log.Printf("=== Benchmarking: %s ===", serverType)
 
-		// Start server
 		cmd, err := startServer(*serverBin, serverType, *port)
 		if err != nil {
 			log.Printf("WARN: Failed to start %s: %v, skipping", serverType, err)
 			continue
 		}
 
-		// Wait for server to be ready
 		if err := waitForServer(ctx, *port, 10*time.Second); err != nil {
 			log.Printf("WARN: Server %s not ready: %v, skipping", serverType, err)
 			stopServer(cmd)
@@ -153,7 +143,6 @@ func main() {
 
 		log.Printf("Server ready: %s", serverType)
 
-		// Run each benchmark type
 		for _, bt := range benchmarkTypes {
 			log.Printf("Running benchmark: %s on %s", bt.Name, serverType)
 
@@ -183,12 +172,10 @@ func main() {
 			))
 		}
 
-		// Stop server
 		stopServer(cmd)
 		time.Sleep(500 * time.Millisecond) // Brief pause between servers
 	}
 
-	// Write output
 	if err := os.MkdirAll(*outputDir, 0755); err != nil {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
@@ -247,7 +234,6 @@ func waitForServer(ctx context.Context, port string, timeout time.Duration) erro
 		default:
 		}
 
-		// Try TCP connection
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%s", port), 100*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()

@@ -7,7 +7,6 @@ import (
 )
 
 // LatencyRecorder records latency samples for percentile calculation.
-// Uses a lock-free append with periodic sorting for efficiency.
 type LatencyRecorder struct {
 	mu      sync.Mutex
 	samples []time.Duration
@@ -21,7 +20,7 @@ type LatencyRecorder struct {
 func NewLatencyRecorder() *LatencyRecorder {
 	return &LatencyRecorder{
 		samples: make([]time.Duration, 0, 100000),
-		min:     time.Hour, // Start with a very high min
+		min:     time.Hour,
 	}
 }
 
@@ -63,7 +62,6 @@ func (r *LatencyRecorder) Percentiles() Percentiles {
 		return Percentiles{}
 	}
 
-	// Sort samples for percentile calculation
 	sorted := make([]time.Duration, len(r.samples))
 	copy(sorted, r.samples)
 	sort.Slice(sorted, func(i, j int) bool {

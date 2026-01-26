@@ -63,7 +63,6 @@ type Benchmarker struct {
 // New creates a new Benchmarker with the given configuration.
 func New(cfg Config) *Benchmarker {
 	if cfg.H2C {
-		// HTTP/2 Cleartext (H2C) configuration
 		h2Transport := &http2.Transport{
 			AllowHTTP: true,
 			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
@@ -197,7 +196,6 @@ func (b *Benchmarker) doRequest(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	// Set Content-Length explicitly to avoid chunked transfer encoding
 	if len(b.config.Body) > 0 {
 		req.ContentLength = int64(len(b.config.Body))
 	}

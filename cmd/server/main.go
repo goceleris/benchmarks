@@ -25,7 +25,6 @@ func main() {
 	var err error
 
 	switch *serverType {
-	// Baseline servers
 	case "stdhttp-h1":
 		server := stdhttp.NewHTTP1Server(*port)
 		err = server.Run()
@@ -74,7 +73,6 @@ func main() {
 		server := echo.NewServer(*port, true)
 		err = server.Run()
 
-	// Theoretical servers will be added here
 	case "epoll-h1", "epoll-h2", "epoll-hybrid":
 		log.Printf("Epoll server %s - Linux only", *serverType)
 		err = runEpollServer(*serverType, *port)

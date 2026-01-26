@@ -47,12 +47,10 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) registerRoutes() {
-	// Simple benchmark: plain text response
 	s.e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Hello, World!")
 	})
 
-	// JSON benchmark: JSON serialization
 	s.e.GET("/json", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{
 			"message": "Hello, World!",
@@ -60,15 +58,13 @@ func (s *Server) registerRoutes() {
 		})
 	})
 
-	// Path benchmark: path parameter extraction
 	s.e.GET("/users/:id", func(c echo.Context) error {
 		id := c.Param("id")
 		return c.String(http.StatusOK, "User ID: "+id)
 	})
 
-	// Big request benchmark: POST with body
 	s.e.POST("/upload", func(c echo.Context) error {
-		_, _ = io.Copy(io.Discard, c.Request().Body) // Read body
+		_, _ = io.Copy(io.Discard, c.Request().Body)
 		return c.String(http.StatusOK, "OK")
 	})
 }

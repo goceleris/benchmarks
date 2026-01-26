@@ -30,11 +30,10 @@ func (s *HTTP1Server) Run() error {
 	s.registerRoutes(mux)
 
 	server := &http.Server{
-		Addr:    ":" + s.config.Port,
-		Handler: mux,
-		// Optimize for benchmarks
-		MaxHeaderBytes:    1 << 20, // 1MB
-		ReadHeaderTimeout: 0,       // Disable timeout for benchmarks
+		Addr:              ":" + s.config.Port,
+		Handler:           mux,
+		MaxHeaderBytes:    1 << 20,
+		ReadHeaderTimeout: 0,
 		WriteTimeout:      0,
 		IdleTimeout:       0,
 	}
@@ -43,7 +42,6 @@ func (s *HTTP1Server) Run() error {
 }
 
 func (s *HTTP1Server) registerRoutes(mux *http.ServeMux) {
-	// Simple benchmark: plain text response
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -52,12 +50,10 @@ func (s *HTTP1Server) registerRoutes(mux *http.ServeMux) {
 		common.WriteSimple(w)
 	})
 
-	// JSON benchmark: JSON serialization
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		common.WriteJSON(w, s.config.ServerType)
 	})
 
-	// Path benchmark: path parameter extraction
 	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/users/")
 		if id == "" {
@@ -67,7 +63,6 @@ func (s *HTTP1Server) registerRoutes(mux *http.ServeMux) {
 		common.WritePath(w, id)
 	})
 
-	// Big request benchmark: POST with body
 	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

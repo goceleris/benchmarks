@@ -20,7 +20,7 @@ type Server struct {
 // NewServer creates a new Iris baseline server.
 func NewServer(port string, useH2C bool) *Server {
 	app := iris.New()
-	app.Logger().SetLevel("warn") // Reduce logging noise
+	app.Logger().SetLevel("warn")
 
 	s := &Server{
 		port:   port,
@@ -35,13 +35,10 @@ func NewServer(port string, useH2C bool) *Server {
 // Run starts the Iris server.
 func (s *Server) Run() error {
 	if s.useH2C {
-		// Ensure Iris application is built (routes registered, internal state set)
-		// since we are skipping app.Listen
 		if err := s.app.Build(); err != nil {
 			return err
 		}
 
-		// Configure H2C (HTTP/2 Cleartext)
 		h2cHandler := h2c.NewHandler(s.app, &http2.Server{})
 
 		srv := &http.Server{
@@ -51,7 +48,6 @@ func (s *Server) Run() error {
 		return srv.ListenAndServe()
 	}
 
-	// Standard HTTP/1.1
 	return s.app.Listen(":"+s.port,
 		iris.WithOptimizations,
 		iris.WithoutServerError(iris.ErrServerClosed),
@@ -60,13 +56,11 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) registerRoutes() {
-	// Simple benchmark: plain text response
 	s.app.Get("/", func(ctx iris.Context) {
 		ctx.ContentType("text/plain")
 		_, _ = ctx.WriteString("Hello, World!")
 	})
 
-	// JSON benchmark: JSON serialization
 	s.app.Get("/json", func(ctx iris.Context) {
 		_ = ctx.JSON(iris.Map{
 			"message": "Hello, World!",
@@ -74,16 +68,14 @@ func (s *Server) registerRoutes() {
 		})
 	})
 
-	// Path benchmark: path parameter extraction
 	s.app.Get("/users/{id:string}", func(ctx iris.Context) {
 		id := ctx.Params().Get("id")
 		ctx.ContentType("text/plain")
 		_, _ = ctx.WriteString("User ID: " + id)
 	})
 
-	// Big request benchmark: POST with body
 	s.app.Post("/upload", func(ctx iris.Context) {
-		_, _ = ctx.GetBody() // Read body
+		_, _ = ctx.GetBody()
 		ctx.ContentType("text/plain")
 		_, _ = ctx.WriteString("OK")
 	})

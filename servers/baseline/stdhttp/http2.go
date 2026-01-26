@@ -33,10 +33,9 @@ func (s *HTTP2Server) Run() error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	// Create H2C handler that supports HTTP/2 prior knowledge
 	h2s := &http2.Server{
 		MaxConcurrentStreams: 1000,
-		MaxReadFrameSize:     1 << 20, // 1MB
+		MaxReadFrameSize:     1 << 20,
 	}
 
 	handler := h2c.NewHandler(mux, h2s)
@@ -46,7 +45,6 @@ func (s *HTTP2Server) Run() error {
 		Handler: handler,
 	}
 
-	// Use raw listener for better control
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
 		return err
@@ -56,7 +54,6 @@ func (s *HTTP2Server) Run() error {
 }
 
 func (s *HTTP2Server) registerRoutes(mux *http.ServeMux) {
-	// Simple benchmark: plain text response
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -65,12 +62,10 @@ func (s *HTTP2Server) registerRoutes(mux *http.ServeMux) {
 		common.WriteSimple(w)
 	})
 
-	// JSON benchmark: JSON serialization
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		common.WriteJSON(w, s.config.ServerType)
 	})
 
-	// Path benchmark: path parameter extraction
 	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/users/")
 		if id == "" {
@@ -80,7 +75,6 @@ func (s *HTTP2Server) registerRoutes(mux *http.ServeMux) {
 		common.WritePath(w, id)
 	})
 
-	// Big request benchmark: POST with body
 	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
