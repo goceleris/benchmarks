@@ -21,10 +21,10 @@ const (
 
 // hybridConnState tracks per-connection state
 type hybridConnState struct {
-	protocol    int
-	prefaceRecv bool
+	protocol     int
+	prefaceRecv  bool
 	settingsSent bool
-	streams     map[uint32]string
+	streams      map[uint32]string
 }
 
 // hybridWorker represents a single event loop worker
@@ -309,7 +309,8 @@ func (w *hybridWorker) handleHTTP1(fd int, data []byte) int {
 	}
 
 	var response []byte
-	if data[0] == 'G' {
+	switch data[0] {
+	case 'G':
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
 			response = responseSimple
 		} else if len(data) > 9 && data[5] == 'j' {
@@ -319,9 +320,9 @@ func (w *hybridWorker) handleHTTP1(fd int, data []byte) int {
 		} else {
 			response = response404
 		}
-	} else if data[0] == 'P' {
+	case 'P':
 		response = responseOK
-	} else {
+	default:
 		response = response404
 	}
 

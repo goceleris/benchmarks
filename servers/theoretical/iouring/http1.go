@@ -23,8 +23,8 @@ const (
 	IORING_ENTER_GETEVENTS = 1 << 0
 
 	sqeCount    = 4096
-	bufferCount = 4096  // Reduced from 65536 - matches sqeCount
-	bufferSize  = 8192  // Sufficient for most HTTP requests including POST with body
+	bufferCount = 4096 // Reduced from 65536 - matches sqeCount
+	bufferSize  = 8192 // Sufficient for most HTTP requests including POST with body
 )
 
 var (
@@ -419,7 +419,8 @@ func (w *ioWorker) processRequest(fd int, data []byte) int {
 	}
 
 	var response []byte
-	if data[0] == 'G' {
+	switch data[0] {
+	case 'G':
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
 			response = responseSimple
 		} else if len(data) > 9 && data[5] == 'j' {
@@ -429,9 +430,9 @@ func (w *ioWorker) processRequest(fd int, data []byte) int {
 		} else {
 			response = response404
 		}
-	} else if data[0] == 'P' {
+	case 'P':
 		response = responseOK
-	} else {
+	default:
 		response = response404
 	}
 

@@ -18,8 +18,8 @@ import (
 
 const (
 	maxEvents   = 4096
-	maxConns    = 4096  // Reduced from 65536 to save memory
-	readBufSize = 8192  // Sufficient for most HTTP requests including POST with body
+	maxConns    = 4096 // Reduced from 65536 to save memory
+	readBufSize = 8192 // Sufficient for most HTTP requests including POST with body
 )
 
 // HTTP/1.1 response templates (pre-formatted for zero-allocation)
@@ -263,7 +263,8 @@ func processHTTP1Request(fd int, data []byte) int {
 
 	// Ultra-fast path matching
 	var response []byte
-	if data[0] == 'G' {
+	switch data[0] {
+	case 'G':
 		if len(data) > 6 && data[4] == '/' && data[5] == ' ' {
 			response = responseSimple
 		} else if len(data) > 9 && data[5] == 'j' {
@@ -273,9 +274,9 @@ func processHTTP1Request(fd int, data []byte) int {
 		} else {
 			response = response404
 		}
-	} else if data[0] == 'P' {
+	case 'P':
 		response = responseOK
-	} else {
+	default:
 		response = response404
 	}
 
