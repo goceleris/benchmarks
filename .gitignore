@@ -34,10 +34,11 @@ terraform/*.tfplan
 *.tfvars
 !terraform.tfvars.example
 
-# Results
-# Keep official results (latest/ and version folders like v0.1.0/)
-# Ignore temporary test results and raw benchmark output
-results/
+# Results - ignore temporary benchmark outputs but keep official results
+results/*
+!results/latest/
+!results/v*/
+!results/README.md
 
 # Logs
 *.log

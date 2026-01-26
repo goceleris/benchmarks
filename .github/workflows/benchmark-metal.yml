@@ -5,6 +5,8 @@ name: Benchmark (Metal)
 # Uses c5.metal (x86) and c6g.metal (ARM64)
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -40,8 +42,8 @@ jobs:
   authorize:
     name: Authorize Caller
     runs-on: ubuntu-latest
-    # Skip authorization for release events (already requires write access)
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    # Skip authorization for push/release events (already requires write access)
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     steps:
       - name: Check Permissions
         if: github.event_name == 'workflow_dispatch'
@@ -274,10 +276,10 @@ jobs:
             echo "Release: ${VERSION}" > "results/${VERSION}/RELEASE_INFO"
             echo "Date: $(date -u)" >> "results/${VERSION}/RELEASE_INFO"
             
-            git add "results/${VERSION}/"
+            git add -f "results/${VERSION}/"
           fi
-          
-          git add results/latest/
+
+          git add -f results/latest/
           git commit -m "chore: update benchmark results [skip ci]" || echo "No changes to commit"
           git push || echo "Push failed (may need permissions)"
       
