@@ -2,10 +2,12 @@ name: Benchmark (Fast)
 
 # Fast mode: Runs on PRs for quick trend validation
 # Uses cheaper virtualized instances (c5.large, c6g.medium)
+# Requires approval: PR must have 'run-benchmarks' label added by maintainer
 
 on:
   pull_request:
     branches: [main]
+    types: [labeled, synchronize]
   workflow_dispatch:
     inputs:
       duration:
@@ -31,9 +33,45 @@ env:
   TF_VAR_benchmark_mode: fast
 
 jobs:
+  authorize:
+    name: Authorize Benchmark
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Check Authorization
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For manual triggers, check user permissions
+            PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+            if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+              echo "authorized=true" >> $GITHUB_OUTPUT
+              echo "User ${{ github.actor }} authorized (permission: $PERMISSION)"
+            else
+              echo "authorized=false" >> $GITHUB_OUTPUT
+              echo "::error::User ${{ github.actor }} not authorized (permission: $PERMISSION)"
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, require 'run-benchmarks' label
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-benchmarks') }}" == "true" ]]; then
+              echo "authorized=true" >> $GITHUB_OUTPUT
+              echo "PR has 'run-benchmarks' label - authorized"
+            else
+              echo "authorized=false" >> $GITHUB_OUTPUT
+              echo "::notice::PR needs 'run-benchmarks' label to run benchmarks. A maintainer must add this label."
+            fi
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+          fi
+
   launch:
     name: Launch Fast Infrastructure
     runs-on: ubuntu-latest
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
     outputs:
       arm64_launched: ${{ steps.result.outputs.arm64_launched }}
       x86_launched: ${{ steps.result.outputs.x86_launched }}
@@ -198,9 +236,9 @@ jobs:
 
   report:
     name: Generate Report
-    needs: [launch, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && needs.authorize.outputs.authorized == 'true'
     permissions:
       pull-requests: write
       contents: read
@@ -366,9 +404,9 @@ jobs:
 
   cleanup:
     name: Cleanup Infrastructure
-    needs: [launch, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && needs.authorize.outputs.authorized == 'true'
 
     steps:
       - name: Checkout

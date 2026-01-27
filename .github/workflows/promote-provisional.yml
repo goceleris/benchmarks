@@ -2,6 +2,9 @@ name: Promote Provisional Results
 
 # Promotes provisional benchmark results to official by re-running on metal
 # Only runs on metal - fails if metal instances are unavailable
+#
+# Security: Only authorized users can trigger (to protect AWS resources)
+# Requires write/maintain/admin permissions
 
 on:
   workflow_dispatch:
@@ -29,9 +32,34 @@ env:
   TF_VAR_benchmark_mode: metal
 
 jobs:
+  authorize:
+    name: Authorize Caller
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Check Permissions
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+          echo "User: ${{ github.actor }}"
+          echo "Permission level: $PERMISSION"
+          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            echo "User ${{ github.actor }} authorized with permission: $PERMISSION"
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "::error::Unauthorized: Only maintainers and owners can promote results"
+            exit 1
+          fi
+
   check-provisional:
     name: Check for Provisional Results
     runs-on: ubuntu-latest
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
     outputs:
       has_provisional: ${{ steps.check.outputs.has_provisional }}
 
@@ -54,8 +82,8 @@ jobs:
   launch-metal:
     name: Launch Metal Infrastructure
     runs-on: ubuntu-latest
-    needs: check-provisional
-    if: needs.check-provisional.outputs.has_provisional == 'true'
+    needs: [authorize, check-provisional]
+    if: needs.authorize.outputs.authorized == 'true' && needs.check-provisional.outputs.has_provisional == 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
       instance_mode: ${{ steps.result.outputs.instance_mode }}
@@ -208,9 +236,9 @@ jobs:
 
   promote:
     name: Promote to Official
-    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch-metal, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
+    if: always() && needs.authorize.outputs.authorized == 'true' && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
     permissions:
       contents: write
 
@@ -302,9 +330,9 @@ jobs:
 
   cleanup:
     name: Cleanup Infrastructure
-    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch-metal, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && needs.authorize.outputs.authorized == 'true'
 
     steps:
       - name: Checkout
@@ -329,8 +357,8 @@ jobs:
   no-provisional:
     name: No Provisional Results
     runs-on: ubuntu-latest
-    needs: check-provisional
-    if: needs.check-provisional.outputs.has_provisional != 'true'
+    needs: [authorize, check-provisional]
+    if: needs.authorize.outputs.authorized == 'true' && needs.check-provisional.outputs.has_provisional != 'true'
 
     steps:
       - name: Report No Provisional
