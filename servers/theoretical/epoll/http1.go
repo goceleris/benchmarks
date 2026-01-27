@@ -19,11 +19,11 @@ import (
 
 // Scaling constants - these scale based on CPU count
 const (
-	maxEventsBase   = 1024           // Base epoll_wait batch size
-	maxConnsPerCPU  = 512            // Connections per CPU per worker
-	readBufSize     = 8192           // Per-connection read buffer
-	maxConnsMin     = 1024           // Minimum connections per worker
-	maxConnsMax     = 65536          // Maximum connections per worker (fd limit)
+	maxEventsBase  = 1024  // Base epoll_wait batch size
+	maxConnsPerCPU = 512   // Connections per CPU per worker
+	readBufSize    = 8192  // Per-connection read buffer
+	maxConnsMin    = 1024  // Minimum connections per worker
+	maxConnsMax    = 65536 // Maximum connections per worker (fd limit)
 )
 
 // getScaledLimits returns connection limits scaled to available CPUs

@@ -21,6 +21,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
+
 	"github.com/goceleris/benchmarks/internal/bench"
 )
 
@@ -324,7 +325,7 @@ func main() {
 		if err := waitForServer(ctx, serverHost, *port, 10*time.Second); err != nil {
 			log.Printf("WARN: Server %s not ready: %v, skipping", serverType, err)
 			if remoteMode {
-				rc.StopServer(ctx)
+				_ = rc.StopServer(ctx)
 			} else {
 				stopServer(cmd)
 			}
@@ -338,7 +339,7 @@ func main() {
 			case <-ctx.Done():
 				log.Printf("Benchmark interrupted during %s:%s", serverType, bt.Name)
 				if remoteMode {
-					rc.StopServer(ctx)
+					_ = rc.StopServer(ctx)
 				} else {
 					stopServer(cmd)
 				}
@@ -381,7 +382,7 @@ func main() {
 				if ctx.Err() != nil {
 					log.Printf("Benchmark interrupted: %v", err)
 					if remoteMode {
-						rc.StopServer(ctx)
+						_ = rc.StopServer(ctx)
 					} else {
 						stopServer(cmd)
 					}
@@ -403,7 +404,7 @@ func main() {
 		}
 
 		if remoteMode {
-			rc.StopServer(ctx)
+			_ = rc.StopServer(ctx)
 		} else {
 			stopServer(cmd)
 		}
@@ -530,7 +531,7 @@ func (rc *RemoteController) StartServer(ctx context.Context, serverType string) 
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
 			var status ControlStatus
@@ -561,7 +562,7 @@ func (rc *RemoteController) StopServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	return nil
 }
@@ -591,7 +592,7 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 		// Check if server is reachable
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", rc.serverIP, rc.serverPort), 2*time.Second)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil
 		}
 

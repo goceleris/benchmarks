@@ -83,7 +83,7 @@ func main() {
 		<-sigChan
 		log.Println("Shutting down control daemon...")
 		daemon.stopServer()
-		server.Shutdown(context.Background())
+		_ = server.Shutdown(context.Background())
 	}()
 
 	log.Printf("Control daemon listening on :%s (server binary: %s)", *controlPort, *serverBin)
@@ -92,18 +92,18 @@ func main() {
 	}
 }
 
-func (d *ControlDaemon) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (d *ControlDaemon) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
 }
 
-func (d *ControlDaemon) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (d *ControlDaemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	d.mu.Lock()
 	status := d.status
 	d.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (d *ControlDaemon) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +137,7 @@ func (d *ControlDaemon) handleStart(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (d *ControlDaemon) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +153,7 @@ func (d *ControlDaemon) handleStop(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (d *ControlDaemon) startServer(serverType string) error {
@@ -234,7 +234,7 @@ func (d *ControlDaemon) stopServer() {
 	// Wait with timeout
 	done := make(chan struct{})
 	go func() {
-		cmd.Wait()
+		_ = cmd.Wait()
 		close(done)
 	}()
 
@@ -262,7 +262,7 @@ func (d *ControlDaemon) waitForReady(timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get("http://" + addr + "/")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)

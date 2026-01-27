@@ -77,7 +77,7 @@ func New(cfg Config) *Benchmarker {
 				return dialer.Dial(network, addr)
 			},
 			// Allow many concurrent streams per connection for better multiplexing
-			MaxReadFrameSize:     32 * 1024,
+			MaxReadFrameSize:           32 * 1024,
 			StrictMaxConcurrentStreams: false,
 		}
 		return &Benchmarker{

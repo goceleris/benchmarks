@@ -53,7 +53,7 @@ func (r *LatencyRecorder) Record(d time.Duration) {
 		// This maintains a uniform random sample of the stream
 		// Use a simple modulo-based sampling for performance (not cryptographically random, but sufficient for latency stats)
 		if int(r.count%int64(r.maxSamples)) == 0 {
-			idx := int(r.count / int64(r.maxSamples)) % r.maxSamples
+			idx := int(r.count/int64(r.maxSamples)) % r.maxSamples
 			r.samples[idx] = d
 		}
 	}
