@@ -85,6 +85,9 @@ fi
 
 # Configure runner (ephemeral = one job only)
 echo "=== Configuring Runner ==="
+echo "Registering with URL: $REPOSITORY_URL"
+echo "Registering with labels: $RUNNER_LABELS"
+echo "Runner name: benchmark-client-$ARCHITECTURE-$(date +%s)"
 sudo -u ubuntu ./config.sh \
     --url "$REPOSITORY_URL" \
     --token "$REG_TOKEN" \

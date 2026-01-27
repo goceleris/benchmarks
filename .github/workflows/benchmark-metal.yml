@@ -213,7 +213,7 @@ jobs:
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_benchmark_mode: metal
           TF_VAR_launch_arm64_only: "true"
-        run: terraform destroy -auto-approve -target=aws_spot_instance_request.arm64_runner || true
+        run: terraform destroy -auto-approve -target=aws_spot_instance_request.arm64_server || true
 
       - name: Try ARM64 Metal On-Demand
         id: metal_ondemand
@@ -395,6 +395,8 @@ jobs:
 
       - name: Wait for ARM64 Runners
         if: steps.result.outputs.launched == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
           if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
             echo "Waiting for ARM64 provisional runners (90s)..."
@@ -403,6 +405,18 @@ jobs:
             echo "Waiting for ARM64 metal runners (150s)..."
             sleep 150
           fi
+
+          # Debug: Show expected labels
+          echo ""
+          echo "=== Expected Runner Labels ==="
+          echo "Server job expects: [self-hosted, ${{ steps.result.outputs.server_runner_label }}]"
+          echo "Client job expects: [self-hosted, ${{ steps.result.outputs.client_runner_label }}]"
+
+          # Debug: Show registered runners
+          echo ""
+          echo "=== Currently Registered Runners ==="
+          gh api repos/${{ github.repository }}/actions/runners \
+            --jq '.runners[] | "Name: \(.name) | Status: \(.status) | Labels: \([.labels[].name] | join(", "))"' || echo "Failed to fetch runners"
 
       - name: Report Launch Status
         if: always()
@@ -672,6 +686,8 @@ jobs:
 
       - name: Wait for x86 Runners
         if: steps.result.outputs.launched == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
           if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
             echo "Waiting for x86 provisional runners (90s)..."
@@ -680,6 +696,18 @@ jobs:
             echo "Waiting for x86 metal runners (150s)..."
             sleep 150
           fi
+
+          # Debug: Show expected labels
+          echo ""
+          echo "=== Expected Runner Labels ==="
+          echo "Server job expects: [self-hosted, ${{ steps.result.outputs.server_runner_label }}]"
+          echo "Client job expects: [self-hosted, ${{ steps.result.outputs.client_runner_label }}]"
+
+          # Debug: Show registered runners
+          echo ""
+          echo "=== Currently Registered Runners ==="
+          gh api repos/${{ github.repository }}/actions/runners \
+            --jq '.runners[] | "Name: \(.name) | Status: \(.status) | Labels: \([.labels[].name] | join(", "))"' || echo "Failed to fetch runners"
 
       - name: Report Launch Status
         if: always()

@@ -93,10 +93,13 @@ fi
 
 # Configure runner (ephemeral = one job only)
 echo "=== Configuring Runner ==="
+echo "Registering with URL: $REPOSITORY_URL"
+echo "Registering with labels: $RUNNER_LABELS"
+echo "Runner name: benchmark-server-$ARCHITECTURE-$(date +%s)"
 sudo -u ubuntu ./config.sh \
     --url "$REPOSITORY_URL" \
     --token "$REG_TOKEN" \
-    --name "benchmark-runner-$ARCHITECTURE-$(date +%s)" \
+    --name "benchmark-server-$ARCHITECTURE-$(date +%s)" \
     --labels "$RUNNER_LABELS" \
     --unattended \
     --ephemeral \
