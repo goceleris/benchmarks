@@ -108,10 +108,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 metal spot (c6g.metal)..."
-          if terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot failed with exit code $EXIT_CODE"
           fi
 
       # Try Metal On-Demand
@@ -140,10 +146,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 metal on-demand (c6g.metal)..."
-          if terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 metal on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 metal on-demand failed with exit code $EXIT_CODE"
           fi
 
       # Try Provisional Spot
@@ -172,10 +184,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
-          if terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot failed with exit code $EXIT_CODE"
           fi
 
       # Try Provisional On-Demand
@@ -204,10 +222,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 provisional on-demand (c6g.2xlarge)..."
-          if terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional on-demand failed with exit code $EXIT_CODE"
           fi
 
       - name: Set ARM64 Launch Results
@@ -290,10 +314,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 metal spot (c5.metal)..."
-          if terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 metal spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 metal spot failed with exit code $EXIT_CODE"
           fi
 
       # Try Metal On-Demand
@@ -322,10 +352,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 metal on-demand (c5.metal)..."
-          if terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 metal on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 metal on-demand failed with exit code $EXIT_CODE"
           fi
 
       # Try Provisional Spot
@@ -354,10 +390,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 provisional spot (c5.2xlarge)..."
-          if terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 provisional spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 provisional spot failed with exit code $EXIT_CODE"
           fi
 
       # Try Provisional On-Demand
@@ -386,10 +428,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 provisional on-demand (c5.2xlarge)..."
-          if terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand 2>&1; then
+          set +e
+          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 provisional on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 provisional on-demand failed with exit code $EXIT_CODE"
           fi
 
       - name: Set x86 Launch Results
