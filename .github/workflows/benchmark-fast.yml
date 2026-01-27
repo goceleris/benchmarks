@@ -279,7 +279,7 @@ jobs:
     name: Fast Benchmark (ARM64)
     needs: launch-arm64
     if: needs.launch-arm64.outputs.launched == 'true'
-    runs-on: [self-hosted, fast-arm64]
+    runs-on: [self-hosted, server-fast-arm64]
     timeout-minutes: 90
 
     steps:
@@ -315,7 +315,7 @@ jobs:
     name: Fast Benchmark (x86)
     needs: launch-x86
     if: needs.launch-x86.outputs.launched == 'true'
-    runs-on: [self-hosted, fast-x86]
+    runs-on: [self-hosted, server-fast-x86]
     timeout-minutes: 90
 
     steps:
@@ -510,7 +510,7 @@ jobs:
     if: |
       always() &&
       needs.retry-arm64.outputs.launched == 'true'
-    runs-on: [self-hosted, fast-arm64]
+    runs-on: [self-hosted, server-fast-arm64]
     timeout-minutes: 90
 
     steps:
@@ -564,7 +564,7 @@ jobs:
     if: |
       always() &&
       needs.retry-x86.outputs.launched == 'true'
-    runs-on: [self-hosted, fast-x86]
+    runs-on: [self-hosted, server-fast-x86]
     timeout-minutes: 90
 
     steps:
