@@ -278,7 +278,7 @@ jobs:
     needs: launch-arm64
     if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, fast-arm64]
-    timeout-minutes: 30
+    timeout-minutes: 45
     continue-on-error: true
 
     steps:
@@ -314,7 +314,7 @@ jobs:
     needs: launch-x86
     if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, fast-x86]
-    timeout-minutes: 30
+    timeout-minutes: 45
     continue-on-error: true
 
     steps:
