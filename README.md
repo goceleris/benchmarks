@@ -1,6 +1,6 @@
 # Celeris Benchmarks
 
-Official reproducible benchmark suite comparing Celeris throughput and latency against alternatives.
+Official reproducible benchmark suite comparing Celeris throughput and latency against alternatives and theoretical maximum implementations.
 
 ## Overview
 
@@ -44,7 +44,7 @@ This suite includes a custom Go benchmarking tool (`cmd/bench`) designed for max
 - Results shown in PR summary for trend validation
 
 ### Metal Mode
-- Runs on new releases or manual trigger by maintainers
+- Runs on new releases or manual trigger by maintainers as well as merges to main branch
 - Uses bare-metal instances for accurate results
 - ~30 second benchmark duration
 - Official results committed to repository
@@ -97,7 +97,7 @@ make docker-test-theoretical  # Test theoretical servers (Linux)
 ## Infrastructure
 
 The benchmark infrastructure uses:
-- **Terraform** for AWS Spot Instance provisioning
+- **Terraform** for AWS Spot and On-Demand Instance provisioning
 - **GitHub Actions** self-hosted runners (ephemeral)
 - **Custom Go benchmark tool** for throughput and latency testing
 
@@ -107,8 +107,6 @@ The benchmark infrastructure uses:
 |------|-------|-----|
 | Fast | c6g.medium (1 vCPU) | c5.large (2 vCPU) |
 | Metal | c6g.metal (Graviton2) | c5.metal (Intel) |
-
-> **Note**: Do not use t3/t4g (burstable) instances - CPU credit throttling will invalidate io_uring benchmarks.
 
 ## License
 

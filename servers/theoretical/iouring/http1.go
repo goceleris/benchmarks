@@ -23,8 +23,8 @@ const (
 	IORING_ENTER_GETEVENTS = 1 << 0
 
 	sqeCount    = 4096
-	bufferCount = 4096 // Reduced from 65536 - matches sqeCount
-	bufferSize  = 8192 // Sufficient for most HTTP requests including POST with body
+	bufferCount = 4096
+	bufferSize  = 8192
 )
 
 var (

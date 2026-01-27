@@ -117,13 +117,3 @@ services:
       - "8096:8080"
     profiles: ["theoretical", "iouring"]
     privileged: true
-
-# Usage:
-# Build and test baseline servers:
-#   docker compose --profile baseline up --build
-#
-# Build and test theoretical servers (Linux only):
-#   docker compose --profile theoretical up --build
-#
-# Build all:
-#   docker compose --profile baseline --profile theoretical up --build
