@@ -49,6 +49,7 @@ data "aws_region" "current" {}
 # GitHub Actions runner version
 # Hardcoded to avoid GitHub API rate limit issues on shared runner IPs
 # Update periodically from: https://github.com/actions/runner/releases
+# Note: v2.327.1+ required for node24 support (used by actions/checkout@v6)
 locals {
-  runner_version = "v2.321.0"
+  runner_version = "v2.331.0"
 }
