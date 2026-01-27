@@ -51,6 +51,24 @@ variable "launch_x86_only" {
   default     = false
 }
 
+variable "launch_client" {
+  description = "Launch client instances for benchmark (set to true after server is running)"
+  type        = bool
+  default     = false
+}
+
+variable "server_ip_arm64" {
+  description = "Private IP of ARM64 server instance (passed to client)"
+  type        = string
+  default     = ""
+}
+
+variable "server_ip_x86" {
+  description = "Private IP of x86 server instance (passed to client)"
+  type        = string
+  default     = ""
+}
+
 # Pre-existing infrastructure references
 # These must be created manually before running Terraform
 variable "iam_instance_profile_name" {
@@ -76,7 +94,10 @@ locals {
   # Fast mode: cheaper virtualized instances for PR validation
   # Metal mode: bare metal for official results
   # Provisional mode: best available within quota limits (8 vCPUs) when metal unavailable
-  instance_types = {
+  #
+  # Server instances: Run the HTTP servers being benchmarked
+  # Client instances: Run the benchmark tool (always on-demand for stability)
+  server_instance_types = {
     fast = {
       arm64 = "c6g.medium"  # 1 vCPU
       x86   = "c5.large"    # 2 vCPU
@@ -91,7 +112,28 @@ locals {
     }
   }
 
-  # Spot prices per mode
+  # Client instances: modest sizes, always on-demand
+  # Fast mode: very small (just needs to send HTTP requests)
+  # Metal/Provisional mode: 8 vCPU (enough to saturate server)
+  client_instance_types = {
+    fast = {
+      arm64 = "t4g.small"   # 2 vCPU, burstable
+      x86   = "t3.small"    # 2 vCPU, burstable
+    }
+    metal = {
+      arm64 = "c6g.2xlarge" # 8 vCPU
+      x86   = "c5.2xlarge"  # 8 vCPU
+    }
+    provisional = {
+      arm64 = "c6g.2xlarge" # 8 vCPU
+      x86   = "c5.2xlarge"  # 8 vCPU
+    }
+  }
+
+  # Backwards compatibility alias
+  instance_types = local.server_instance_types
+
+  # Spot prices per mode (for server instances)
   spot_prices = {
     fast = {
       arm64 = "0.10"
@@ -107,21 +149,40 @@ locals {
     }
   }
 
-  # Runner labels per mode
-  runner_labels = {
+  # Server runner labels (runs HTTP servers)
+  server_runner_labels = {
     fast = {
-      arm64 = ["self-hosted", "fast-arm64", "linux", "arm64"]
-      x86   = ["self-hosted", "fast-x86", "linux", "x86_64"]
+      arm64 = ["self-hosted", "server-fast-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "server-fast-x86", "linux", "x86_64"]
     }
     metal = {
-      arm64 = ["self-hosted", "metal-arm64", "linux", "arm64"]
-      x86   = ["self-hosted", "metal-x86", "linux", "x86_64"]
+      arm64 = ["self-hosted", "server-metal-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "server-metal-x86", "linux", "x86_64"]
     }
     provisional = {
-      arm64 = ["self-hosted", "provisional-arm64", "linux", "arm64"]
-      x86   = ["self-hosted", "provisional-x86", "linux", "x86_64"]
+      arm64 = ["self-hosted", "server-provisional-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "server-provisional-x86", "linux", "x86_64"]
     }
   }
+
+  # Client runner labels (runs benchmark tool)
+  client_runner_labels = {
+    fast = {
+      arm64 = ["self-hosted", "client-fast-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "client-fast-x86", "linux", "x86_64"]
+    }
+    metal = {
+      arm64 = ["self-hosted", "client-metal-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "client-metal-x86", "linux", "x86_64"]
+    }
+    provisional = {
+      arm64 = ["self-hosted", "client-provisional-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "client-provisional-x86", "linux", "x86_64"]
+    }
+  }
+
+  # Backwards compatibility alias
+  runner_labels = local.server_runner_labels
 
   # Effective mode: provisional overrides metal when use_provisional is true
   effective_mode = var.use_provisional ? "provisional" : var.benchmark_mode

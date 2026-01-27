@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -60,6 +62,14 @@ var benchmarkTypes = []struct {
 	{"big-request", "POST", "/upload", make([]byte, 4096)},
 }
 
+// ControlStatus represents the response from the control daemon
+type ControlStatus struct {
+	ServerType string `json:"server_type"`
+	Status     string `json:"status"`
+	Port       string `json:"port"`
+	Error      string `json:"error,omitempty"`
+}
+
 func main() {
 	mode := flag.String("mode", "baseline", "Benchmark mode: baseline, theoretical, all")
 	duration := flag.Duration("duration", 30*time.Second, "Benchmark duration")
@@ -75,7 +85,20 @@ func main() {
 	resume := flag.Bool("resume", false, "Resume from existing checkpoint")
 	mergeFile := flag.String("merge", "", "Merge results from another checkpoint file into output")
 
+	// Remote mode flags
+	serverIP := flag.String("server-ip", "", "Remote server IP (enables remote mode)")
+	controlPort := flag.String("control-port", "9999", "Control daemon port on remote server")
+	serverRetryTimeout := flag.Duration("server-retry-timeout", 10*time.Minute, "Max time to wait for server to become available")
+	serverRetryInterval := flag.Duration("server-retry-interval", 5*time.Second, "Interval between server availability checks")
+
 	flag.Parse()
+
+	// Check for environment variable override
+	if *serverIP == "" {
+		*serverIP = os.Getenv("BENCHMARK_SERVER_IP")
+	}
+
+	remoteMode := *serverIP != ""
 
 	arch := runtime.GOARCH
 	if arch == "amd64" {
@@ -88,14 +111,10 @@ func main() {
 	// Auto-scale workers based on CPU count if not explicitly set
 	actualWorkers := *workers
 	if actualWorkers == 0 {
-		// For I/O-bound HTTP benchmarks, use multiple workers per CPU
-		// This ensures we can saturate the server even with network latency
 		actualWorkers = numCPU * *workersPerCPU
-		// Ensure minimum of 8 workers for small machines
 		if actualWorkers < 8 {
 			actualWorkers = 8
 		}
-		// Cap at reasonable maximum to avoid overwhelming the system
 		if actualWorkers > 1024 {
 			actualWorkers = 1024
 		}
@@ -104,13 +123,10 @@ func main() {
 	// Auto-scale connections based on workers if not explicitly set
 	actualConnections := *connections
 	if actualConnections == 0 {
-		// Multiple connections per worker for better connection pool utilization
 		actualConnections = actualWorkers * *connectionsPerWorker
-		// Ensure minimum of 64 connections
 		if actualConnections < 64 {
 			actualConnections = 64
 		}
-		// Cap at reasonable maximum
 		if actualConnections > 4096 {
 			actualConnections = 4096
 		}
@@ -120,6 +136,11 @@ func main() {
 	log.Printf("Architecture: %s", arch)
 	log.Printf("Available CPUs: %d", numCPU)
 	log.Printf("Duration: %s", *duration)
+	if remoteMode {
+		log.Printf("Mode: REMOTE (server: %s:%s, control: %s)", *serverIP, *port, *controlPort)
+	} else {
+		log.Printf("Mode: LOCAL")
+	}
 	if *workers == 0 {
 		log.Printf("Workers: %d (auto-scaled: %d CPUs x %d workers/CPU)", actualWorkers, numCPU, *workersPerCPU)
 	} else {
@@ -131,20 +152,19 @@ func main() {
 		log.Printf("Connections: %d (manually set)", actualConnections)
 	}
 
-	if *serverBin == "" {
-		candidates := []string{
-			"./bin/server",
-			"./server",
-			"bin/server",
-		}
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				*serverBin = c
-				break
-			}
-		}
+	// In local mode, we need the server binary
+	if !remoteMode {
 		if *serverBin == "" {
-			log.Fatal("Could not find server binary. Build with 'go build -o bin/server ./cmd/server'")
+			candidates := []string{"./bin/server", "./server", "bin/server"}
+			for _, c := range candidates {
+				if _, err := os.Stat(c); err == nil {
+					*serverBin = c
+					break
+				}
+			}
+			if *serverBin == "" {
+				log.Fatal("Could not find server binary. Build with 'go build -o bin/server ./cmd/server'")
+			}
 		}
 	}
 
@@ -165,14 +185,12 @@ func main() {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	// Auto-generate checkpoint filename if not specified
 	if *checkpointFile == "" {
 		*checkpointFile = filepath.Join(*outputDir, fmt.Sprintf("checkpoint-%s.json", arch))
 	}
 
 	var checkpoint *bench.Checkpoint
 	if *resume {
-		// Try to load existing checkpoint
 		if cp, err := bench.LoadCheckpoint(*checkpointFile); err == nil {
 			checkpoint = cp
 			log.Printf("Resuming from checkpoint: %s (%d results completed)", *checkpointFile, len(cp.Results))
@@ -181,7 +199,6 @@ func main() {
 		}
 	}
 
-	// Create new checkpoint if not resuming or no checkpoint found
 	if checkpoint == nil {
 		output := &bench.BenchmarkOutput{
 			Timestamp:    time.Now().UTC().Format("2006-01-02T15_04_05Z"),
@@ -202,7 +219,6 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Save checkpoint on shutdown
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal %v, saving checkpoint and shutting down...", sig)
@@ -214,13 +230,23 @@ func main() {
 		cancel()
 	}()
 
-	// Count how many benchmarks are already completed
+	// Create remote controller if in remote mode
+	var rc *RemoteController
+	if remoteMode {
+		rc = &RemoteController{
+			serverIP:      *serverIP,
+			serverPort:    *port,
+			controlPort:   *controlPort,
+			retryTimeout:  *serverRetryTimeout,
+			retryInterval: *serverRetryInterval,
+		}
+	}
+
 	totalBenchmarks := len(servers) * len(benchmarkTypes)
 	completedBefore := len(checkpoint.Results)
 	skipped := 0
 
 	for _, serverType := range servers {
-		// Check if context is cancelled
 		select {
 		case <-ctx.Done():
 			log.Printf("Benchmark interrupted, progress saved")
@@ -244,31 +270,53 @@ func main() {
 
 		log.Printf("=== Benchmarking: %s ===", serverType)
 
-		cmd, err := startServer(*serverBin, serverType, *port)
-		if err != nil {
-			log.Printf("WARN: Failed to start %s: %v, skipping", serverType, err)
-			continue
+		var cmd *exec.Cmd
+		var serverHost string
+
+		if remoteMode {
+			// Remote mode: use control daemon to start server
+			if err := rc.StartServer(ctx, serverType); err != nil {
+				log.Printf("WARN: Failed to start %s on remote: %v, skipping", serverType, err)
+				continue
+			}
+			serverHost = *serverIP
+		} else {
+			// Local mode: start server locally
+			var err error
+			cmd, err = startServer(*serverBin, serverType, *port)
+			if err != nil {
+				log.Printf("WARN: Failed to start %s: %v, skipping", serverType, err)
+				continue
+			}
+			serverHost = "localhost"
 		}
 
-		if err := waitForServer(ctx, *port, 10*time.Second); err != nil {
+		// Wait for server to be ready
+		if err := waitForServer(ctx, serverHost, *port, 10*time.Second); err != nil {
 			log.Printf("WARN: Server %s not ready: %v, skipping", serverType, err)
-			stopServer(cmd)
+			if remoteMode {
+				rc.StopServer(ctx)
+			} else {
+				stopServer(cmd)
+			}
 			continue
 		}
 
 		log.Printf("Server ready: %s", serverType)
 
 		for _, bt := range benchmarkTypes {
-			// Check if context is cancelled
 			select {
 			case <-ctx.Done():
 				log.Printf("Benchmark interrupted during %s:%s", serverType, bt.Name)
-				stopServer(cmd)
+				if remoteMode {
+					rc.StopServer(ctx)
+				} else {
+					stopServer(cmd)
+				}
 				goto saveAndExit
 			default:
 			}
 
-			// Skip if already completed
 			if checkpoint.IsCompleted(serverType, bt.Name) {
 				log.Printf("Skipping (completed): %s on %s", bt.Name, serverType)
 				skipped++
@@ -278,7 +326,7 @@ func main() {
 			log.Printf("Running benchmark: %s on %s", bt.Name, serverType)
 
 			cfg := bench.Config{
-				URL:         fmt.Sprintf("http://localhost:%s%s", *port, bt.Path),
+				URL:         fmt.Sprintf("http://%s:%s%s", serverHost, *port, bt.Path),
 				Method:      bt.Method,
 				Body:        bt.Body,
 				Duration:    *duration,
@@ -289,13 +337,25 @@ func main() {
 				H2C:         strings.Contains(serverType, "-h2") || strings.Contains(serverType, "-hybrid"),
 			}
 
-			benchmarker := bench.New(cfg)
-			result, err := benchmarker.Run(ctx)
+			// In remote mode, wrap the benchmark with retry logic
+			var result *bench.Result
+			var err error
+
+			if remoteMode {
+				result, err = runBenchmarkWithRetry(ctx, cfg, rc, serverType, *serverRetryTimeout, *serverRetryInterval)
+			} else {
+				benchmarker := bench.New(cfg)
+				result, err = benchmarker.Run(ctx)
+			}
+
 			if err != nil {
 				if ctx.Err() != nil {
-					// Context cancelled, save and exit
 					log.Printf("Benchmark interrupted: %v", err)
-					stopServer(cmd)
+					if remoteMode {
+						rc.StopServer(ctx)
+					} else {
+						stopServer(cmd)
+					}
 					goto saveAndExit
 				}
 				log.Printf("ERROR: Benchmark failed: %v", err)
@@ -304,23 +364,24 @@ func main() {
 
 			log.Printf("Completed: %.2f req/s, avg latency: %s", result.RequestsPerSec, result.Latency.Avg)
 
-			// Add result and save checkpoint immediately
 			checkpoint.AddResult(result.ToServerResult(
 				serverType, bt.Name, bt.Method, bt.Path,
 			))
 
-			// Save checkpoint after each benchmark
 			if err := checkpoint.Save(*checkpointFile); err != nil {
 				log.Printf("WARN: Failed to save checkpoint: %v", err)
 			}
 		}
 
-		stopServer(cmd)
-		time.Sleep(500 * time.Millisecond) // Brief pause between servers
+		if remoteMode {
+			rc.StopServer(ctx)
+		} else {
+			stopServer(cmd)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
 saveAndExit:
-	// Merge results from another file if specified
 	if *mergeFile != "" {
 		if otherCP, err := bench.LoadCheckpoint(*mergeFile); err == nil {
 			beforeMerge := len(checkpoint.Results)
@@ -332,12 +393,10 @@ saveAndExit:
 		}
 	}
 
-	// Save final checkpoint
 	if err := checkpoint.Save(*checkpointFile); err != nil {
 		log.Printf("ERROR: Failed to save final checkpoint: %v", err)
 	}
 
-	// Write final output file (without checkpoint metadata)
 	output := checkpoint.ToBenchmarkOutput()
 	outputFile := filepath.Join(*outputDir, fmt.Sprintf("benchmark-%s-%s.json", arch, output.Timestamp))
 	data, err := json.MarshalIndent(output, "", "  ")
@@ -360,6 +419,176 @@ saveAndExit:
 	} else {
 		log.Printf("Benchmarks complete!")
 	}
+}
+
+// RemoteController manages communication with the control daemon
+type RemoteController struct {
+	serverIP      string
+	serverPort    string
+	controlPort   string
+	retryTimeout  time.Duration
+	retryInterval time.Duration
+}
+
+// StartServer starts a server on the remote machine
+func (rc *RemoteController) StartServer(ctx context.Context, serverType string) error {
+	url := fmt.Sprintf("http://%s:%s/start?type=%s", rc.serverIP, rc.controlPort, serverType)
+
+	// Retry starting server with timeout
+	deadline := time.Now().Add(rc.retryTimeout)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			return err
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("Control daemon not reachable, retrying in %s...", rc.retryInterval)
+			time.Sleep(rc.retryInterval)
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var status ControlStatus
+			if err := json.Unmarshal(body, &status); err == nil {
+				if status.Status == "running" {
+					return nil
+				}
+			}
+		}
+
+		log.Printf("Server start response: %d - %s, retrying...", resp.StatusCode, string(body))
+		time.Sleep(rc.retryInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for server to start")
+}
+
+// StopServer stops the current server on the remote machine
+func (rc *RemoteController) StopServer(ctx context.Context) error {
+	url := fmt.Sprintf("http://%s:%s/stop", rc.serverIP, rc.controlPort)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	return nil
+}
+
+// WaitForServer waits for the server to become available
+func (rc *RemoteController) WaitForServer(ctx context.Context) error {
+	deadline := time.Now().Add(rc.retryTimeout)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Check if server is reachable
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", rc.serverIP, rc.serverPort), 2*time.Second)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+
+		log.Printf("Server not available, waiting %s...", rc.retryInterval)
+		time.Sleep(rc.retryInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for server")
+}
+
+// runBenchmarkWithRetry runs a benchmark with automatic retry on server failure
+func runBenchmarkWithRetry(ctx context.Context, cfg bench.Config, rc *RemoteController, serverType string, timeout, interval time.Duration) (*bench.Result, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Check server health first
+		if err := rc.WaitForServer(ctx); err != nil {
+			lastErr = err
+			log.Printf("Server unavailable during benchmark, pausing and waiting...")
+
+			// Server might have been terminated (spot instance)
+			// Wait for it to come back (retry will bring up new instance)
+			pauseStart := time.Now()
+			for time.Now().Before(deadline) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+
+				// Try to restart the server via control daemon
+				if err := rc.StartServer(ctx, serverType); err == nil {
+					log.Printf("Server recovered after %s pause", time.Since(pauseStart).Round(time.Second))
+					break
+				}
+
+				time.Sleep(interval)
+			}
+			continue
+		}
+
+		// Run the benchmark
+		benchmarker := bench.New(cfg)
+		result, err := benchmarker.Run(ctx)
+		if err != nil {
+			// Check if it's a connection error (server might have died)
+			if isConnectionError(err) {
+				lastErr = err
+				log.Printf("Connection error during benchmark: %v, pausing...", err)
+				continue
+			}
+			return nil, err
+		}
+
+		return result, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("benchmark failed after retries: %w", lastErr)
+	}
+	return nil, fmt.Errorf("benchmark timed out")
+}
+
+// isConnectionError checks if the error is a connection-related error
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "no such host") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "i/o timeout")
 }
 
 func startServer(binary, serverType, port string) (*exec.Cmd, error) {
@@ -392,7 +621,7 @@ func stopServer(cmd *exec.Cmd) {
 	}
 }
 
-func waitForServer(ctx context.Context, port string, timeout time.Duration) error {
+func waitForServer(ctx context.Context, host, port string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
@@ -402,7 +631,7 @@ func waitForServer(ctx context.Context, port string, timeout time.Duration) erro
 		default:
 		}
 
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%s", port), 100*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", host, port), 100*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			return nil
@@ -411,5 +640,5 @@ func waitForServer(ctx context.Context, port string, timeout time.Duration) erro
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return fmt.Errorf("timeout waiting for server on port %s", port)
+	return fmt.Errorf("timeout waiting for server on %s:%s", host, port)
 }

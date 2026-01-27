@@ -1,7 +1,7 @@
 # Celeris Benchmark Suite Makefile
 # ================================
 
-.PHONY: all build build-bench lint test docker-build docker-test validate clean help
+.PHONY: all build build-bench build-control lint test docker-build docker-test validate clean help
 
 # Go parameters
 GOCMD=go
@@ -11,6 +11,7 @@ GOVET=$(GOCMD) vet
 GOFMT=gofmt
 SERVER_BINARY=server
 BENCH_BINARY=bench
+CONTROL_BINARY=control
 BINARY_DIR=bin
 
 # Docker parameters
@@ -44,8 +45,8 @@ help:
 	@echo "  make clean          - Clean build artifacts"
 	@echo ""
 
-## build: Build both server and benchmark binaries
-build: build-server build-bench
+## build: Build server, benchmark, and control daemon binaries
+build: build-server build-bench build-control
 
 ## build-server: Build the server binary for current platform
 build-server:
@@ -61,12 +62,20 @@ build-bench:
 	$(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY) ./cmd/bench
 	@echo "$(GREEN)✓ Benchmark tool build complete: $(BINARY_DIR)/$(BENCH_BINARY)$(NC)"
 
+## build-control: Build the control daemon for current platform
+build-control:
+	@echo "$(GREEN)Building control daemon...$(NC)"
+	@mkdir -p $(BINARY_DIR)
+	$(GOBUILD) -o $(BINARY_DIR)/$(CONTROL_BINARY) ./cmd/control
+	@echo "$(GREEN)✓ Control daemon build complete: $(BINARY_DIR)/$(CONTROL_BINARY)$(NC)"
+
 ## build-linux: Cross-compile for Linux (amd64)
 build-linux:
 	@echo "$(GREEN)Building for Linux amd64...$(NC)"
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(SERVER_BINARY)-linux-amd64 ./cmd/server
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY)-linux-amd64 ./cmd/bench
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_DIR)/$(CONTROL_BINARY)-linux-amd64 ./cmd/control
 	@echo "$(GREEN)✓ Linux build complete$(NC)"
 
 ## build-linux-arm: Cross-compile for Linux (arm64)
@@ -75,6 +84,7 @@ build-linux-arm:
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(SERVER_BINARY)-linux-arm64 ./cmd/server
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(BENCH_BINARY)-linux-arm64 ./cmd/bench
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BINARY_DIR)/$(CONTROL_BINARY)-linux-arm64 ./cmd/control
 	@echo "$(GREEN)✓ Linux ARM build complete$(NC)"
 
 ## lint: Run golangci-lint

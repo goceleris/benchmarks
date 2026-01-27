@@ -155,7 +155,9 @@ jobs:
       launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
       instance_type: ${{ steps.result.outputs.instance_type }}
-      runner_label: ${{ steps.result.outputs.runner_label }}
+      server_runner_label: ${{ steps.result.outputs.server_runner_label }}
+      client_runner_label: ${{ steps.result.outputs.client_runner_label }}
+      server_private_ip: ${{ steps.result.outputs.server_private_ip }}
       was_spot: ${{ steps.result.outputs.was_spot }}
       benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
 
@@ -190,7 +192,7 @@ jobs:
         run: |
           echo "Attempting ARM64 metal spot (c6g.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -228,7 +230,7 @@ jobs:
         run: |
           echo "Attempting ARM64 metal on-demand (c6g.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -266,7 +268,7 @@ jobs:
         run: |
           echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -304,7 +306,7 @@ jobs:
         run: |
           echo "Attempting ARM64 provisional on-demand (c6g.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -317,34 +319,43 @@ jobs:
 
       - name: Set ARM64 Launch Results
         id: result
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
           # Priority order: metal_spot -> metal_ondemand -> provisional_spot -> provisional_ondemand
           if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
             echo "instance_type=c6g.metal-spot" >> $GITHUB_OUTPUT
-            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-metal-arm64" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-metal-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=true" >> $GITHUB_OUTPUT
             echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
             echo "instance_type=c6g.metal-ondemand" >> $GITHUB_OUTPUT
-            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-metal-arm64" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-metal-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
             echo "instance_type=c6g.2xlarge-spot" >> $GITHUB_OUTPUT
-            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-provisional-arm64" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-provisional-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=true" >> $GITHUB_OUTPUT
             echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
             echo "instance_type=c6g.2xlarge-ondemand" >> $GITHUB_OUTPUT
-            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-provisional-arm64" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-provisional-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           else
@@ -353,17 +364,44 @@ jobs:
             echo "instance_type=none" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "::error::All ARM64 launch attempts failed"
+            exit 0
           fi
 
-      - name: Wait for ARM64 Runner
+          # Get server private IP from terraform output
+          SERVER_IP=$(terraform output -raw arm64_server_private_ip 2>/dev/null || echo "")
+          if [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
+            echo "server_private_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+            echo "Server private IP: $SERVER_IP"
+          else
+            echo "::warning::Could not get server private IP"
+            echo "server_private_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Launch ARM64 Client
+        if: steps.result.outputs.launched == 'true' && steps.result.outputs.server_private_ip != ''
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
+          TF_VAR_launch_arm64_only: "true"
+          TF_VAR_launch_client: "true"
+          TF_VAR_server_ip_arm64: ${{ steps.result.outputs.server_private_ip }}
+        run: |
+          echo "Launching ARM64 client instance (server IP: $TF_VAR_server_ip_arm64)..."
+          terraform apply -auto-approve -target=aws_instance.arm64_client
+          echo "ARM64 client launched"
+
+      - name: Wait for ARM64 Runners
         if: steps.result.outputs.launched == 'true'
         run: |
           if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
-            echo "Waiting for ARM64 provisional runner (60s)..."
-            sleep 60
+            echo "Waiting for ARM64 provisional runners (90s)..."
+            sleep 90
           else
-            echo "Waiting for ARM64 metal runner (120s)..."
-            sleep 120
+            echo "Waiting for ARM64 metal runners (150s)..."
+            sleep 150
           fi
 
       - name: Report Launch Status
@@ -378,7 +416,9 @@ jobs:
               echo "**Status:** Launched (Official Metal)" >> $GITHUB_STEP_SUMMARY
             fi
             echo "- Instance Type: \`${{ steps.result.outputs.instance_type }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Runner Label: \`${{ steps.result.outputs.runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Server Label: \`${{ steps.result.outputs.server_runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Client Label: \`${{ steps.result.outputs.client_runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Server IP: \`${{ steps.result.outputs.server_private_ip }}\`" >> $GITHUB_STEP_SUMMARY
             echo "- Spot Instance: ${{ steps.result.outputs.was_spot }}" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Status:** FAILED" >> $GITHUB_STEP_SUMMARY
@@ -396,7 +436,9 @@ jobs:
       launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
       instance_type: ${{ steps.result.outputs.instance_type }}
-      runner_label: ${{ steps.result.outputs.runner_label }}
+      server_runner_label: ${{ steps.result.outputs.server_runner_label }}
+      client_runner_label: ${{ steps.result.outputs.client_runner_label }}
+      server_private_ip: ${{ steps.result.outputs.server_private_ip }}
       was_spot: ${{ steps.result.outputs.was_spot }}
       benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
 
@@ -428,7 +470,7 @@ jobs:
         run: |
           echo "Attempting x86 metal spot (c5.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -449,7 +491,7 @@ jobs:
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_benchmark_mode: metal
           TF_VAR_launch_x86_only: "true"
-        run: terraform destroy -auto-approve -target=aws_spot_instance_request.x86_runner || true
+        run: terraform destroy -auto-approve -target=aws_spot_instance_request.x86_server || true
 
       - name: Try x86 Metal On-Demand
         id: metal_ondemand
@@ -466,7 +508,7 @@ jobs:
         run: |
           echo "Attempting x86 metal on-demand (c5.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -504,7 +546,7 @@ jobs:
         run: |
           echo "Attempting x86 provisional spot (c5.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -542,7 +584,7 @@ jobs:
         run: |
           echo "Attempting x86 provisional on-demand (c5.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand
           EXIT_CODE=$?
           set -e
           if [ $EXIT_CODE -eq 0 ]; then
@@ -555,33 +597,42 @@ jobs:
 
       - name: Set x86 Launch Results
         id: result
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
         run: |
           if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
             echo "instance_type=c5.metal-spot" >> $GITHUB_OUTPUT
-            echo "runner_label=metal-x86" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-metal-x86" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-metal-x86" >> $GITHUB_OUTPUT
             echo "was_spot=true" >> $GITHUB_OUTPUT
             echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
             echo "instance_type=c5.metal-ondemand" >> $GITHUB_OUTPUT
-            echo "runner_label=metal-x86" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-metal-x86" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-metal-x86" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
             echo "instance_type=c5.2xlarge-spot" >> $GITHUB_OUTPUT
-            echo "runner_label=provisional-x86" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-provisional-x86" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-provisional-x86" >> $GITHUB_OUTPUT
             echo "was_spot=true" >> $GITHUB_OUTPUT
             echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
             echo "instance_type=c5.2xlarge-ondemand" >> $GITHUB_OUTPUT
-            echo "runner_label=provisional-x86" >> $GITHUB_OUTPUT
+            echo "server_runner_label=server-provisional-x86" >> $GITHUB_OUTPUT
+            echo "client_runner_label=client-provisional-x86" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           else
@@ -590,17 +641,44 @@ jobs:
             echo "instance_type=none" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "::error::All x86 launch attempts failed"
+            exit 0
           fi
 
-      - name: Wait for x86 Runner
+          # Get server private IP from terraform output
+          SERVER_IP=$(terraform output -raw x86_server_private_ip 2>/dev/null || echo "")
+          if [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
+            echo "server_private_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+            echo "Server private IP: $SERVER_IP"
+          else
+            echo "::warning::Could not get server private IP"
+            echo "server_private_ip=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Launch x86 Client
+        if: steps.result.outputs.launched == 'true' && steps.result.outputs.server_private_ip != ''
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
+          TF_VAR_launch_x86_only: "true"
+          TF_VAR_launch_client: "true"
+          TF_VAR_server_ip_x86: ${{ steps.result.outputs.server_private_ip }}
+        run: |
+          echo "Launching x86 client instance (server IP: $TF_VAR_server_ip_x86)..."
+          terraform apply -auto-approve -target=aws_instance.x86_client
+          echo "x86 client launched"
+
+      - name: Wait for x86 Runners
         if: steps.result.outputs.launched == 'true'
         run: |
           if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
-            echo "Waiting for x86 provisional runner (60s)..."
-            sleep 60
+            echo "Waiting for x86 provisional runners (90s)..."
+            sleep 90
           else
-            echo "Waiting for x86 metal runner (120s)..."
-            sleep 120
+            echo "Waiting for x86 metal runners (150s)..."
+            sleep 150
           fi
 
       - name: Report Launch Status
@@ -615,7 +693,9 @@ jobs:
               echo "**Status:** Launched (Official Metal)" >> $GITHUB_STEP_SUMMARY
             fi
             echo "- Instance Type: \`${{ steps.result.outputs.instance_type }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Runner Label: \`${{ steps.result.outputs.runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Server Label: \`${{ steps.result.outputs.server_runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Client Label: \`${{ steps.result.outputs.client_runner_label }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Server IP: \`${{ steps.result.outputs.server_private_ip }}\`" >> $GITHUB_STEP_SUMMARY
             echo "- Spot Instance: ${{ steps.result.outputs.was_spot }}" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Status:** FAILED" >> $GITHUB_STEP_SUMMARY
@@ -623,11 +703,53 @@ jobs:
             echo "All launch attempts failed. Check the logs above for details." >> $GITHUB_STEP_SUMMARY
           fi
 
+  # Server job: Runs on server instance, provides control daemon for benchmarking
+  server-arm64:
+    name: Server (ARM64)
+    needs: launch-arm64
+    if: needs.launch-arm64.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.launch-arm64.outputs.server_runner_label }}"]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Build Server and Control Daemon
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/control ./cmd/control
+          echo "Server and control daemon built"
+
+      - name: Run Control Daemon
+        env:
+          IS_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.launch-arm64.outputs.instance_type }}
+        run: |
+          if [[ "$IS_PROVISIONAL" == "true" ]]; then
+            echo "Running PROVISIONAL server on $INSTANCE_TYPE"
+          else
+            echo "Running OFFICIAL metal server on $INSTANCE_TYPE"
+          fi
+          # Control daemon will manage server processes as requested by client
+          # It runs until the client job completes (detected by timeout or explicit shutdown)
+          ./bin/control -control-port 9999 -server-port 8080
+
+  # Client job: Runs on client instance, executes benchmarks against server
+  # Note: Does NOT depend on server-arm64 completing - they run in parallel
   benchmark-arm64:
     name: Benchmark (ARM64)
     needs: launch-arm64
-    if: needs.launch-arm64.outputs.launched == 'true'
-    runs-on: [self-hosted, "${{ needs.launch-arm64.outputs.runner_label }}"]
+    if: |
+      needs.launch-arm64.outputs.launched == 'true' &&
+      needs.launch-arm64.outputs.server_private_ip != ''
+    runs-on: [self-hosted, "${{ needs.launch-arm64.outputs.client_runner_label }}"]
     timeout-minutes: 90
 
     steps:
@@ -639,22 +761,28 @@ jobs:
         with:
           go-version: "1.25.5"
 
-      - name: Build and Run
+      - name: Build Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/bench ./cmd/bench
+          echo "Benchmark tool built"
+
+      - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
           IS_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
           INSTANCE_TYPE: ${{ needs.launch-arm64.outputs.instance_type }}
+          SERVER_IP: ${{ needs.launch-arm64.outputs.server_private_ip }}
         run: |
-          go mod download
-          go build -o bin/server ./cmd/server
-          go build -o bin/bench ./cmd/bench
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE"
+            echo "Running PROVISIONAL benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           else
-            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
+            echo "Running OFFICIAL metal benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           fi
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+          # Run benchmark in remote mode, connecting to server via control daemon
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" \
+            -server-ip "$SERVER_IP" -control-port 9999 -resume
 
       - name: Upload Results
         if: always()
@@ -665,11 +793,52 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
+  # Server job: Runs on server instance, provides control daemon for benchmarking
+  server-x86:
+    name: Server (x86)
+    needs: launch-x86
+    if: needs.launch-x86.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.launch-x86.outputs.server_runner_label }}"]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Build Server and Control Daemon
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/control ./cmd/control
+          echo "Server and control daemon built"
+
+      - name: Run Control Daemon
+        env:
+          IS_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.launch-x86.outputs.instance_type }}
+        run: |
+          if [[ "$IS_PROVISIONAL" == "true" ]]; then
+            echo "Running PROVISIONAL server on $INSTANCE_TYPE"
+          else
+            echo "Running OFFICIAL metal server on $INSTANCE_TYPE"
+          fi
+          # Control daemon will manage server processes as requested by client
+          ./bin/control -control-port 9999 -server-port 8080
+
+  # Client job: Runs on client instance, executes benchmarks against server
+  # Note: Does NOT depend on server-x86 completing - they run in parallel
   benchmark-x86:
     name: Benchmark (x86)
     needs: launch-x86
-    if: needs.launch-x86.outputs.launched == 'true'
-    runs-on: [self-hosted, "${{ needs.launch-x86.outputs.runner_label }}"]
+    if: |
+      needs.launch-x86.outputs.launched == 'true' &&
+      needs.launch-x86.outputs.server_private_ip != ''
+    runs-on: [self-hosted, "${{ needs.launch-x86.outputs.client_runner_label }}"]
     timeout-minutes: 90
 
     steps:
@@ -681,22 +850,27 @@ jobs:
         with:
           go-version: "1.25.5"
 
-      - name: Build and Run
+      - name: Build Benchmark Tool
+        run: |
+          go mod download
+          go build -o bin/bench ./cmd/bench
+          echo "Benchmark tool built"
+
+      - name: Run Benchmarks
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
           IS_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
           INSTANCE_TYPE: ${{ needs.launch-x86.outputs.instance_type }}
+          SERVER_IP: ${{ needs.launch-x86.outputs.server_private_ip }}
         run: |
-          go mod download
-          go build -o bin/server ./cmd/server
-          go build -o bin/bench ./cmd/bench
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE"
+            echo "Running PROVISIONAL benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           else
-            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
+            echo "Running OFFICIAL metal benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           fi
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" \
+            -server-ip "$SERVER_IP" -control-port 9999 -resume
 
       - name: Upload Results
         if: always()
@@ -961,7 +1135,7 @@ jobs:
           echo "Attempting to recover checkpoint from failed x86 instance..."
 
           # Refresh state and get instance ID
-          terraform refresh -target=aws_spot_instance_request.x86_runner 2>/dev/null || true
+          terraform refresh -target=aws_spot_instance_request.x86_server 2>/dev/null || true
           INSTANCE_ID=$(terraform output -raw x86_instance_id 2>/dev/null || echo "")
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "null" ]; then
