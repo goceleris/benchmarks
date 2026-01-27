@@ -18,13 +18,23 @@ This benchmark suite provides:
 | Server | Protocol | Framework |
 |--------|----------|-----------|
 | stdhttp-h1 | HTTP/1.1 | Go standard library |
-| stdhttp-h2 | HTTP/2 (H2C) | `golang.org/x/net/http2` |
-| stdhttp-hybrid | HTTP/1.1 + H2C | Auto-detection |
+| stdhttp-h2 | HTTP/1.1 + H2C | `golang.org/x/net/http2/h2c` |
+| stdhttp-hybrid | HTTP/1.1 + H2C | `golang.org/x/net/http2/h2c` |
 | fiber-h1 | HTTP/1.1 | [Fiber](https://github.com/gofiber/fiber) v2 |
 | gin-h1 | HTTP/1.1 | [Gin](https://github.com/gin-gonic/gin) |
+| gin-h2 | HTTP/1.1 + H2C | Gin + `h2c.NewHandler` |
+| gin-hybrid | HTTP/1.1 + H2C | Gin + `h2c.NewHandler` |
 | chi-h1 | HTTP/1.1 | [Chi](https://github.com/go-chi/chi) |
+| chi-h2 | HTTP/1.1 + H2C | Chi + `h2c.NewHandler` |
+| chi-hybrid | HTTP/1.1 + H2C | Chi + `h2c.NewHandler` |
 | echo-h1 | HTTP/1.1 | [Echo](https://github.com/labstack/echo) |
-| iris-h2 | HTTP/2 (H2C) | [Iris](https://github.com/kataras/iris) |
+| echo-h2 | HTTP/1.1 + H2C | Echo + `h2c.NewHandler` |
+| echo-hybrid | HTTP/1.1 + H2C | Echo + `h2c.NewHandler` |
+| iris-h1 | HTTP/1.1 | [Iris](https://github.com/kataras/iris) |
+| iris-h2 | HTTP/1.1 + H2C | Iris + `h2c.NewHandler` |
+| iris-hybrid | HTTP/1.1 + H2C | Iris + `h2c.NewHandler` |
+
+> **Note**: The `-h2` and `-hybrid` variants use `h2c.NewHandler` which supports both HTTP/1.1 and H2C (HTTP/2 cleartext). The naming reflects the primary benchmark focus: `-h2` for H2C testing, `-hybrid` for mixed protocol testing. Fiber does not support H2C.
 
 ### Theoretical Maximum (Raw Syscalls)
 
@@ -267,8 +277,8 @@ For metal benchmarks, ensure sufficient vCPU quota:
 Request quota increases in AWS Service Quotas for:
 - "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances"
 - "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests"
-- "Running On-Demand G and VT instances" (for ARM64)
-- "All G and VT Spot Instance Requests" (for ARM64)
+
+> **Note**: Both ARM64 (c6g) and x86 (c5) instances count towards Standard quotas. The "G" in c6g refers to Graviton processors, not GPU instances.
 
 ## Project Structure
 

@@ -84,7 +84,13 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown server type: %s\n", *serverType)
 		fmt.Fprintf(os.Stderr, "Available types:\n")
-		fmt.Fprintf(os.Stderr, "  Baseline: stdhttp-h1, stdhttp-h2, stdhttp-hybrid, fiber-h1, iris-h2, gin-h1, chi-h1, echo-h1\n")
+		fmt.Fprintf(os.Stderr, "  Baseline:\n")
+		fmt.Fprintf(os.Stderr, "    stdhttp-h1, stdhttp-h2, stdhttp-hybrid\n")
+		fmt.Fprintf(os.Stderr, "    fiber-h1\n")
+		fmt.Fprintf(os.Stderr, "    gin-h1, gin-h2, gin-hybrid\n")
+		fmt.Fprintf(os.Stderr, "    chi-h1, chi-h2, chi-hybrid\n")
+		fmt.Fprintf(os.Stderr, "    echo-h1, echo-h2, echo-hybrid\n")
+		fmt.Fprintf(os.Stderr, "    iris-h1, iris-h2, iris-hybrid\n")
 		fmt.Fprintf(os.Stderr, "  Theoretical: epoll-h1, epoll-h2, epoll-hybrid, iouring-h1, iouring-h2, iouring-hybrid\n")
 		os.Exit(1)
 	}
