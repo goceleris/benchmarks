@@ -3,6 +3,7 @@ name: Benchmark (Fast)
 # Fast mode: Runs on PRs for quick trend validation
 # Uses cheaper virtualized instances (c5.large, c6g.medium)
 # Each architecture launches independently with spot -> on-demand fallback
+# If spot instance is terminated mid-benchmark, automatically retries on on-demand
 #
 # Requires approval: PR must have 'run-benchmarks' label added by maintainer
 
@@ -278,8 +279,7 @@ jobs:
     needs: launch-arm64
     if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, fast-arm64]
-    timeout-minutes: 45
-    continue-on-error: true
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -314,8 +314,7 @@ jobs:
     needs: launch-x86
     if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, fast-x86]
-    timeout-minutes: 45
-    continue-on-error: true
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -345,11 +344,245 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Retry ARM64 on on-demand if spot was terminated
+  retry-arm64:
+    name: Retry ARM64 (On-Demand)
+    needs: [authorize, launch-arm64, benchmark-arm64]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      needs.launch-arm64.outputs.launched == 'true' &&
+      needs.launch-arm64.outputs.instance_mode == 'spot' &&
+      needs.benchmark-arm64.result == 'failure'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Cleanup Failed Spot Instance
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Cleaning up failed ARM64 spot instance..."
+          terraform destroy -auto-approve || true
+
+      - name: Launch ARM64 On-Demand
+        id: launch
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Launching ARM64 on-demand for retry..."
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand launched successfully for retry"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      - name: Set Retry Results
+        id: result
+        run: |
+          if [[ "${{ steps.launch.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "::error::ARM64 on-demand retry launch failed"
+          fi
+
+      - name: Wait for ARM64 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          echo "Waiting for ARM64 on-demand runner to register (60s)..."
+          sleep 60
+
+  # Retry x86 on on-demand if spot was terminated
+  retry-x86:
+    name: Retry x86 (On-Demand)
+    needs: [authorize, launch-x86, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      needs.launch-x86.outputs.launched == 'true' &&
+      needs.launch-x86.outputs.instance_mode == 'spot' &&
+      needs.benchmark-x86.result == 'failure'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Cleanup Failed Spot Instance
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Cleaning up failed x86 spot instance..."
+          terraform destroy -auto-approve || true
+
+      - name: Launch x86 On-Demand
+        id: launch
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Launching x86 on-demand for retry..."
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 on-demand launched successfully for retry"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      - name: Set Retry Results
+        id: result
+        run: |
+          if [[ "${{ steps.launch.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "::error::x86 on-demand retry launch failed"
+          fi
+
+      - name: Wait for x86 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          echo "Waiting for x86 on-demand runner to register (60s)..."
+          sleep 60
+
+  # Retry benchmark on ARM64 on-demand
+  retry-benchmark-arm64:
+    name: Retry Benchmark (ARM64)
+    needs: retry-arm64
+    if: needs.retry-arm64.outputs.launched == 'true'
+    runs-on: [self-hosted, fast-arm64]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          echo "RETRY: Running benchmark on ARM64 on-demand instance"
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-arm64-retry
+          path: results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Retry benchmark on x86 on-demand
+  retry-benchmark-x86:
+    name: Retry Benchmark (x86)
+    needs: retry-x86
+    if: needs.retry-x86.outputs.launched == 'true'
+    runs-on: [self-hosted, fast-x86]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          echo "RETRY: Running benchmark on x86 on-demand instance"
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results-x86-retry
+          path: results/
+          retention-days: 7
+          if-no-files-found: ignore
+
   report:
     name: Generate Report
-    needs: [authorize, launch-arm64, launch-x86, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch-arm64, launch-x86, benchmark-arm64, benchmark-x86, retry-arm64, retry-x86, retry-benchmark-arm64, retry-benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && needs.authorize.outputs.authorized == 'true' && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success' ||
+       needs.retry-benchmark-arm64.result == 'success' || needs.retry-benchmark-x86.result == 'success')
     permissions:
       pull-requests: write
       contents: read
@@ -365,11 +598,25 @@ jobs:
           path: downloaded/arm64
         continue-on-error: true
 
+      - name: Download ARM64 Retry Results
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-arm64-retry
+          path: downloaded/arm64-retry
+        continue-on-error: true
+
       - name: Download x86 Results
         uses: actions/download-artifact@v4
         with:
           name: fast-results-x86
           path: downloaded/x86
+        continue-on-error: true
+
+      - name: Download x86 Retry Results
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-x86-retry
+          path: downloaded/x86-retry
         continue-on-error: true
 
       - name: Setup Python
@@ -378,13 +625,36 @@ jobs:
           python-version: '3.11'
 
       - name: Generate Charts
+        env:
+          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.result == 'success' }}
+          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
+          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.result == 'success' }}
+          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.result == 'success' }}
         run: |
           pip install matplotlib numpy
 
           mkdir -p results/charts/arm64 results/charts/x86
 
+          # Determine which ARM64 results to use (prefer retry if original failed)
+          if [[ "$ARM64_RETRY_SUCCESS" == "true" ]]; then
+            ARM64_SOURCE="downloaded/arm64-retry"
+            echo "Using ARM64 retry results"
+          else
+            ARM64_SOURCE="downloaded/arm64"
+            echo "Using ARM64 original results"
+          fi
+
+          # Determine which x86 results to use
+          if [[ "$X86_RETRY_SUCCESS" == "true" ]]; then
+            X86_SOURCE="downloaded/x86-retry"
+            echo "Using x86 retry results"
+          else
+            X86_SOURCE="downloaded/x86"
+            echo "Using x86 original results"
+          fi
+
           # Find and process ARM64 results
-          ARM64_JSON=$(find downloaded/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
+          ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
           if [ -n "$ARM64_JSON" ]; then
             ARM64_DIR=$(dirname "$ARM64_JSON")
             echo "Found ARM64 results in: $ARM64_DIR"
@@ -394,7 +664,7 @@ jobs:
           fi
 
           # Find and process x86 results
-          X86_JSON=$(find downloaded/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
+          X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
           if [ -n "$X86_JSON" ]; then
             X86_DIR=$(dirname "$X86_JSON")
             echo "Found x86 results in: $X86_DIR"
@@ -416,7 +686,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARM64_MODE: ${{ needs.launch-arm64.outputs.instance_mode }}
           X86_MODE: ${{ needs.launch-x86.outputs.instance_mode }}
+          ARM64_RETRIED: ${{ needs.retry-benchmark-arm64.result == 'success' }}
+          X86_RETRIED: ${{ needs.retry-benchmark-x86.result == 'success' }}
         run: |
+          # Determine final instance mode for each arch
+          if [[ "$ARM64_RETRIED" == "true" ]]; then
+            ARM64_FINAL_MODE="on-demand (retry)"
+          else
+            ARM64_FINAL_MODE="$ARM64_MODE"
+          fi
+
+          if [[ "$X86_RETRIED" == "true" ]]; then
+            X86_FINAL_MODE="on-demand (retry)"
+          else
+            X86_FINAL_MODE="$X86_MODE"
+          fi
+
           COMMENT_BODY="## Fast Benchmark Results (Preview)
 
           > **Note**: These are quick validation results using virtualized instances.
@@ -424,8 +709,8 @@ jobs:
 
           | Architecture | Instance Mode |
           |--------------|---------------|
-          | ARM64 | $ARM64_MODE |
-          | x86 | $X86_MODE |
+          | ARM64 | $ARM64_FINAL_MODE |
+          | x86 | $X86_FINAL_MODE |
 
           ---
           "
@@ -499,7 +784,22 @@ jobs:
         env:
           ARM64_MODE: ${{ needs.launch-arm64.outputs.instance_mode }}
           X86_MODE: ${{ needs.launch-x86.outputs.instance_mode }}
+          ARM64_RETRIED: ${{ needs.retry-benchmark-arm64.result == 'success' }}
+          X86_RETRIED: ${{ needs.retry-benchmark-x86.result == 'success' }}
         run: |
+          # Determine final instance mode for each arch
+          if [[ "$ARM64_RETRIED" == "true" ]]; then
+            ARM64_FINAL_MODE="on-demand (retry)"
+          else
+            ARM64_FINAL_MODE="$ARM64_MODE"
+          fi
+
+          if [[ "$X86_RETRIED" == "true" ]]; then
+            X86_FINAL_MODE="on-demand (retry)"
+          else
+            X86_FINAL_MODE="$X86_MODE"
+          fi
+
           echo "# Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: These are quick validation results using virtualized instances." >> $GITHUB_STEP_SUMMARY
@@ -507,8 +807,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Architecture | Instance Mode |" >> $GITHUB_STEP_SUMMARY
           echo "|--------------|---------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| ARM64 | $ARM64_MODE |" >> $GITHUB_STEP_SUMMARY
-          echo "| x86 | $X86_MODE |" >> $GITHUB_STEP_SUMMARY
+          echo "| ARM64 | $ARM64_FINAL_MODE |" >> $GITHUB_STEP_SUMMARY
+          echo "| x86 | $X86_FINAL_MODE |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
@@ -528,9 +828,12 @@ jobs:
 
   cleanup-arm64:
     name: Cleanup ARM64 Infrastructure
-    needs: [authorize, launch-arm64, benchmark-arm64]
+    needs: [authorize, launch-arm64, benchmark-arm64, retry-arm64, retry-benchmark-arm64]
     runs-on: ubuntu-latest
-    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-arm64.outputs.launched == 'true'
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.launch-arm64.outputs.launched == 'true' || needs.retry-arm64.outputs.launched == 'true')
 
     steps:
       - name: Checkout
@@ -541,6 +844,21 @@ jobs:
         with:
           terraform_version: "1.6.0"
           terraform_wrapper: false
+
+      - name: Determine Instance Mode
+        id: mode
+        env:
+          ORIGINAL_MODE: ${{ needs.launch-arm64.outputs.instance_mode }}
+          RETRY_LAUNCHED: ${{ needs.retry-arm64.outputs.launched }}
+        run: |
+          # If retry launched, we're on on-demand; otherwise use original mode
+          if [[ "$RETRY_LAUNCHED" == "true" ]]; then
+            echo "use_on_demand=true" >> $GITHUB_OUTPUT
+          elif [[ "$ORIGINAL_MODE" == "on-demand" ]]; then
+            echo "use_on_demand=true" >> $GITHUB_OUTPUT
+          else
+            echo "use_on_demand=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Terraform Destroy ARM64
         working-directory: terraform
@@ -549,16 +867,19 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_launch_arm64_only: "true"
-          TF_VAR_use_on_demand: ${{ needs.launch-arm64.outputs.instance_mode == 'on-demand' && 'true' || 'false' }}
+          TF_VAR_use_on_demand: ${{ steps.mode.outputs.use_on_demand }}
         run: |
           terraform init
           terraform destroy -auto-approve || true
 
   cleanup-x86:
     name: Cleanup x86 Infrastructure
-    needs: [authorize, launch-x86, benchmark-x86]
+    needs: [authorize, launch-x86, benchmark-x86, retry-x86, retry-benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-x86.outputs.launched == 'true'
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.launch-x86.outputs.launched == 'true' || needs.retry-x86.outputs.launched == 'true')
 
     steps:
       - name: Checkout
@@ -570,6 +891,21 @@ jobs:
           terraform_version: "1.6.0"
           terraform_wrapper: false
 
+      - name: Determine Instance Mode
+        id: mode
+        env:
+          ORIGINAL_MODE: ${{ needs.launch-x86.outputs.instance_mode }}
+          RETRY_LAUNCHED: ${{ needs.retry-x86.outputs.launched }}
+        run: |
+          # If retry launched, we're on on-demand; otherwise use original mode
+          if [[ "$RETRY_LAUNCHED" == "true" ]]; then
+            echo "use_on_demand=true" >> $GITHUB_OUTPUT
+          elif [[ "$ORIGINAL_MODE" == "on-demand" ]]; then
+            echo "use_on_demand=true" >> $GITHUB_OUTPUT
+          else
+            echo "use_on_demand=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Terraform Destroy x86
         working-directory: terraform
         env:
@@ -577,7 +913,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_launch_x86_only: "true"
-          TF_VAR_use_on_demand: ${{ needs.launch-x86.outputs.instance_mode == 'on-demand' && 'true' || 'false' }}
+          TF_VAR_use_on_demand: ${{ steps.mode.outputs.use_on_demand }}
         run: |
           terraform init
           terraform destroy -auto-approve || true
