@@ -1345,12 +1345,14 @@ jobs:
         env:
           ARM64_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
           ARM64_INSTANCE: ${{ needs.launch-arm64.outputs.instance_type }}
+          ARM64_LAUNCHED: ${{ needs.launch-arm64.outputs.launched }}
           ARM64_RETRY_PROVISIONAL: ${{ needs.retry-arm64.outputs.is_provisional }}
           ARM64_RETRY_INSTANCE: ${{ needs.retry-arm64.outputs.instance_type }}
           ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.result == 'success' }}
           ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
           X86_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
           X86_INSTANCE: ${{ needs.launch-x86.outputs.instance_type }}
+          X86_LAUNCHED: ${{ needs.launch-x86.outputs.launched }}
           X86_RETRY_PROVISIONAL: ${{ needs.retry-x86.outputs.is_provisional }}
           X86_RETRY_INSTANCE: ${{ needs.retry-x86.outputs.instance_type }}
           X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.result == 'success' }}
@@ -1360,17 +1362,28 @@ jobs:
         run: |
           pip install matplotlib numpy
 
+          # Track which architectures have results
+          ARM64_HAS_RESULTS="false"
+          X86_HAS_RESULTS="false"
+
           # Determine which ARM64 results to use and final status
           if [[ "$ARM64_RETRY_SUCCESS" == "true" ]]; then
             ARM64_SOURCE="downloaded/arm64-retry"
             ARM64_FINAL_PROVISIONAL="$ARM64_RETRY_PROVISIONAL"
             ARM64_FINAL_INSTANCE="$ARM64_RETRY_INSTANCE"
+            ARM64_HAS_RESULTS="true"
             echo "Using ARM64 retry results"
-          else
+          elif [[ "$ARM64_ORIGINAL_SUCCESS" == "true" ]]; then
             ARM64_SOURCE="downloaded/arm64"
             ARM64_FINAL_PROVISIONAL="$ARM64_PROVISIONAL"
             ARM64_FINAL_INSTANCE="$ARM64_INSTANCE"
+            ARM64_HAS_RESULTS="true"
             echo "Using ARM64 original results"
+          else
+            ARM64_SOURCE=""
+            ARM64_FINAL_PROVISIONAL=""
+            ARM64_FINAL_INSTANCE="none"
+            echo "No ARM64 results available"
           fi
 
           # Determine which x86 results to use and final status
@@ -1378,12 +1391,19 @@ jobs:
             X86_SOURCE="downloaded/x86-retry"
             X86_FINAL_PROVISIONAL="$X86_RETRY_PROVISIONAL"
             X86_FINAL_INSTANCE="$X86_RETRY_INSTANCE"
+            X86_HAS_RESULTS="true"
             echo "Using x86 retry results"
-          else
+          elif [[ "$X86_ORIGINAL_SUCCESS" == "true" ]]; then
             X86_SOURCE="downloaded/x86"
             X86_FINAL_PROVISIONAL="$X86_PROVISIONAL"
             X86_FINAL_INSTANCE="$X86_INSTANCE"
+            X86_HAS_RESULTS="true"
             echo "Using x86 original results"
+          else
+            X86_SOURCE=""
+            X86_FINAL_PROVISIONAL=""
+            X86_FINAL_INSTANCE="none"
+            echo "No x86 results available"
           fi
 
           # Determine folder names based on provisional status
@@ -1399,55 +1419,73 @@ jobs:
             X86_FOLDER="x86"
           fi
 
-          echo "ARM64 folder: $ARM64_FOLDER (instance: $ARM64_FINAL_INSTANCE)"
-          echo "x86 folder: $X86_FOLDER (instance: $X86_FINAL_INSTANCE)"
+          echo "ARM64: has_results=$ARM64_HAS_RESULTS folder=$ARM64_FOLDER instance=$ARM64_FINAL_INSTANCE"
+          echo "x86: has_results=$X86_HAS_RESULTS folder=$X86_FOLDER instance=$X86_FINAL_INSTANCE"
 
-          # Create output directories
-          mkdir -p "results/latest/$ARM64_FOLDER" "results/latest/$X86_FOLDER"
-
-          # Process ARM64 results
-          ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
-          if [ -n "$ARM64_JSON" ]; then
-            ARM64_DIR=$(dirname "$ARM64_JSON")
-            echo "Processing ARM64 results from: $ARM64_DIR"
-            python scripts/generate_charts.py "$ARM64_DIR" "results/latest/$ARM64_FOLDER"
-            cp "$ARM64_DIR"/*.json "results/latest/$ARM64_FOLDER/" 2>/dev/null || true
+          # Process ARM64 results (only if we have them)
+          if [[ "$ARM64_HAS_RESULTS" == "true" && -n "$ARM64_SOURCE" ]]; then
+            ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$ARM64_JSON" ]; then
+              mkdir -p "results/latest/$ARM64_FOLDER"
+              ARM64_DIR=$(dirname "$ARM64_JSON")
+              echo "Processing ARM64 results from: $ARM64_DIR"
+              python scripts/generate_charts.py "$ARM64_DIR" "results/latest/$ARM64_FOLDER"
+              cp "$ARM64_DIR"/*.json "results/latest/$ARM64_FOLDER/" 2>/dev/null || true
+            else
+              echo "WARNING: ARM64 marked as success but no JSON found in $ARM64_SOURCE"
+              ARM64_HAS_RESULTS="false"
+            fi
           fi
 
-          # Process x86 results
-          X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
-          if [ -n "$X86_JSON" ]; then
-            X86_DIR=$(dirname "$X86_JSON")
-            echo "Processing x86 results from: $X86_DIR"
-            python scripts/generate_charts.py "$X86_DIR" "results/latest/$X86_FOLDER"
-            cp "$X86_DIR"/*.json "results/latest/$X86_FOLDER/" 2>/dev/null || true
+          # Process x86 results (only if we have them)
+          if [[ "$X86_HAS_RESULTS" == "true" && -n "$X86_SOURCE" ]]; then
+            X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$X86_JSON" ]; then
+              mkdir -p "results/latest/$X86_FOLDER"
+              X86_DIR=$(dirname "$X86_JSON")
+              echo "Processing x86 results from: $X86_DIR"
+              python scripts/generate_charts.py "$X86_DIR" "results/latest/$X86_FOLDER"
+              cp "$X86_DIR"/*.json "results/latest/$X86_FOLDER/" 2>/dev/null || true
+            else
+              echo "WARNING: x86 marked as success but no JSON found in $X86_SOURCE"
+              X86_HAS_RESULTS="false"
+            fi
           fi
 
-          # Create metadata
-          cat > "results/latest/BENCHMARK_INFO.json" << EOF
+          # Create metadata (only include architectures that have results)
+          cat > "results/latest/BENCHMARK_INFO.json" << EOFMETA
           {
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "triggered_by": "${{ github.actor }}",
             "event": "${{ github.event_name }}",
             "version": "$VERSION",
             "arm64": {
-              "status": "$([ "$ARM64_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official")",
+              "available": $ARM64_HAS_RESULTS,
+              "status": "$([ "$ARM64_HAS_RESULTS" == "true" ] && ([ "$ARM64_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official") || echo "failed")",
               "instance_type": "$ARM64_FINAL_INSTANCE",
-              "folder": "$ARM64_FOLDER"
+              "folder": "$([ "$ARM64_HAS_RESULTS" == "true" ] && echo "$ARM64_FOLDER" || echo "")"
             },
             "x86": {
-              "status": "$([ "$X86_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official")",
+              "available": $X86_HAS_RESULTS,
+              "status": "$([ "$X86_HAS_RESULTS" == "true" ] && ([ "$X86_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official") || echo "failed")",
               "instance_type": "$X86_FINAL_INSTANCE",
-              "folder": "$X86_FOLDER"
+              "folder": "$([ "$X86_HAS_RESULTS" == "true" ] && echo "$X86_FOLDER" || echo "")"
             }
           }
-          EOF
+          EOFMETA
+
+          echo "Created BENCHMARK_INFO.json:"
+          cat "results/latest/BENCHMARK_INFO.json"
 
           # For releases, also create version folder
           if [[ "$IS_RELEASE" == "true" && -n "$VERSION" ]]; then
             mkdir -p "results/$VERSION"
-            cp -r "results/latest/$ARM64_FOLDER" "results/$VERSION/" 2>/dev/null || true
-            cp -r "results/latest/$X86_FOLDER" "results/$VERSION/" 2>/dev/null || true
+            if [[ "$ARM64_HAS_RESULTS" == "true" ]]; then
+              cp -r "results/latest/$ARM64_FOLDER" "results/$VERSION/" 2>/dev/null || true
+            fi
+            if [[ "$X86_HAS_RESULTS" == "true" ]]; then
+              cp -r "results/latest/$X86_FOLDER" "results/$VERSION/" 2>/dev/null || true
+            fi
             cp "results/latest/BENCHMARK_INFO.json" "results/$VERSION/" 2>/dev/null || true
           fi
 
@@ -1464,6 +1502,8 @@ jobs:
 
           prov_file = "$PROV_FILE"
           version = "$VERSION"
+          arm64_has = "$ARM64_HAS_RESULTS" == "true"
+          x86_has = "$X86_HAS_RESULTS" == "true"
           arm64_prov = "$ARM64_FINAL_PROVISIONAL" == "true"
           x86_prov = "$X86_FINAL_PROVISIONAL" == "true"
           arm64_inst = "$ARM64_FINAL_INSTANCE"
@@ -1477,12 +1517,14 @@ jobs:
 
           data[version] = {
               "arm64": {
-                  "provisional": arm64_prov,
-                  "instance_type": arm64_inst
+                  "available": arm64_has,
+                  "provisional": arm64_prov if arm64_has else None,
+                  "instance_type": arm64_inst if arm64_has else None
               },
               "x86": {
-                  "provisional": x86_prov,
-                  "instance_type": x86_inst
+                  "available": x86_has,
+                  "provisional": x86_prov if x86_has else None,
+                  "instance_type": x86_inst if x86_has else None
               }
           }
 
@@ -1495,6 +1537,8 @@ jobs:
           # Export for later steps
           echo "ARM64_FOLDER=$ARM64_FOLDER" >> $GITHUB_ENV
           echo "X86_FOLDER=$X86_FOLDER" >> $GITHUB_ENV
+          echo "ARM64_HAS_RESULTS=$ARM64_HAS_RESULTS" >> $GITHUB_ENV
+          echo "X86_HAS_RESULTS=$X86_HAS_RESULTS" >> $GITHUB_ENV
           echo "ARM64_FINAL_PROVISIONAL=$ARM64_FINAL_PROVISIONAL" >> $GITHUB_ENV
           echo "ARM64_FINAL_INSTANCE=$ARM64_FINAL_INSTANCE" >> $GITHUB_ENV
           echo "X86_FINAL_PROVISIONAL=$X86_FINAL_PROVISIONAL" >> $GITHUB_ENV
@@ -1515,13 +1559,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # For releases (tag checkout = detached HEAD), fetch and checkout main first
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "Release workflow detected, checking out main branch..."
-            git fetch origin main
-            git checkout main
-            git pull origin main
-          fi
+          # Always checkout main before committing (handles both releases and workflow_dispatch)
+          echo "Checking out main branch..."
+          git fetch origin main
+          git checkout main
+          git pull origin main
 
           # Add all results
           git add -f results/latest/
@@ -1532,11 +1574,18 @@ jobs:
             git add -f "results/$VERSION/"
           fi
 
+          # Show what will be committed
+          echo "Changes to be committed:"
+          git status --short
+
           git commit -m "chore: update benchmark results [skip ci]" || echo "No changes to commit"
 
           # Use PAT for push to bypass branch protection rules
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-          git push origin HEAD:main || echo "Push failed (may need permissions)"
+          git push origin main || {
+            echo "::error::Push to main failed"
+            exit 1
+          }
 
       - name: Create Summary
         run: |
@@ -1544,41 +1593,52 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # ARM64 status
-          if [[ "$ARM64_FINAL_PROVISIONAL" == "true" ]]; then
-            echo "## ARM64 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
-            echo "> Run on **$ARM64_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
+          if [[ "$ARM64_HAS_RESULTS" == "true" ]]; then
+            if [[ "$ARM64_FINAL_PROVISIONAL" == "true" ]]; then
+              echo "## ARM64 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
+              echo "> Run on **$ARM64_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## ARM64 Results (Official)" >> $GITHUB_STEP_SUMMARY
+              echo "> Run on **$ARM64_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -f "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" ]; then
+              cat "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "## ARM64 Results (Official)" >> $GITHUB_STEP_SUMMARY
-            echo "> Run on **$ARM64_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" ]; then
-            cat "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No ARM64 results available" >> $GITHUB_STEP_SUMMARY
+            echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
+            echo "> **FAILED** - No results available (launch or benchmark failed)" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # x86 status
-          if [[ "$X86_FINAL_PROVISIONAL" == "true" ]]; then
-            echo "## x86 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
-            echo "> Run on **$X86_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
+          if [[ "$X86_HAS_RESULTS" == "true" ]]; then
+            if [[ "$X86_FINAL_PROVISIONAL" == "true" ]]; then
+              echo "## x86 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
+              echo "> Run on **$X86_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## x86 Results (Official)" >> $GITHUB_STEP_SUMMARY
+              echo "> Run on **$X86_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -f "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" ]; then
+              cat "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "## x86 Results (Official)" >> $GITHUB_STEP_SUMMARY
-            echo "> Run on **$X86_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" ]; then
-            cat "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No x86 results available" >> $GITHUB_STEP_SUMMARY
+            echo "## x86 Results" >> $GITHUB_STEP_SUMMARY
+            echo "> **FAILED** - No results available (launch or benchmark failed)" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Note about provisional
+          # Notes
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$ARM64_HAS_RESULTS" != "true" || "$X86_HAS_RESULTS" != "true" ]]; then
+            echo "**Warning**: Some architectures failed. Check the workflow logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
           if [[ "$ARM64_FINAL_PROVISIONAL" == "true" || "$X86_FINAL_PROVISIONAL" == "true" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "---" >> $GITHUB_STEP_SUMMARY
             echo "**Note**: Some results are provisional. Run the **Promote Provisional** workflow when metal quota is available." >> $GITHUB_STEP_SUMMARY
           fi
 
