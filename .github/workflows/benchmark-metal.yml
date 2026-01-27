@@ -38,7 +38,6 @@ concurrency:
 
 env:
   TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
-  AWS_REGION: us-east-1
 
 jobs:
   authorize:
@@ -72,78 +71,11 @@ jobs:
             exit 1
           fi
 
-  # Pre-flight checks: list existing instances and cleanup orphans
-  preflight:
-    name: Pre-flight Checks
-    runs-on: ubuntu-latest
-    needs: authorize
-    if: needs.authorize.outputs.authorized == 'true'
-
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Check Existing Instances
-        run: |
-          echo "## Pre-flight Check: Existing Instances" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          INSTANCES=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=benchmark-runner-*" \
-                      "Name=instance-state-name,Values=pending,running" \
-            --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,LaunchTime,Tags[?Key==`Name`].Value|[0]]' \
-            --output text)
-
-          if [ -z "$INSTANCES" ]; then
-            echo "No existing benchmark instances found. Ready to launch." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**WARNING: Found existing benchmark instances:**" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Instance ID | Type | State | Launched | Name |" >> $GITHUB_STEP_SUMMARY
-            echo "|-------------|------|-------|----------|------|" >> $GITHUB_STEP_SUMMARY
-            echo "$INSTANCES" | while read id type state launched name; do
-              echo "| $id | $type | $state | $launched | $name |" >> $GITHUB_STEP_SUMMARY
-            done
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "These may be orphaned from a previous run. Consider running the **Cleanup Instances** workflow if issues occur." >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Check Self-Hosted Runners
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-        run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Pre-flight Check: Self-Hosted Runners" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          RUNNERS=$(gh api repos/${{ github.repository }}/actions/runners --jq '.runners[] | "\(.name) \(.status) \(.busy)"')
-
-          if [ -z "$RUNNERS" ]; then
-            echo "No self-hosted runners registered." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Runner Name | Status | Busy |" >> $GITHUB_STEP_SUMMARY
-            echo "|-------------|--------|------|" >> $GITHUB_STEP_SUMMARY
-            echo "$RUNNERS" | while read name status busy; do
-              echo "| $name | $status | $busy |" >> $GITHUB_STEP_SUMMARY
-            done
-          fi
-
-          # Count offline runners
-          OFFLINE=$(gh api repos/${{ github.repository }}/actions/runners --jq '[.runners[] | select(.status == "offline")] | length')
-          if [ "$OFFLINE" -gt 0 ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Note:** $OFFLINE offline runner(s) found. These will be cleaned up after the benchmark." >> $GITHUB_STEP_SUMMARY
-          fi
-
   # Launch ARM64 infrastructure with independent fallback
   launch-arm64:
     name: Launch ARM64 Infrastructure
     runs-on: ubuntu-latest
-    needs: [authorize, preflight]
+    needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
@@ -356,31 +288,11 @@ jobs:
             sleep 120
           fi
 
-      - name: Report Launch Status
-        if: always()
-        run: |
-          echo "## ARM64 Launch Result" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.result.outputs.launched }}" == "true" ]]; then
-            if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
-              echo "**Status:** Launched (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "**Status:** Launched (Official Metal)" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo "- Instance Type: \`${{ steps.result.outputs.instance_type }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Runner Label: \`${{ steps.result.outputs.runner_label }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Spot Instance: ${{ steps.result.outputs.was_spot }}" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Status:** FAILED" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "All launch attempts failed. Check the logs above for details." >> $GITHUB_STEP_SUMMARY
-          fi
-
   # Launch x86 infrastructure with independent fallback
   launch-x86:
     name: Launch x86 Infrastructure
     runs-on: ubuntu-latest
-    needs: [authorize, preflight]
+    needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
@@ -591,26 +503,6 @@ jobs:
           else
             echo "Waiting for x86 metal runner (120s)..."
             sleep 120
-          fi
-
-      - name: Report Launch Status
-        if: always()
-        run: |
-          echo "## x86 Launch Result" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.result.outputs.launched }}" == "true" ]]; then
-            if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
-              echo "**Status:** Launched (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "**Status:** Launched (Official Metal)" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo "- Instance Type: \`${{ steps.result.outputs.instance_type }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Runner Label: \`${{ steps.result.outputs.runner_label }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Spot Instance: ${{ steps.result.outputs.was_spot }}" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Status:** FAILED" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "All launch attempts failed. Check the logs above for details." >> $GITHUB_STEP_SUMMARY
           fi
 
   benchmark-arm64:
@@ -1336,20 +1228,6 @@ jobs:
           # Try destroying both spot and on-demand resources
           terraform destroy -auto-approve || true
 
-      - name: Cleanup Offline Runners
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-        run: |
-          # Remove any offline self-hosted runners with arm64 in the name
-          RUNNERS=$(gh api repos/${{ github.repository }}/actions/runners --jq '.runners[] | select(.status == "offline") | select(.name | contains("arm64")) | "\(.id) \(.name)"')
-          if [ -n "$RUNNERS" ]; then
-            echo "$RUNNERS" | while read id name; do
-              echo "Removing offline runner: $name"
-              gh api -X DELETE repos/${{ github.repository }}/actions/runners/$id || true
-            done
-          fi
-
   cleanup-x86:
     name: Cleanup x86 Infrastructure
     needs: [authorize, launch-x86, benchmark-x86, retry-x86, retry-benchmark-x86]
@@ -1380,17 +1258,3 @@ jobs:
           terraform init
           # Try destroying both spot and on-demand resources
           terraform destroy -auto-approve || true
-
-      - name: Cleanup Offline Runners
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-        run: |
-          # Remove any offline self-hosted runners with x86 in the name
-          RUNNERS=$(gh api repos/${{ github.repository }}/actions/runners --jq '.runners[] | select(.status == "offline") | select(.name | contains("x86")) | "\(.id) \(.name)"')
-          if [ -n "$RUNNERS" ]; then
-            echo "$RUNNERS" | while read id name; do
-              echo "Removing offline runner: $name"
-              gh api -X DELETE repos/${{ github.repository }}/actions/runners/$id || true
-            done
-          fi
