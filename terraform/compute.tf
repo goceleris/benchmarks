@@ -1,6 +1,7 @@
-# ARM64 Spot Instance (default)
-resource "aws_spot_instance_request" "benchmark_arm64" {
-  count = var.use_on_demand ? 0 : 1
+# ARM64 Spot Instance
+# Created when: not using on-demand AND not launching x86 only
+resource "aws_spot_instance_request" "arm64_runner" {
+  count = (!var.use_on_demand && !var.launch_x86_only) ? 1 : 0
 
   ami                    = data.aws_ami.ubuntu_arm64.id
   instance_type          = local.instance_types[local.effective_mode].arm64
@@ -36,9 +37,10 @@ resource "aws_spot_instance_request" "benchmark_arm64" {
   instance_initiated_shutdown_behavior = "terminate"
 }
 
-# x86_64 Spot Instance (default)
-resource "aws_spot_instance_request" "benchmark_x86" {
-  count = var.use_on_demand ? 0 : 1
+# x86_64 Spot Instance
+# Created when: not using on-demand AND not launching arm64 only
+resource "aws_spot_instance_request" "x86_runner" {
+  count = (!var.use_on_demand && !var.launch_arm64_only) ? 1 : 0
 
   ami                    = data.aws_ami.ubuntu_x86.id
   instance_type          = local.instance_types[local.effective_mode].x86
@@ -75,8 +77,9 @@ resource "aws_spot_instance_request" "benchmark_x86" {
 }
 
 # ARM64 On-Demand Instance (fallback)
-resource "aws_instance" "benchmark_arm64_ondemand" {
-  count = var.use_on_demand ? 1 : 0
+# Created when: using on-demand AND not launching x86 only
+resource "aws_instance" "arm64_runner_ondemand" {
+  count = (var.use_on_demand && !var.launch_x86_only) ? 1 : 0
 
   ami           = data.aws_ami.ubuntu_arm64.id
   instance_type = local.instance_types[local.effective_mode].arm64
@@ -107,12 +110,14 @@ resource "aws_instance" "benchmark_arm64_ondemand" {
     OnDemand      = "true"
   }
 
-  instance_initiated_shutdown_behavior = "terminate"
+  # Note: instance_initiated_shutdown_behavior removed to avoid IAM permission errors
+  # The cleanup job handles termination via terraform destroy
 }
 
 # x86_64 On-Demand Instance (fallback)
-resource "aws_instance" "benchmark_x86_ondemand" {
-  count = var.use_on_demand ? 1 : 0
+# Created when: using on-demand AND not launching arm64 only
+resource "aws_instance" "x86_runner_ondemand" {
+  count = (var.use_on_demand && !var.launch_arm64_only) ? 1 : 0
 
   ami           = data.aws_ami.ubuntu_x86.id
   instance_type = local.instance_types[local.effective_mode].x86
@@ -143,5 +148,6 @@ resource "aws_instance" "benchmark_x86_ondemand" {
     OnDemand      = "true"
   }
 
-  instance_initiated_shutdown_behavior = "terminate"
+  # Note: instance_initiated_shutdown_behavior removed to avoid IAM permission errors
+  # The cleanup job handles termination via terraform destroy
 }

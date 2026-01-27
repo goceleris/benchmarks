@@ -39,6 +39,18 @@ variable "use_provisional" {
   default     = false
 }
 
+variable "launch_arm64_only" {
+  description = "Only launch ARM64 infrastructure (for independent architecture launches)"
+  type        = bool
+  default     = false
+}
+
+variable "launch_x86_only" {
+  description = "Only launch x86 infrastructure (for independent architecture launches)"
+  type        = bool
+  default     = false
+}
+
 # Pre-existing infrastructure references
 # These must be created manually before running Terraform
 variable "iam_instance_profile_name" {

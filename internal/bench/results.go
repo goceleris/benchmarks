@@ -2,6 +2,7 @@ package bench
 
 import (
 	"encoding/json"
+	"os"
 	"time"
 )
 
@@ -92,6 +93,87 @@ func (r *Result) ToServerResult(server, benchmark, method, path string) ServerRe
 // ToJSON serializes the output to JSON.
 func (o *BenchmarkOutput) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(o, "", "  ")
+}
+
+// Checkpoint tracks benchmark progress for incremental execution.
+type Checkpoint struct {
+	BenchmarkOutput
+	Completed map[string]bool `json:"completed"` // key: "server:benchmark"
+}
+
+// NewCheckpoint creates a new checkpoint from a BenchmarkOutput.
+func NewCheckpoint(output *BenchmarkOutput) *Checkpoint {
+	return &Checkpoint{
+		BenchmarkOutput: *output,
+		Completed:       make(map[string]bool),
+	}
+}
+
+// LoadCheckpoint loads a checkpoint from a file.
+func LoadCheckpoint(path string) (*Checkpoint, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cp Checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return nil, err
+	}
+	if cp.Completed == nil {
+		cp.Completed = make(map[string]bool)
+	}
+	return &cp, nil
+}
+
+// Save writes the checkpoint to a file atomically.
+func (cp *Checkpoint) Save(path string) error {
+	data, err := json.MarshalIndent(cp, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Write to temp file first, then rename for atomic operation
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// IsCompleted checks if a server:benchmark combination is done.
+func (cp *Checkpoint) IsCompleted(server, benchmark string) bool {
+	return cp.Completed[server+":"+benchmark]
+}
+
+// MarkCompleted marks a server:benchmark combination as done.
+func (cp *Checkpoint) MarkCompleted(server, benchmark string) {
+	cp.Completed[server+":"+benchmark] = true
+}
+
+// AddResult adds a result and marks it as completed.
+func (cp *Checkpoint) AddResult(result ServerResult) {
+	cp.Results = append(cp.Results, result)
+	cp.MarkCompleted(result.Server, result.Benchmark)
+}
+
+// ToBenchmarkOutput converts checkpoint to final output (without checkpoint metadata).
+func (cp *Checkpoint) ToBenchmarkOutput() *BenchmarkOutput {
+	return &BenchmarkOutput{
+		Timestamp:    cp.Timestamp,
+		Architecture: cp.Architecture,
+		Config:       cp.Config,
+		Results:      cp.Results,
+	}
+}
+
+// MergeResults merges results from another checkpoint, avoiding duplicates.
+func (cp *Checkpoint) MergeResults(other *Checkpoint) {
+	for _, result := range other.Results {
+		key := result.Server + ":" + result.Benchmark
+		if !cp.Completed[key] {
+			cp.Results = append(cp.Results, result)
+			cp.Completed[key] = true
+		}
+	}
 }
 
 func formatBytes(b float64) string {

@@ -1,8 +1,17 @@
 name: Benchmark (Metal)
 
 # Metal mode: Official benchmarks on bare-metal instances
-# Falls back to provisional (best available) if metal quota unavailable
-# Uses c5.metal/c6g.metal (official) or c5.2xlarge/c6g.2xlarge (provisional)
+# Each architecture falls back independently to provisional if quota unavailable
+# ARM64: c6g.metal (official) or c6g.2xlarge (provisional)
+# x86: c5.metal (official) or c5.2xlarge (provisional)
+#
+# If spot instance is terminated mid-benchmark, automatically retries on on-demand
+#
+# Results are stored with -provisional suffix if not on metal:
+#   results/latest/arm64/          (official)
+#   results/latest/x86-provisional/ (provisional)
+#
+# Security: Only authorized users can trigger (to protect AWS resources)
 
 on:
   release:
@@ -29,55 +38,69 @@ concurrency:
 
 env:
   TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
-  TF_VAR_benchmark_mode: metal
 
 jobs:
   authorize:
     name: Authorize Caller
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
     steps:
       - name: Check Permissions
-        if: github.event_name == 'workflow_dispatch'
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
-          echo "User: ${{ github.actor }}"
-          echo "Permission level: $PERMISSION"
-          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" && "$PERMISSION" != "write" ]]; then
-            echo "::error::Unauthorized: Only maintainers and owners can trigger metal benchmarks"
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            echo "Release event - authorized (release creator: ${{ github.actor }})"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+            echo "User: ${{ github.actor }}"
+            echo "Permission level: $PERMISSION"
+            if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+              echo "authorized=true" >> $GITHUB_OUTPUT
+              echo "User ${{ github.actor }} authorized with permission: $PERMISSION"
+            else
+              echo "authorized=false" >> $GITHUB_OUTPUT
+              echo "::error::Unauthorized: Only maintainers and owners can trigger metal benchmarks"
+              exit 1
+            fi
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
             exit 1
           fi
-          echo "User ${{ github.actor }} authorized with permission: $PERMISSION"
 
-  launch:
-    name: Launch Infrastructure
+  # Launch ARM64 infrastructure with independent fallback
+  launch-arm64:
+    name: Launch ARM64 Infrastructure
     runs-on: ubuntu-latest
     needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
     outputs:
-      arm64_launched: ${{ steps.result.outputs.arm64_launched }}
-      x86_launched: ${{ steps.result.outputs.x86_launched }}
-      instance_mode: ${{ steps.result.outputs.instance_mode }}
+      launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
-      runner_label_arm64: ${{ steps.result.outputs.runner_label_arm64 }}
-      runner_label_x86: ${{ steps.result.outputs.runner_label_x86 }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+      runner_label: ${{ steps.result.outputs.runner_label }}
+      was_spot: ${{ steps.result.outputs.was_spot }}
+      benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
 
-      # Attempt 1: Metal Spot
-      - name: Try Metal Spot
+      # Try Metal Spot
+      - name: Try ARM64 Metal Spot
         id: metal_spot
         continue-on-error: true
         working-directory: terraform
@@ -85,25 +108,35 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting metal spot instances..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 metal spot (c6g.metal)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot failed with exit code $EXIT_CODE"
           fi
 
-      # Attempt 2: Metal On-Demand
-      - name: Cleanup for Metal On-Demand
+      # Try Metal On-Demand
+      - name: Cleanup ARM64 Metal Spot
         if: steps.metal_spot.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-        run: terraform destroy -auto-approve || true
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
+        run: terraform destroy -auto-approve -target=aws_spot_instance_request.arm64_runner || true
 
-      - name: Try Metal On-Demand
+      - name: Try ARM64 Metal On-Demand
         id: metal_ondemand
         if: steps.metal_spot.outputs.success != 'true'
         continue-on-error: true
@@ -112,27 +145,37 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
           TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting metal on-demand instances..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 metal on-demand (c6g.metal)..."
+          set +e
+          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 metal on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 metal on-demand failed with exit code $EXIT_CODE"
           fi
 
-      # Attempt 3: Provisional Spot
-      - name: Cleanup for Provisional Spot
+      # Try Provisional Spot
+      - name: Cleanup ARM64 Metal On-Demand
         if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
           TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
         run: terraform destroy -auto-approve || true
 
-      - name: Try Provisional Spot
+      - name: Try ARM64 Provisional Spot
         id: provisional_spot
         if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
         continue-on-error: true
@@ -141,27 +184,35 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_provisional: "true"
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting provisional spot instances (c6g.2xlarge/c5.2xlarge)..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot failed with exit code $EXIT_CODE"
           fi
 
-      # Attempt 4: Provisional On-Demand
-      - name: Cleanup for Provisional On-Demand
+      # Try Provisional On-Demand
+      - name: Cleanup ARM64 Provisional Spot
         if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_provisional: "true"
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_launch_arm64_only: "true"
         run: terraform destroy -auto-approve || true
 
-      - name: Try Provisional On-Demand
+      - name: Try ARM64 Provisional On-Demand
         id: provisional_ondemand
         if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
         continue-on-error: true
@@ -170,167 +221,728 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_provisional: "true"
+          TF_VAR_benchmark_mode: provisional
           TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting provisional on-demand instances..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 provisional on-demand (c6g.2xlarge)..."
+          set +e
+          terraform apply -auto-approve -target=aws_instance.arm64_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional on-demand failed with exit code $EXIT_CODE"
           fi
 
-      - name: Set Launch Results
+      - name: Set ARM64 Launch Results
         id: result
         run: |
           if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=metal-spot" >> $GITHUB_OUTPUT
+            echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
-            echo "runner_label_arm64=metal-arm64" >> $GITHUB_OUTPUT
-            echo "runner_label_x86=metal-x86" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.metal-spot" >> $GITHUB_OUTPUT
+            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=true" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=metal-ondemand" >> $GITHUB_OUTPUT
+            echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
-            echo "runner_label_arm64=metal-arm64" >> $GITHUB_OUTPUT
-            echo "runner_label_x86=metal-x86" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.metal-ondemand" >> $GITHUB_OUTPUT
+            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_spot.outputs.success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=provisional-spot" >> $GITHUB_OUTPUT
+            echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
-            echo "runner_label_arm64=provisional-arm64" >> $GITHUB_OUTPUT
-            echo "runner_label_x86=provisional-x86" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.2xlarge-spot" >> $GITHUB_OUTPUT
+            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=true" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=provisional-ondemand" >> $GITHUB_OUTPUT
+            echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=true" >> $GITHUB_OUTPUT
-            echo "runner_label_arm64=provisional-arm64" >> $GITHUB_OUTPUT
-            echo "runner_label_x86=provisional-x86" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.2xlarge-ondemand" >> $GITHUB_OUTPUT
+            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           else
-            echo "arm64_launched=false" >> $GITHUB_OUTPUT
-            echo "x86_launched=false" >> $GITHUB_OUTPUT
-            echo "instance_mode=none" >> $GITHUB_OUTPUT
+            echo "launched=false" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
-            echo "::error::All launch attempts failed"
-            exit 1
+            echo "instance_type=none" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "::error::All ARM64 launch attempts failed"
           fi
 
-      - name: Wait for Runners
+      - name: Wait for ARM64 Runner
+        if: steps.result.outputs.launched == 'true'
         run: |
           if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
-            echo "Waiting for provisional runners to register (60s)..."
+            echo "Waiting for ARM64 provisional runner (60s)..."
             sleep 60
           else
-            echo "Waiting for metal runners to register (120s)..."
+            echo "Waiting for ARM64 metal runner (120s)..."
+            sleep 120
+          fi
+
+  # Launch x86 infrastructure with independent fallback
+  launch-x86:
+    name: Launch x86 Infrastructure
+    runs-on: ubuntu-latest
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      is_provisional: ${{ steps.result.outputs.is_provisional }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+      runner_label: ${{ steps.result.outputs.runner_label }}
+      was_spot: ${{ steps.result.outputs.was_spot }}
+      benchmark_mode: ${{ steps.result.outputs.benchmark_mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      # Try Metal Spot
+      - name: Try x86 Metal Spot
+        id: metal_spot
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 metal spot (c5.metal)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 metal spot launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 metal spot failed with exit code $EXIT_CODE"
+          fi
+
+      # Try Metal On-Demand
+      - name: Cleanup x86 Metal Spot
+        if: steps.metal_spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_x86_only: "true"
+        run: terraform destroy -auto-approve -target=aws_spot_instance_request.x86_runner || true
+
+      - name: Try x86 Metal On-Demand
+        id: metal_ondemand
+        if: steps.metal_spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 metal on-demand (c5.metal)..."
+          set +e
+          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 metal on-demand launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 metal on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      # Try Provisional Spot
+      - name: Cleanup x86 Metal On-Demand
+        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: terraform destroy -auto-approve || true
+
+      - name: Try x86 Provisional Spot
+        id: provisional_spot
+        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 provisional spot (c5.2xlarge)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 provisional spot launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 provisional spot failed with exit code $EXIT_CODE"
+          fi
+
+      # Try Provisional On-Demand
+      - name: Cleanup x86 Provisional Spot
+        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_launch_x86_only: "true"
+        run: terraform destroy -auto-approve || true
+
+      - name: Try x86 Provisional On-Demand
+        id: provisional_ondemand
+        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 provisional on-demand (c5.2xlarge)..."
+          set +e
+          terraform apply -auto-approve -target=aws_instance.x86_runner_ondemand
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 provisional on-demand launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 provisional on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      - name: Set x86 Launch Results
+        id: result
+        run: |
+          if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=false" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.metal-spot" >> $GITHUB_OUTPUT
+            echo "runner_label=metal-x86" >> $GITHUB_OUTPUT
+            echo "was_spot=true" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=false" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.metal-ondemand" >> $GITHUB_OUTPUT
+            echo "runner_label=metal-x86" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.provisional_spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=true" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.2xlarge-spot" >> $GITHUB_OUTPUT
+            echo "runner_label=provisional-x86" >> $GITHUB_OUTPUT
+            echo "was_spot=true" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=true" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.2xlarge-ondemand" >> $GITHUB_OUTPUT
+            echo "runner_label=provisional-x86" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "is_provisional=false" >> $GITHUB_OUTPUT
+            echo "instance_type=none" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "::error::All x86 launch attempts failed"
+          fi
+
+      - name: Wait for x86 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          if [[ "${{ steps.result.outputs.is_provisional }}" == "true" ]]; then
+            echo "Waiting for x86 provisional runner (60s)..."
+            sleep 60
+          else
+            echo "Waiting for x86 metal runner (120s)..."
             sleep 120
           fi
 
   benchmark-arm64:
     name: Benchmark (ARM64)
-    needs: launch
-    if: needs.launch.outputs.arm64_launched == 'true'
-    runs-on: [self-hosted, "${{ needs.launch.outputs.runner_label_arm64 }}"]
-    timeout-minutes: 60
+    needs: launch-arm64
+    if: needs.launch-arm64.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.launch-arm64.outputs.runner_label }}"]
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.25.5"
 
-      - name: Build Server and Benchmark Tool
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          IS_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.launch-arm64.outputs.instance_type }}
         run: |
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-
-      - name: Run Benchmarks
-        env:
-          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
-          IS_PROVISIONAL: ${{ needs.launch.outputs.is_provisional }}
-        run: |
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            echo "Running PROVISIONAL benchmarks (c6g.2xlarge)"
+            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE"
           else
-            echo "Running OFFICIAL metal benchmarks (c6g.metal)"
+            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
           fi
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
 
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-arm64
           path: results/
           retention-days: 90
+          if-no-files-found: ignore
 
   benchmark-x86:
     name: Benchmark (x86)
-    needs: launch
-    if: needs.launch.outputs.x86_launched == 'true'
-    runs-on: [self-hosted, "${{ needs.launch.outputs.runner_label_x86 }}"]
-    timeout-minutes: 60
+    needs: launch-x86
+    if: needs.launch-x86.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.launch-x86.outputs.runner_label }}"]
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.25.5"
 
-      - name: Build Server and Benchmark Tool
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          IS_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.launch-x86.outputs.instance_type }}
         run: |
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-
-      - name: Run Benchmarks
-        env:
-          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
-          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
-          IS_PROVISIONAL: ${{ needs.launch.outputs.is_provisional }}
-        run: |
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            echo "Running PROVISIONAL benchmarks (c5.2xlarge)"
+            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE"
           else
-            echo "Running OFFICIAL metal benchmarks (c5.metal)"
+            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
           fi
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
 
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-x86
           path: results/
           retention-days: 90
+          if-no-files-found: ignore
+
+  # Retry ARM64 on on-demand if spot was terminated
+  retry-arm64:
+    name: Retry ARM64 (On-Demand)
+    needs: [authorize, launch-arm64, benchmark-arm64]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      needs.launch-arm64.outputs.launched == 'true' &&
+      needs.launch-arm64.outputs.was_spot == 'true' &&
+      needs.benchmark-arm64.result == 'failure'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      is_provisional: ${{ steps.result.outputs.is_provisional }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+      runner_label: ${{ steps.result.outputs.runner_label }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Cleanup Failed Spot Instance
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ needs.launch-arm64.outputs.benchmark_mode }}
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Cleaning up failed ARM64 spot instance..."
+          terraform destroy -auto-approve || true
+
+      - name: Launch ARM64 On-Demand
+        id: launch
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ needs.launch-arm64.outputs.benchmark_mode }}
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Launching ARM64 on-demand for retry (mode: $TF_VAR_benchmark_mode)..."
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand launched successfully for retry"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      - name: Set Retry Results
+        id: result
+        env:
+          ORIGINAL_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
+          ORIGINAL_MODE: ${{ needs.launch-arm64.outputs.benchmark_mode }}
+        run: |
+          if [[ "${{ steps.launch.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=$ORIGINAL_PROVISIONAL" >> $GITHUB_OUTPUT
+            if [[ "$ORIGINAL_MODE" == "metal" ]]; then
+              echo "instance_type=c6g.metal-ondemand" >> $GITHUB_OUTPUT
+              echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            else
+              echo "instance_type=c6g.2xlarge-ondemand" >> $GITHUB_OUTPUT
+              echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "::error::ARM64 on-demand retry launch failed"
+          fi
+
+      - name: Wait for ARM64 Runner
+        if: steps.result.outputs.launched == 'true'
+        env:
+          ORIGINAL_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
+        run: |
+          if [[ "$ORIGINAL_PROVISIONAL" == "true" ]]; then
+            echo "Waiting for ARM64 provisional on-demand runner (60s)..."
+            sleep 60
+          else
+            echo "Waiting for ARM64 metal on-demand runner (120s)..."
+            sleep 120
+          fi
+
+  # Retry x86 on on-demand if spot was terminated
+  retry-x86:
+    name: Retry x86 (On-Demand)
+    needs: [authorize, launch-x86, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      needs.launch-x86.outputs.launched == 'true' &&
+      needs.launch-x86.outputs.was_spot == 'true' &&
+      needs.benchmark-x86.result == 'failure'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      is_provisional: ${{ steps.result.outputs.is_provisional }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+      runner_label: ${{ steps.result.outputs.runner_label }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Cleanup Failed Spot Instance
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ needs.launch-x86.outputs.benchmark_mode }}
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Cleaning up failed x86 spot instance..."
+          terraform destroy -auto-approve || true
+
+      - name: Launch x86 On-Demand
+        id: launch
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: ${{ needs.launch-x86.outputs.benchmark_mode }}
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Launching x86 on-demand for retry (mode: $TF_VAR_benchmark_mode)..."
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 on-demand launched successfully for retry"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 on-demand failed with exit code $EXIT_CODE"
+          fi
+
+      - name: Set Retry Results
+        id: result
+        env:
+          ORIGINAL_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
+          ORIGINAL_MODE: ${{ needs.launch-x86.outputs.benchmark_mode }}
+        run: |
+          if [[ "${{ steps.launch.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=$ORIGINAL_PROVISIONAL" >> $GITHUB_OUTPUT
+            if [[ "$ORIGINAL_MODE" == "metal" ]]; then
+              echo "instance_type=c5.metal-ondemand" >> $GITHUB_OUTPUT
+              echo "runner_label=metal-x86" >> $GITHUB_OUTPUT
+            else
+              echo "instance_type=c5.2xlarge-ondemand" >> $GITHUB_OUTPUT
+              echo "runner_label=provisional-x86" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "::error::x86 on-demand retry launch failed"
+          fi
+
+      - name: Wait for x86 Runner
+        if: steps.result.outputs.launched == 'true'
+        env:
+          ORIGINAL_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
+        run: |
+          if [[ "$ORIGINAL_PROVISIONAL" == "true" ]]; then
+            echo "Waiting for x86 provisional on-demand runner (60s)..."
+            sleep 60
+          else
+            echo "Waiting for x86 metal on-demand runner (120s)..."
+            sleep 120
+          fi
+
+  # Retry benchmark on ARM64 on-demand - continues from checkpoint
+  retry-benchmark-arm64:
+    name: Retry Benchmark (ARM64)
+    needs: [launch-arm64, retry-arm64, benchmark-arm64]
+    if: |
+      always() &&
+      needs.retry-arm64.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.retry-arm64.outputs.runner_label }}"]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download Previous Checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-arm64
+          path: results/
+        continue-on-error: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Build and Resume
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          IS_PROVISIONAL: ${{ needs.retry-arm64.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.retry-arm64.outputs.instance_type }}
+        run: |
+          echo "RETRY: Resuming benchmark on ARM64 on-demand instance"
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+
+          if [[ "$IS_PROVISIONAL" == "true" ]]; then
+            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE (retry)"
+          else
+            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE (retry)"
+          fi
+
+          # Check if checkpoint exists and resume from it
+          if [ -f results/checkpoint-arm64.json ]; then
+            echo "Found checkpoint, resuming from previous progress..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8 -resume
+          else
+            echo "No checkpoint found, starting fresh..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-arm64-retry
+          path: results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # Retry benchmark on x86 on-demand - continues from checkpoint
+  retry-benchmark-x86:
+    name: Retry Benchmark (x86)
+    needs: [launch-x86, retry-x86, benchmark-x86]
+    if: |
+      always() &&
+      needs.retry-x86.outputs.launched == 'true'
+    runs-on: [self-hosted, "${{ needs.retry-x86.outputs.runner_label }}"]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download Previous Checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-x86
+          path: results/
+        continue-on-error: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Build and Resume
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          IS_PROVISIONAL: ${{ needs.retry-x86.outputs.is_provisional }}
+          INSTANCE_TYPE: ${{ needs.retry-x86.outputs.instance_type }}
+        run: |
+          echo "RETRY: Resuming benchmark on x86 on-demand instance"
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+
+          if [[ "$IS_PROVISIONAL" == "true" ]]; then
+            echo "Running PROVISIONAL benchmarks on $INSTANCE_TYPE (retry)"
+          else
+            echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE (retry)"
+          fi
+
+          # Check if checkpoint exists and resume from it
+          if [ -f results/checkpoint-x86.json ]; then
+            echo "Found checkpoint, resuming from previous progress..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8 -resume
+          else
+            echo "No checkpoint found, starting fresh..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-x86-retry
+          path: results/
+          retention-days: 90
+          if-no-files-found: ignore
 
   report:
     name: Generate Report
-    needs: [launch, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch-arm64, launch-x86, benchmark-arm64, benchmark-x86, retry-arm64, retry-x86, retry-benchmark-arm64, retry-benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success' ||
+       needs.retry-benchmark-arm64.result == 'success' || needs.retry-benchmark-x86.result == 'success')
     permissions:
       contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download ARM64 Results
         uses: actions/download-artifact@v4
         with:
           name: benchmark-results-arm64
           path: downloaded/arm64
+        continue-on-error: true
+
+      - name: Download ARM64 Retry Results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-arm64-retry
+          path: downloaded/arm64-retry
         continue-on-error: true
 
       - name: Download x86 Results
@@ -340,6 +952,13 @@ jobs:
           path: downloaded/x86
         continue-on-error: true
 
+      - name: Download x86 Retry Results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-x86-retry
+          path: downloaded/x86-retry
+        continue-on-error: true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -347,151 +966,295 @@ jobs:
 
       - name: Generate Charts and Organize Results
         env:
-          IS_PROVISIONAL: ${{ needs.launch.outputs.is_provisional }}
-          INSTANCE_MODE: ${{ needs.launch.outputs.instance_mode }}
+          ARM64_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
+          ARM64_INSTANCE: ${{ needs.launch-arm64.outputs.instance_type }}
+          ARM64_RETRY_PROVISIONAL: ${{ needs.retry-arm64.outputs.is_provisional }}
+          ARM64_RETRY_INSTANCE: ${{ needs.retry-arm64.outputs.instance_type }}
+          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.result == 'success' }}
+          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
+          X86_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
+          X86_INSTANCE: ${{ needs.launch-x86.outputs.instance_type }}
+          X86_RETRY_PROVISIONAL: ${{ needs.retry-x86.outputs.is_provisional }}
+          X86_RETRY_INSTANCE: ${{ needs.retry-x86.outputs.instance_type }}
+          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.result == 'success' }}
+          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.result == 'success' }}
+          IS_RELEASE: ${{ github.event_name == 'release' }}
+          VERSION: ${{ github.event.release.tag_name || 'latest' }}
         run: |
           pip install matplotlib numpy
 
-          # Determine output directory based on provisional status
-          if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            OUTPUT_DIR="results/provisional"
-            echo "Storing results as PROVISIONAL (will need promotion to official)"
+          # Determine which ARM64 results to use and final status
+          if [[ "$ARM64_RETRY_SUCCESS" == "true" ]]; then
+            ARM64_SOURCE="downloaded/arm64-retry"
+            ARM64_FINAL_PROVISIONAL="$ARM64_RETRY_PROVISIONAL"
+            ARM64_FINAL_INSTANCE="$ARM64_RETRY_INSTANCE"
+            echo "Using ARM64 retry results"
           else
-            OUTPUT_DIR="results/latest"
-            echo "Storing results as OFFICIAL"
+            ARM64_SOURCE="downloaded/arm64"
+            ARM64_FINAL_PROVISIONAL="$ARM64_PROVISIONAL"
+            ARM64_FINAL_INSTANCE="$ARM64_INSTANCE"
+            echo "Using ARM64 original results"
           fi
 
-          mkdir -p "$OUTPUT_DIR/arm64" "$OUTPUT_DIR/x86"
+          # Determine which x86 results to use and final status
+          if [[ "$X86_RETRY_SUCCESS" == "true" ]]; then
+            X86_SOURCE="downloaded/x86-retry"
+            X86_FINAL_PROVISIONAL="$X86_RETRY_PROVISIONAL"
+            X86_FINAL_INSTANCE="$X86_RETRY_INSTANCE"
+            echo "Using x86 retry results"
+          else
+            X86_SOURCE="downloaded/x86"
+            X86_FINAL_PROVISIONAL="$X86_PROVISIONAL"
+            X86_FINAL_INSTANCE="$X86_INSTANCE"
+            echo "Using x86 original results"
+          fi
+
+          # Determine folder names based on provisional status
+          if [[ "$ARM64_FINAL_PROVISIONAL" == "true" ]]; then
+            ARM64_FOLDER="arm64-provisional"
+          else
+            ARM64_FOLDER="arm64"
+          fi
+
+          if [[ "$X86_FINAL_PROVISIONAL" == "true" ]]; then
+            X86_FOLDER="x86-provisional"
+          else
+            X86_FOLDER="x86"
+          fi
+
+          echo "ARM64 folder: $ARM64_FOLDER (instance: $ARM64_FINAL_INSTANCE)"
+          echo "x86 folder: $X86_FOLDER (instance: $X86_FINAL_INSTANCE)"
+
+          # Create output directories
+          mkdir -p "results/latest/$ARM64_FOLDER" "results/latest/$X86_FOLDER"
 
           # Process ARM64 results
-          if [ -d "downloaded/arm64" ]; then
-            ARM64_JSON=$(find downloaded/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
-            if [ -n "$ARM64_JSON" ]; then
-              ARM64_DIR=$(dirname "$ARM64_JSON")
-              echo "Found ARM64 results in: $ARM64_DIR"
-              python scripts/generate_charts.py "$ARM64_DIR" "$OUTPUT_DIR/arm64"
-              cp "$ARM64_DIR"/*.json "$OUTPUT_DIR/arm64/" 2>/dev/null || true
-            fi
+          ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+          if [ -n "$ARM64_JSON" ]; then
+            ARM64_DIR=$(dirname "$ARM64_JSON")
+            echo "Processing ARM64 results from: $ARM64_DIR"
+            python scripts/generate_charts.py "$ARM64_DIR" "results/latest/$ARM64_FOLDER"
+            cp "$ARM64_DIR"/*.json "results/latest/$ARM64_FOLDER/" 2>/dev/null || true
           fi
 
           # Process x86 results
-          if [ -d "downloaded/x86" ]; then
-            X86_JSON=$(find downloaded/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
-            if [ -n "$X86_JSON" ]; then
-              X86_DIR=$(dirname "$X86_JSON")
-              echo "Found x86 results in: $X86_DIR"
-              python scripts/generate_charts.py "$X86_DIR" "$OUTPUT_DIR/x86"
-              cp "$X86_DIR"/*.json "$OUTPUT_DIR/x86/" 2>/dev/null || true
-            fi
+          X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+          if [ -n "$X86_JSON" ]; then
+            X86_DIR=$(dirname "$X86_JSON")
+            echo "Processing x86 results from: $X86_DIR"
+            python scripts/generate_charts.py "$X86_DIR" "results/latest/$X86_FOLDER"
+            cp "$X86_DIR"/*.json "results/latest/$X86_FOLDER/" 2>/dev/null || true
           fi
 
-          # Add metadata
-          echo "Last updated: $(date -u)" > "$OUTPUT_DIR/TIMESTAMP"
-          echo "Triggered by: ${{ github.actor }}" >> "$OUTPUT_DIR/TIMESTAMP"
-          echo "Event: ${{ github.event_name }}" >> "$OUTPUT_DIR/TIMESTAMP"
-          echo "Instance mode: $INSTANCE_MODE" >> "$OUTPUT_DIR/TIMESTAMP"
-          echo "Provisional: $IS_PROVISIONAL" >> "$OUTPUT_DIR/TIMESTAMP"
+          # Create metadata
+          cat > "results/latest/BENCHMARK_INFO.json" << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "triggered_by": "${{ github.actor }}",
+            "event": "${{ github.event_name }}",
+            "version": "$VERSION",
+            "arm64": {
+              "status": "$([ "$ARM64_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official")",
+              "instance_type": "$ARM64_FINAL_INSTANCE",
+              "folder": "$ARM64_FOLDER"
+            },
+            "x86": {
+              "status": "$([ "$X86_FINAL_PROVISIONAL" == "true" ] && echo "provisional" || echo "official")",
+              "instance_type": "$X86_FINAL_INSTANCE",
+              "folder": "$X86_FOLDER"
+            }
+          }
+          EOF
+
+          # For releases, also create version folder
+          if [[ "$IS_RELEASE" == "true" && -n "$VERSION" ]]; then
+            mkdir -p "results/$VERSION"
+            cp -r "results/latest/$ARM64_FOLDER" "results/$VERSION/" 2>/dev/null || true
+            cp -r "results/latest/$X86_FOLDER" "results/$VERSION/" 2>/dev/null || true
+            cp "results/latest/BENCHMARK_INFO.json" "results/$VERSION/" 2>/dev/null || true
+          fi
+
+          # Update provisional status tracking file
+          PROV_FILE="results/PROVISIONAL_STATUS.json"
+          if [ ! -f "$PROV_FILE" ]; then
+            echo "{}" > "$PROV_FILE"
+          fi
+
+          # Update status using Python for proper JSON handling
+          python3 << PYEOF
+          import json
+          import os
+
+          prov_file = "$PROV_FILE"
+          version = "$VERSION"
+          arm64_prov = "$ARM64_FINAL_PROVISIONAL" == "true"
+          x86_prov = "$X86_FINAL_PROVISIONAL" == "true"
+          arm64_inst = "$ARM64_FINAL_INSTANCE"
+          x86_inst = "$X86_FINAL_INSTANCE"
+
+          try:
+              with open(prov_file, 'r') as f:
+                  data = json.load(f)
+          except:
+              data = {}
+
+          data[version] = {
+              "arm64": {
+                  "provisional": arm64_prov,
+                  "instance_type": arm64_inst
+              },
+              "x86": {
+                  "provisional": x86_prov,
+                  "instance_type": x86_inst
+              }
+          }
+
+          with open(prov_file, 'w') as f:
+              json.dump(data, f, indent=2)
+
+          print(f"Updated {prov_file} for version {version}")
+          PYEOF
 
           # Export for later steps
-          echo "OUTPUT_DIR=$OUTPUT_DIR" >> $GITHUB_ENV
+          echo "ARM64_FOLDER=$ARM64_FOLDER" >> $GITHUB_ENV
+          echo "X86_FOLDER=$X86_FOLDER" >> $GITHUB_ENV
+          echo "ARM64_FINAL_PROVISIONAL=$ARM64_FINAL_PROVISIONAL" >> $GITHUB_ENV
+          echo "ARM64_FINAL_INSTANCE=$ARM64_FINAL_INSTANCE" >> $GITHUB_ENV
+          echo "X86_FINAL_PROVISIONAL=$X86_FINAL_PROVISIONAL" >> $GITHUB_ENV
+          echo "X86_FINAL_INSTANCE=$X86_FINAL_INSTANCE" >> $GITHUB_ENV
 
       - name: Upload Charts
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-charts
-          path: ${{ env.OUTPUT_DIR }}/
+          path: results/latest/
           retention-days: 365
 
       - name: Commit Results
         env:
-          IS_PROVISIONAL: ${{ needs.launch.outputs.is_provisional }}
+          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          VERSION: ${{ github.event.release.tag_name || '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            git add -f results/provisional/
-          else
-            git add -f results/latest/
+          # Add all results
+          git add -f results/latest/
+          git add -f results/PROVISIONAL_STATUS.json
 
-            # For releases, also create version folder
-            if [ "${{ github.event_name }}" == "release" ]; then
-              VERSION="${{ github.event.release.tag_name }}"
-              mkdir -p "results/${VERSION}/arm64" "results/${VERSION}/x86"
-
-              if [ -d "results/latest/arm64" ]; then
-                cp -r results/latest/arm64/* "results/${VERSION}/arm64/" 2>/dev/null || true
-              fi
-              if [ -d "results/latest/x86" ]; then
-                cp -r results/latest/x86/* "results/${VERSION}/x86/" 2>/dev/null || true
-              fi
-
-              echo "Release: ${VERSION}" > "results/${VERSION}/RELEASE_INFO"
-              echo "Date: $(date -u)" >> "results/${VERSION}/RELEASE_INFO"
-              git add -f "results/${VERSION}/"
-            fi
+          # For releases, also add version folder
+          if [ -n "$VERSION" ] && [ -d "results/$VERSION" ]; then
+            git add -f "results/$VERSION/"
           fi
 
           git commit -m "chore: update benchmark results [skip ci]" || echo "No changes to commit"
+
+          # Use PAT for push to bypass branch protection rules
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git push || echo "Push failed (may need permissions)"
 
       - name: Create Summary
-        env:
-          IS_PROVISIONAL: ${{ needs.launch.outputs.is_provisional }}
-          INSTANCE_MODE: ${{ needs.launch.outputs.instance_mode }}
         run: |
-          if [[ "$IS_PROVISIONAL" == "true" ]]; then
-            echo "# PROVISIONAL Benchmark Results" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> **Warning**: These results are PROVISIONAL (run on $INSTANCE_MODE)." >> $GITHUB_STEP_SUMMARY
-            echo "> Metal instances were unavailable. Run the **Promote Provisional** workflow when metal quota is available." >> $GITHUB_STEP_SUMMARY
+          echo "# Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # ARM64 status
+          if [[ "$ARM64_FINAL_PROVISIONAL" == "true" ]]; then
+            echo "## ARM64 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
+            echo "> Run on **$ARM64_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
           else
-            echo "# Official Metal Benchmark Results" >> $GITHUB_STEP_SUMMARY
+            echo "## ARM64 Results (Official)" >> $GITHUB_STEP_SUMMARY
+            echo "> Run on **$ARM64_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
           fi
-
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Instance mode**: $INSTANCE_MODE" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
-          if [ -f "${{ env.OUTPUT_DIR }}/arm64/summary_arm64.md" ]; then
-            cat "${{ env.OUTPUT_DIR }}/arm64/summary_arm64.md" >> $GITHUB_STEP_SUMMARY
+          if [ -f "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" ]; then
+            cat "results/latest/${{ env.ARM64_FOLDER }}/summary_arm64.md" >> $GITHUB_STEP_SUMMARY
           else
             echo "No ARM64 results available" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## x86 Results" >> $GITHUB_STEP_SUMMARY
-          if [ -f "${{ env.OUTPUT_DIR }}/x86/summary_x86.md" ]; then
-            cat "${{ env.OUTPUT_DIR }}/x86/summary_x86.md" >> $GITHUB_STEP_SUMMARY
+
+          # x86 status
+          if [[ "$X86_FINAL_PROVISIONAL" == "true" ]]; then
+            echo "## x86 Results (PROVISIONAL)" >> $GITHUB_STEP_SUMMARY
+            echo "> Run on **$X86_FINAL_INSTANCE** - not official metal results" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## x86 Results (Official)" >> $GITHUB_STEP_SUMMARY
+            echo "> Run on **$X86_FINAL_INSTANCE**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" ]; then
+            cat "results/latest/${{ env.X86_FOLDER }}/summary_x86.md" >> $GITHUB_STEP_SUMMARY
           else
             echo "No x86 results available" >> $GITHUB_STEP_SUMMARY
           fi
 
-  cleanup:
-    name: Cleanup Infrastructure
-    needs: [launch, benchmark-arm64, benchmark-x86]
+          # Note about provisional
+          if [[ "$ARM64_FINAL_PROVISIONAL" == "true" || "$X86_FINAL_PROVISIONAL" == "true" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "**Note**: Some results are provisional. Run the **Promote Provisional** workflow when metal quota is available." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  cleanup-arm64:
+    name: Cleanup ARM64 Infrastructure
+    needs: [authorize, launch-arm64, benchmark-arm64, retry-arm64, retry-benchmark-arm64]
     runs-on: ubuntu-latest
-    if: always()
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.launch-arm64.outputs.launched == 'true' || needs.retry-arm64.outputs.launched == 'true')
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
-      - name: Terraform Destroy
+      - name: Terraform Destroy ARM64
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_provisional: ${{ contains(needs.launch.outputs.instance_mode, 'provisional') && 'true' || 'false' }}
-          TF_VAR_use_on_demand: ${{ contains(needs.launch.outputs.instance_mode, 'ondemand') && 'true' || 'false' }}
+          TF_VAR_launch_arm64_only: "true"
         run: |
           terraform init
+          # Try destroying both spot and on-demand resources
+          terraform destroy -auto-approve || true
+
+  cleanup-x86:
+    name: Cleanup x86 Infrastructure
+    needs: [authorize, launch-x86, benchmark-x86, retry-x86, retry-benchmark-x86]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.authorize.outputs.authorized == 'true' &&
+      (needs.launch-x86.outputs.launched == 'true' || needs.retry-x86.outputs.launched == 'true')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Destroy x86
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          terraform init
+          # Try destroying both spot and on-demand resources
           terraform destroy -auto-approve || true

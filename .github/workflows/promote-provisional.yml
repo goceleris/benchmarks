@@ -1,11 +1,31 @@
 name: Promote Provisional Results
 
 # Promotes provisional benchmark results to official by re-running on metal
-# Only runs on metal - fails if metal instances are unavailable
+# Can target specific versions and architectures
+#
+# Key features:
+# - Runs benchmarks from the specific tag's code (version coherence)
+# - Only updates results/latest/ if promoting the most recent version
+# - Supports promoting individual architectures (arm64, x86, or both)
+#
+# Security: Only authorized users can trigger (to protect AWS resources)
 
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "Version to promote (e.g., v0.1.0, or 'latest')"
+        required: true
+        default: "latest"
+      architecture:
+        description: "Architecture to promote"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - arm64
+          - x86
+          - both
       duration:
         description: "Benchmark duration (e.g., 30s, 60s)"
         required: false
@@ -21,7 +41,7 @@ on:
           - all
 
 concurrency:
-  group: promote-provisional
+  group: promote-provisional-${{ github.event.inputs.version }}
   cancel-in-progress: false
 
 env:
@@ -29,51 +49,165 @@ env:
   TF_VAR_benchmark_mode: metal
 
 jobs:
-  check-provisional:
-    name: Check for Provisional Results
+  authorize:
+    name: Authorize Caller
     runs-on: ubuntu-latest
     outputs:
-      has_provisional: ${{ steps.check.outputs.has_provisional }}
-
+      authorized: ${{ steps.check.outputs.authorized }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check for Provisional Results
+      - name: Check Permissions
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -d "results/provisional" ] && [ "$(ls -A results/provisional 2>/dev/null)" ]; then
-            echo "Found provisional results to promote"
-            echo "has_provisional=true" >> $GITHUB_OUTPUT
-            cat results/provisional/TIMESTAMP || true
+          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+          echo "User: ${{ github.actor }}"
+          echo "Permission level: $PERMISSION"
+          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            echo "User ${{ github.actor }} authorized with permission: $PERMISSION"
           else
-            echo "No provisional results found"
-            echo "has_provisional=false" >> $GITHUB_OUTPUT
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "::error::Unauthorized: Only maintainers and owners can promote results"
+            exit 1
           fi
 
-  launch-metal:
-    name: Launch Metal Infrastructure
+  check-provisional:
+    name: Check Provisional Status
     runs-on: ubuntu-latest
-    needs: check-provisional
-    if: needs.check-provisional.outputs.has_provisional == 'true'
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
     outputs:
-      launched: ${{ steps.result.outputs.launched }}
-      instance_mode: ${{ steps.result.outputs.instance_mode }}
+      arm64_needs_promotion: ${{ steps.check.outputs.arm64_needs_promotion }}
+      x86_needs_promotion: ${{ steps.check.outputs.x86_needs_promotion }}
+      target_ref: ${{ steps.check.outputs.target_ref }}
+      is_latest_version: ${{ steps.check.outputs.is_latest_version }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check Provisional Status
+        id: check
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          ARCHITECTURE: ${{ github.event.inputs.architecture }}
+        run: |
+          echo "Checking provisional status for version: $VERSION, architecture: $ARCHITECTURE"
+
+          # Determine target ref (tag or main for 'latest')
+          if [[ "$VERSION" == "latest" ]]; then
+            TARGET_REF="main"
+            echo "target_ref=main" >> $GITHUB_OUTPUT
+          else
+            # Check if tag exists
+            if git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+              TARGET_REF="$VERSION"
+              echo "target_ref=$VERSION" >> $GITHUB_OUTPUT
+            else
+              echo "::error::Version tag $VERSION not found"
+              exit 1
+            fi
+          fi
+
+          # Check if this is the latest version
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [[ "$VERSION" == "latest" || "$VERSION" == "$LATEST_TAG" ]]; then
+            echo "is_latest_version=true" >> $GITHUB_OUTPUT
+            echo "This is the latest version - will update results/latest/"
+          else
+            echo "is_latest_version=false" >> $GITHUB_OUTPUT
+            echo "This is NOT the latest version - will only update results/$VERSION/"
+          fi
+
+          # Check provisional status from tracking file
+          PROV_FILE="results/PROVISIONAL_STATUS.json"
+          if [ -f "$PROV_FILE" ]; then
+            ARM64_PROV=$(python3 -c "
+          import json
+          with open('$PROV_FILE') as f:
+              data = json.load(f)
+          v = data.get('$VERSION', data.get('latest', {}))
+          print('true' if v.get('arm64', {}).get('provisional', False) else 'false')
+          " 2>/dev/null || echo "false")
+
+            X86_PROV=$(python3 -c "
+          import json
+          with open('$PROV_FILE') as f:
+              data = json.load(f)
+          v = data.get('$VERSION', data.get('latest', {}))
+          print('true' if v.get('x86', {}).get('provisional', False) else 'false')
+          " 2>/dev/null || echo "false")
+          else
+            # Check by folder naming convention
+            if [ -d "results/$VERSION/arm64-provisional" ] || [ -d "results/latest/arm64-provisional" ]; then
+              ARM64_PROV="true"
+            else
+              ARM64_PROV="false"
+            fi
+
+            if [ -d "results/$VERSION/x86-provisional" ] || [ -d "results/latest/x86-provisional" ]; then
+              X86_PROV="true"
+            else
+              X86_PROV="false"
+            fi
+          fi
+
+          echo "ARM64 provisional: $ARM64_PROV"
+          echo "x86 provisional: $X86_PROV"
+
+          # Determine what needs promotion based on input
+          if [[ "$ARCHITECTURE" == "arm64" || "$ARCHITECTURE" == "both" ]]; then
+            if [[ "$ARM64_PROV" == "true" ]]; then
+              echo "arm64_needs_promotion=true" >> $GITHUB_OUTPUT
+            else
+              echo "arm64_needs_promotion=false" >> $GITHUB_OUTPUT
+              echo "::notice::ARM64 is already official for $VERSION"
+            fi
+          else
+            echo "arm64_needs_promotion=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [[ "$ARCHITECTURE" == "x86" || "$ARCHITECTURE" == "both" ]]; then
+            if [[ "$X86_PROV" == "true" ]]; then
+              echo "x86_needs_promotion=true" >> $GITHUB_OUTPUT
+            else
+              echo "x86_needs_promotion=false" >> $GITHUB_OUTPUT
+              echo "::notice::x86 is already official for $VERSION"
+            fi
+          else
+            echo "x86_needs_promotion=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Launch ARM64 metal for promotion
+  launch-arm64:
+    name: Launch ARM64 Metal
+    runs-on: ubuntu-latest
+    needs: [authorize, check-provisional]
+    if: needs.authorize.outputs.authorized == 'true' && needs.check-provisional.outputs.arm64_needs_promotion == 'true'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.check-provisional.outputs.target_ref }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
 
-      - name: Try Metal Spot
+      - name: Try ARM64 Metal Spot
         id: metal_spot
         continue-on-error: true
         working-directory: terraform
@@ -81,24 +215,28 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting metal spot instances..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 metal spot (c6g.metal)..."
+          if terraform apply -auto-approve 2>&1; then
             echo "success=true" >> $GITHUB_OUTPUT
           else
             echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Cleanup for Metal On-Demand
+      - name: Cleanup ARM64 Metal Spot
         if: steps.metal_spot.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
         run: terraform destroy -auto-approve || true
 
-      - name: Try Metal On-Demand
+      - name: Try ARM64 Metal On-Demand
         id: metal_ondemand
         if: steps.metal_spot.outputs.success != 'true'
         continue-on-error: true
@@ -107,62 +245,162 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
           TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting metal on-demand instances..."
-          if terraform apply -auto-approve; then
+          echo "Attempting ARM64 metal on-demand (c6g.metal)..."
+          if terraform apply -auto-approve 2>&1; then
             echo "success=true" >> $GITHUB_OUTPUT
           else
             echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Set Launch Results
+      - name: Set ARM64 Launch Results
         id: result
         run: |
           if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=metal-spot" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.metal-spot" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=metal-ondemand" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.metal-ondemand" >> $GITHUB_OUTPUT
           else
             echo "launched=false" >> $GITHUB_OUTPUT
-            echo "instance_mode=none" >> $GITHUB_OUTPUT
-            echo "::error::Metal instances unavailable. Cannot promote provisional results."
-            echo "::error::Please request AWS quota increase for c5.metal (96 vCPUs) and c6g.metal (64 vCPUs)"
-            exit 1
+            echo "instance_type=none" >> $GITHUB_OUTPUT
+            echo "::error::ARM64 metal instances unavailable. Cannot promote."
           fi
 
-      - name: Wait for Metal Runners
+      - name: Wait for ARM64 Runner
+        if: steps.result.outputs.launched == 'true'
         run: |
-          echo "Waiting for metal runners to register (120s)..."
+          echo "Waiting for ARM64 metal runner (120s)..."
+          sleep 120
+
+  # Launch x86 metal for promotion
+  launch-x86:
+    name: Launch x86 Metal
+    runs-on: ubuntu-latest
+    needs: [authorize, check-provisional]
+    if: needs.authorize.outputs.authorized == 'true' && needs.check-provisional.outputs.x86_needs_promotion == 'true'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      instance_type: ${{ steps.result.outputs.instance_type }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.check-provisional.outputs.target_ref }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Try x86 Metal Spot
+        id: metal_spot
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 metal spot (c5.metal)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cleanup x86 Metal Spot
+        if: steps.metal_spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_x86_only: "true"
+        run: terraform destroy -auto-approve || true
+
+      - name: Try x86 Metal On-Demand
+        id: metal_ondemand
+        if: steps.metal_spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 metal on-demand (c5.metal)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set x86 Launch Results
+        id: result
+        run: |
+          if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.metal-spot" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_type=c5.metal-ondemand" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "instance_type=none" >> $GITHUB_OUTPUT
+            echo "::error::x86 metal instances unavailable. Cannot promote."
+          fi
+
+      - name: Wait for x86 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          echo "Waiting for x86 metal runner (120s)..."
           sleep 120
 
   benchmark-arm64:
     name: Metal Benchmark (ARM64)
-    needs: launch-metal
-    if: needs.launch-metal.outputs.launched == 'true'
+    needs: [check-provisional, launch-arm64]
+    if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, metal-arm64]
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Target Version
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.check-provisional.outputs.target_ref }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.25.5"
 
       - name: Build and Run
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-          echo "Running OFFICIAL metal benchmarks to replace provisional results"
+          echo "Running OFFICIAL metal benchmarks for $VERSION promotion"
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
 
       - name: Upload Results
@@ -174,29 +412,32 @@ jobs:
 
   benchmark-x86:
     name: Metal Benchmark (x86)
-    needs: launch-metal
-    if: needs.launch-metal.outputs.launched == 'true'
+    needs: [check-provisional, launch-x86]
+    if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, metal-x86]
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Target Version
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.check-provisional.outputs.target_ref }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.25.5"
 
       - name: Build and Run
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-          echo "Running OFFICIAL metal benchmarks to replace provisional results"
+          echo "Running OFFICIAL metal benchmarks for $VERSION promotion"
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
 
       - name: Upload Results
@@ -207,18 +448,21 @@ jobs:
           retention-days: 90
 
   promote:
-    name: Promote to Official
-    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+    name: Promote Results
+    needs: [authorize, check-provisional, launch-arm64, launch-x86, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
+    if: always() && needs.authorize.outputs.authorized == 'true' && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Main
+        uses: actions/checkout@v6
+        with:
+          ref: main
 
       - name: Download ARM64 Results
+        if: needs.benchmark-arm64.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: metal-results-arm64
@@ -226,6 +470,7 @@ jobs:
         continue-on-error: true
 
       - name: Download x86 Results
+        if: needs.benchmark-x86.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: metal-results-x86
@@ -237,107 +482,295 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate Charts and Promote
+      - name: Promote Results
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          IS_LATEST: ${{ needs.check-provisional.outputs.is_latest_version }}
+          ARM64_PROMOTED: ${{ needs.benchmark-arm64.result == 'success' }}
+          ARM64_INSTANCE: ${{ needs.launch-arm64.outputs.instance_type }}
+          X86_PROMOTED: ${{ needs.benchmark-x86.result == 'success' }}
+          X86_INSTANCE: ${{ needs.launch-x86.outputs.instance_type }}
         run: |
           pip install matplotlib numpy
 
-          mkdir -p results/latest/arm64 results/latest/x86
+          echo "Promoting results for version: $VERSION"
+          echo "Is latest version: $IS_LATEST"
+          echo "ARM64 promoted: $ARM64_PROMOTED (instance: $ARM64_INSTANCE)"
+          echo "x86 promoted: $X86_PROMOTED (instance: $X86_INSTANCE)"
 
-          # Process ARM64 results
-          if [ -d "downloaded/arm64" ]; then
+          # Determine target directories
+          if [[ "$VERSION" == "latest" ]]; then
+            VERSION_DIR="results/latest"
+          else
+            VERSION_DIR="results/$VERSION"
+          fi
+
+          mkdir -p "$VERSION_DIR"
+
+          # Process ARM64 promotion
+          if [[ "$ARM64_PROMOTED" == "true" ]]; then
             ARM64_JSON=$(find downloaded/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
             if [ -n "$ARM64_JSON" ]; then
-              ARM64_DIR=$(dirname "$ARM64_JSON")
-              python scripts/generate_charts.py "$ARM64_DIR" results/latest/arm64
-              cp "$ARM64_DIR"/*.json results/latest/arm64/ 2>/dev/null || true
+              ARM64_SRC=$(dirname "$ARM64_JSON")
+
+              # Remove old provisional folder if exists
+              rm -rf "$VERSION_DIR/arm64-provisional" 2>/dev/null || true
+              rm -rf "$VERSION_DIR/arm64" 2>/dev/null || true
+
+              # Create new official folder
+              mkdir -p "$VERSION_DIR/arm64"
+              python scripts/generate_charts.py "$ARM64_SRC" "$VERSION_DIR/arm64"
+              cp "$ARM64_SRC"/*.json "$VERSION_DIR/arm64/" 2>/dev/null || true
+
+              echo "ARM64 promoted to official in $VERSION_DIR/arm64"
+
+              # Also update latest if this is the latest version
+              if [[ "$IS_LATEST" == "true" && "$VERSION" != "latest" ]]; then
+                rm -rf "results/latest/arm64-provisional" 2>/dev/null || true
+                rm -rf "results/latest/arm64" 2>/dev/null || true
+                mkdir -p "results/latest/arm64"
+                cp -r "$VERSION_DIR/arm64"/* "results/latest/arm64/"
+                echo "Also updated results/latest/arm64"
+              fi
             fi
           fi
 
-          # Process x86 results
-          if [ -d "downloaded/x86" ]; then
+          # Process x86 promotion
+          if [[ "$X86_PROMOTED" == "true" ]]; then
             X86_JSON=$(find downloaded/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
             if [ -n "$X86_JSON" ]; then
-              X86_DIR=$(dirname "$X86_JSON")
-              python scripts/generate_charts.py "$X86_DIR" results/latest/x86
-              cp "$X86_DIR"/*.json results/latest/x86/ 2>/dev/null || true
+              X86_SRC=$(dirname "$X86_JSON")
+
+              # Remove old provisional folder if exists
+              rm -rf "$VERSION_DIR/x86-provisional" 2>/dev/null || true
+              rm -rf "$VERSION_DIR/x86" 2>/dev/null || true
+
+              # Create new official folder
+              mkdir -p "$VERSION_DIR/x86"
+              python scripts/generate_charts.py "$X86_SRC" "$VERSION_DIR/x86"
+              cp "$X86_SRC"/*.json "$VERSION_DIR/x86/" 2>/dev/null || true
+
+              echo "x86 promoted to official in $VERSION_DIR/x86"
+
+              # Also update latest if this is the latest version
+              if [[ "$IS_LATEST" == "true" && "$VERSION" != "latest" ]]; then
+                rm -rf "results/latest/x86-provisional" 2>/dev/null || true
+                rm -rf "results/latest/x86" 2>/dev/null || true
+                mkdir -p "results/latest/x86"
+                cp -r "$VERSION_DIR/x86"/* "results/latest/x86/"
+                echo "Also updated results/latest/x86"
+              fi
             fi
           fi
 
-          # Add metadata
-          echo "Last updated: $(date -u)" > results/latest/TIMESTAMP
-          echo "Triggered by: ${{ github.actor }}" >> results/latest/TIMESTAMP
-          echo "Event: promote-provisional" >> results/latest/TIMESTAMP
-          echo "Instance mode: ${{ needs.launch-metal.outputs.instance_mode }}" >> results/latest/TIMESTAMP
-          echo "Promoted from provisional: true" >> results/latest/TIMESTAMP
+          # Update BENCHMARK_INFO.json for the version
+          python3 << PYEOF
+          import json
+          import os
+          from datetime import datetime
+
+          version = "$VERSION"
+          version_dir = "$VERSION_DIR"
+          arm64_promoted = "$ARM64_PROMOTED" == "true"
+          x86_promoted = "$X86_PROMOTED" == "true"
+          arm64_inst = "$ARM64_INSTANCE"
+          x86_inst = "$X86_INSTANCE"
+
+          info_file = f"{version_dir}/BENCHMARK_INFO.json"
+
+          # Load existing or create new
+          try:
+              with open(info_file, 'r') as f:
+                  info = json.load(f)
+          except:
+              info = {"version": version}
+
+          info["last_updated"] = datetime.utcnow().isoformat() + "Z"
+          info["promoted_by"] = "${{ github.actor }}"
+
+          if arm64_promoted:
+              info["arm64"] = {
+                  "status": "official",
+                  "instance_type": arm64_inst,
+                  "folder": "arm64",
+                  "promoted_at": datetime.utcnow().isoformat() + "Z"
+              }
+
+          if x86_promoted:
+              info["x86"] = {
+                  "status": "official",
+                  "instance_type": x86_inst,
+                  "folder": "x86",
+                  "promoted_at": datetime.utcnow().isoformat() + "Z"
+              }
+
+          with open(info_file, 'w') as f:
+              json.dump(info, f, indent=2)
+
+          print(f"Updated {info_file}")
+          PYEOF
+
+          # Update PROVISIONAL_STATUS.json
+          python3 << PYEOF
+          import json
+
+          prov_file = "results/PROVISIONAL_STATUS.json"
+          version = "$VERSION"
+          arm64_promoted = "$ARM64_PROMOTED" == "true"
+          x86_promoted = "$X86_PROMOTED" == "true"
+          arm64_inst = "$ARM64_INSTANCE"
+          x86_inst = "$X86_INSTANCE"
+
+          try:
+              with open(prov_file, 'r') as f:
+                  data = json.load(f)
+          except:
+              data = {}
+
+          if version not in data:
+              data[version] = {}
+
+          if arm64_promoted:
+              data[version]["arm64"] = {
+                  "provisional": False,
+                  "instance_type": arm64_inst
+              }
+
+          if x86_promoted:
+              data[version]["x86"] = {
+                  "provisional": False,
+                  "instance_type": x86_inst
+              }
+
+          with open(prov_file, 'w') as f:
+              json.dump(data, f, indent=2)
+
+          print(f"Updated {prov_file}")
+          PYEOF
 
       - name: Commit Promotion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Add new official results
-          git add -f results/latest/
+          # Add all results
+          git add -f results/
 
-          # Remove provisional results
-          if [ -d "results/provisional" ]; then
-            git rm -rf results/provisional || true
-          fi
+          COMMIT_MSG="chore: promote provisional results for $VERSION [skip ci]"
+          git commit -m "$COMMIT_MSG" || echo "No changes to commit"
 
-          git commit -m "chore: promote provisional results to official [skip ci]" || echo "No changes to commit"
+          # Use PAT for push to bypass branch protection rules
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git push || echo "Push failed"
 
       - name: Create Summary
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          IS_LATEST: ${{ needs.check-provisional.outputs.is_latest_version }}
+          ARM64_PROMOTED: ${{ needs.benchmark-arm64.result == 'success' }}
+          ARM64_INSTANCE: ${{ needs.launch-arm64.outputs.instance_type }}
+          X86_PROMOTED: ${{ needs.benchmark-x86.result == 'success' }}
+          X86_INSTANCE: ${{ needs.launch-x86.outputs.instance_type }}
         run: |
-          echo "# Provisional Results Promoted to Official" >> $GITHUB_STEP_SUMMARY
+          echo "# Promotion Results for $VERSION" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Provisional benchmark results have been replaced with official metal benchmark results." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Instance mode**: ${{ needs.launch-metal.outputs.instance_mode }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
-          [ -f "results/latest/arm64/summary_arm64.md" ] && cat results/latest/arm64/summary_arm64.md >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## x86 Results" >> $GITHUB_STEP_SUMMARY
-          [ -f "results/latest/x86/summary_x86.md" ] && cat results/latest/x86/summary_x86.md >> $GITHUB_STEP_SUMMARY
 
-  cleanup:
-    name: Cleanup Infrastructure
-    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+          if [[ "$ARM64_PROMOTED" == "true" ]]; then
+            echo "## ARM64: Promoted to Official" >> $GITHUB_STEP_SUMMARY
+            echo "- Instance: $ARM64_INSTANCE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ARM64: Not Promoted" >> $GITHUB_STEP_SUMMARY
+            echo "- Metal instances unavailable or not requested" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$X86_PROMOTED" == "true" ]]; then
+            echo "## x86: Promoted to Official" >> $GITHUB_STEP_SUMMARY
+            echo "- Instance: $X86_INSTANCE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## x86: Not Promoted" >> $GITHUB_STEP_SUMMARY
+            echo "- Metal instances unavailable or not requested" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$IS_LATEST" == "true" ]]; then
+            echo "**Note**: This is the latest version, so results/latest/ was also updated." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Note**: This is NOT the latest version, so only results/$VERSION/ was updated." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  cleanup-arm64:
+    name: Cleanup ARM64 Infrastructure
+    needs: [authorize, launch-arm64, benchmark-arm64]
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-arm64.outputs.launched == 'true'
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
-      - name: Terraform Destroy
+      - name: Terraform Destroy ARM64
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_on_demand: ${{ needs.launch-metal.outputs.instance_mode == 'metal-ondemand' && 'true' || 'false' }}
+          TF_VAR_launch_arm64_only: "true"
         run: |
           terraform init
           terraform destroy -auto-approve || true
 
-  no-provisional:
-    name: No Provisional Results
+  cleanup-x86:
+    name: Cleanup x86 Infrastructure
+    needs: [authorize, launch-x86, benchmark-x86]
     runs-on: ubuntu-latest
-    needs: check-provisional
-    if: needs.check-provisional.outputs.has_provisional != 'true'
+    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-x86.outputs.launched == 'true'
 
     steps:
-      - name: Report No Provisional
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Destroy x86
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
         run: |
-          echo "::notice::No provisional results found to promote."
-          echo "# No Provisional Results" >> $GITHUB_STEP_SUMMARY
+          terraform init
+          terraform destroy -auto-approve || true
+
+  no-promotion-needed:
+    name: Nothing to Promote
+    runs-on: ubuntu-latest
+    needs: [authorize, check-provisional]
+    if: |
+      needs.authorize.outputs.authorized == 'true' &&
+      needs.check-provisional.outputs.arm64_needs_promotion != 'true' &&
+      needs.check-provisional.outputs.x86_needs_promotion != 'true'
+
+    steps:
+      - name: Report
+        run: |
+          echo "::notice::No provisional results found to promote for the requested version/architecture."
+          echo "# Nothing to Promote" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "There are no provisional results to promote. Either:" >> $GITHUB_STEP_SUMMARY
-          echo "- No benchmarks have been run with provisional instances" >> $GITHUB_STEP_SUMMARY
-          echo "- Provisional results have already been promoted" >> $GITHUB_STEP_SUMMARY
+          echo "All requested results are already official, or no provisional results exist." >> $GITHUB_STEP_SUMMARY

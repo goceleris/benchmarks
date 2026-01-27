@@ -36,11 +36,11 @@ terraform/*.tfplan
 *.tfvars
 !terraform.tfvars.example
 
-# Results - ignore temporary benchmark outputs but keep official results
+# Results - ignore temporary benchmark outputs but keep official and provisional results
 results/*
 !results/latest/
-!results/provisional/
 !results/v*/
+!results/PROVISIONAL_STATUS.json
 !results/README.md
 
 # Logs

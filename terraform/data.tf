@@ -46,15 +46,10 @@ data "aws_caller_identity" "current" {}
 # Get current region
 data "aws_region" "current" {}
 
-# Fetch latest GitHub Actions runner version
-data "http" "runner_version" {
-  url = "https://api.github.com/repos/actions/runner/releases/latest"
-
-  request_headers = {
-    Accept = "application/vnd.github.v3+json"
-  }
-}
-
+# GitHub Actions runner version
+# Hardcoded to avoid GitHub API rate limit issues on shared runner IPs
+# Update periodically from: https://github.com/actions/runner/releases
+# Note: v2.327.1+ required for node24 support (used by actions/checkout@v6)
 locals {
-  runner_version = jsondecode(data.http.runner_version.response_body).tag_name
+  runner_version = "v2.331.0"
 }
