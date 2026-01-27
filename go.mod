@@ -36,15 +36,15 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
-	github.com/gomarkdown/markdown v0.0.0-20250810172220-2e2c11897d1a // indirect
+	github.com/gomarkdown/markdown v0.0.0-20240328165702-4d01890c35c0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/iris-contrib/schema v0.0.6 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kataras/blocks v0.0.12 // indirect
-	github.com/kataras/golog v0.1.15 // indirect
-	github.com/kataras/pio v0.0.14 // indirect
+	github.com/kataras/golog v0.1.11 // indirect
+	github.com/kataras/pio v0.0.13 // indirect
 	github.com/kataras/sitemap v0.0.6 // indirect
 	github.com/kataras/tunnel v0.0.4 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
@@ -78,7 +78,7 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/arch v0.23.0 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
+	golang.org/x/exp v0.0.0-20240404231335-c0f41cb1a7a0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
