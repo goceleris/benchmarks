@@ -12,20 +12,9 @@ REPOSITORY_URL="${repository_url}"
 GH_PAT="${gh_pat_runner_token}"
 RUNNER_VERSION="${runner_version}"
 
-# Get instance private IP and register with SSM for client discovery
+# Get instance private IP (for later SSM registration)
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 echo "Instance private IP: $PRIVATE_IP"
-
-# Write IP to SSM Parameter Store for client to discover
-# Parameter name includes architecture for multi-arch support
-SSM_PARAM="/celeris-benchmark/server-ip/$ARCHITECTURE"
-echo "Registering server IP in SSM: $SSM_PARAM"
-aws ssm put-parameter \
-    --name "$SSM_PARAM" \
-    --value "$PRIVATE_IP" \
-    --type String \
-    --overwrite \
-    --region us-east-1 || echo "Warning: Failed to register IP in SSM (may lack permissions)"
 
 # Derive repository owner and name from URL
 REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
@@ -33,7 +22,21 @@ REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
 echo "=== Installing Dependencies ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip
+apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip awscli
+
+# Register server IP in SSM for client discovery (optional, requires IAM permissions)
+SSM_PARAM="/celeris-benchmark/server-ip/$ARCHITECTURE"
+echo "Registering server IP in SSM: $SSM_PARAM"
+if aws ssm put-parameter \
+    --name "$SSM_PARAM" \
+    --value "$PRIVATE_IP" \
+    --type String \
+    --overwrite \
+    --region us-east-1 2>/dev/null; then
+    echo "Successfully registered IP in SSM"
+else
+    echo "Warning: Failed to register IP in SSM (may lack IAM permissions - this is optional)"
+fi
 
 # Install Go 1.22
 echo "=== Installing Go ==="
