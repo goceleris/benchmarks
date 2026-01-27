@@ -110,7 +110,8 @@ resource "aws_instance" "arm64_runner_ondemand" {
     OnDemand      = "true"
   }
 
-  instance_initiated_shutdown_behavior = "terminate"
+  # Note: instance_initiated_shutdown_behavior removed to avoid IAM permission errors
+  # The cleanup job handles termination via terraform destroy
 }
 
 # x86_64 On-Demand Instance (fallback)
@@ -147,5 +148,6 @@ resource "aws_instance" "x86_runner_ondemand" {
     OnDemand      = "true"
   }
 
-  instance_initiated_shutdown_behavior = "terminate"
+  # Note: instance_initiated_shutdown_behavior removed to avoid IAM permission errors
+  # The cleanup job handles termination via terraform destroy
 }

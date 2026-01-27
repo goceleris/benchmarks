@@ -69,6 +69,9 @@ func main() {
 	outputDir := flag.String("output", "results", "Output directory for results")
 	port := flag.String("port", "8080", "Server port")
 	serverBin := flag.String("server-bin", "", "Path to server binary (auto-detect if empty)")
+	checkpointFile := flag.String("checkpoint", "", "Checkpoint file for incremental execution (auto-generated if empty)")
+	resume := flag.Bool("resume", false, "Resume from existing checkpoint")
+	mergeFile := flag.String("merge", "", "Merge results from another checkpoint file into output")
 
 	flag.Parse()
 
@@ -112,21 +115,87 @@ func main() {
 		log.Fatalf("Unknown mode: %s", *mode)
 	}
 
-	output := &bench.BenchmarkOutput{
-		Timestamp:    time.Now().UTC().Format("2006-01-02T15_04_05Z"),
-		Architecture: arch,
-		Config: bench.BenchmarkConfig{
-			Duration:    duration.String(),
-			Connections: *connections,
-			Workers:     *workers,
-		},
-		Results: []bench.ServerResult{},
+	// Setup checkpoint
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	// Auto-generate checkpoint filename if not specified
+	if *checkpointFile == "" {
+		*checkpointFile = filepath.Join(*outputDir, fmt.Sprintf("checkpoint-%s.json", arch))
+	}
+
+	var checkpoint *bench.Checkpoint
+	if *resume {
+		// Try to load existing checkpoint
+		if cp, err := bench.LoadCheckpoint(*checkpointFile); err == nil {
+			checkpoint = cp
+			log.Printf("Resuming from checkpoint: %s (%d results completed)", *checkpointFile, len(cp.Results))
+		} else {
+			log.Printf("No existing checkpoint found, starting fresh")
+		}
+	}
+
+	// Create new checkpoint if not resuming or no checkpoint found
+	if checkpoint == nil {
+		output := &bench.BenchmarkOutput{
+			Timestamp:    time.Now().UTC().Format("2006-01-02T15_04_05Z"),
+			Architecture: arch,
+			Config: bench.BenchmarkConfig{
+				Duration:    duration.String(),
+				Connections: *connections,
+				Workers:     *workers,
+			},
+			Results: []bench.ServerResult{},
+		}
+		checkpoint = bench.NewCheckpoint(output)
+	}
+
+	// Setup signal handling for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Save checkpoint on shutdown
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v, saving checkpoint and shutting down...", sig)
+		if err := checkpoint.Save(*checkpointFile); err != nil {
+			log.Printf("ERROR: Failed to save checkpoint: %v", err)
+		} else {
+			log.Printf("Checkpoint saved to: %s", *checkpointFile)
+		}
+		cancel()
+	}()
+
+	// Count how many benchmarks are already completed
+	totalBenchmarks := len(servers) * len(benchmarkTypes)
+	completedBefore := len(checkpoint.Results)
+	skipped := 0
 
 	for _, serverType := range servers {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			log.Printf("Benchmark interrupted, progress saved")
+			goto saveAndExit
+		default:
+		}
+
+		// Check if all benchmarks for this server are already completed
+		allCompleted := true
+		for _, bt := range benchmarkTypes {
+			if !checkpoint.IsCompleted(serverType, bt.Name) {
+				allCompleted = false
+				break
+			}
+		}
+		if allCompleted {
+			log.Printf("=== Skipping (completed): %s ===", serverType)
+			skipped += len(benchmarkTypes)
+			continue
+		}
+
 		log.Printf("=== Benchmarking: %s ===", serverType)
 
 		cmd, err := startServer(*serverBin, serverType, *port)
@@ -144,6 +213,22 @@ func main() {
 		log.Printf("Server ready: %s", serverType)
 
 		for _, bt := range benchmarkTypes {
+			// Check if context is cancelled
+			select {
+			case <-ctx.Done():
+				log.Printf("Benchmark interrupted during %s:%s", serverType, bt.Name)
+				stopServer(cmd)
+				goto saveAndExit
+			default:
+			}
+
+			// Skip if already completed
+			if checkpoint.IsCompleted(serverType, bt.Name) {
+				log.Printf("Skipping (completed): %s on %s", bt.Name, serverType)
+				skipped++
+				continue
+			}
+
 			log.Printf("Running benchmark: %s on %s", bt.Name, serverType)
 
 			cfg := bench.Config{
@@ -161,25 +246,53 @@ func main() {
 			benchmarker := bench.New(cfg)
 			result, err := benchmarker.Run(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					// Context cancelled, save and exit
+					log.Printf("Benchmark interrupted: %v", err)
+					stopServer(cmd)
+					goto saveAndExit
+				}
 				log.Printf("ERROR: Benchmark failed: %v", err)
 				continue
 			}
 
 			log.Printf("Completed: %.2f req/s, avg latency: %s", result.RequestsPerSec, result.Latency.Avg)
 
-			output.Results = append(output.Results, result.ToServerResult(
+			// Add result and save checkpoint immediately
+			checkpoint.AddResult(result.ToServerResult(
 				serverType, bt.Name, bt.Method, bt.Path,
 			))
+
+			// Save checkpoint after each benchmark
+			if err := checkpoint.Save(*checkpointFile); err != nil {
+				log.Printf("WARN: Failed to save checkpoint: %v", err)
+			}
 		}
 
 		stopServer(cmd)
 		time.Sleep(500 * time.Millisecond) // Brief pause between servers
 	}
 
-	if err := os.MkdirAll(*outputDir, 0755); err != nil {
-		log.Fatalf("Failed to create output directory: %v", err)
+saveAndExit:
+	// Merge results from another file if specified
+	if *mergeFile != "" {
+		if otherCP, err := bench.LoadCheckpoint(*mergeFile); err == nil {
+			beforeMerge := len(checkpoint.Results)
+			checkpoint.MergeResults(otherCP)
+			afterMerge := len(checkpoint.Results)
+			log.Printf("Merged %d results from %s", afterMerge-beforeMerge, *mergeFile)
+		} else {
+			log.Printf("WARN: Failed to load merge file %s: %v", *mergeFile, err)
+		}
 	}
 
+	// Save final checkpoint
+	if err := checkpoint.Save(*checkpointFile); err != nil {
+		log.Printf("ERROR: Failed to save final checkpoint: %v", err)
+	}
+
+	// Write final output file (without checkpoint metadata)
+	output := checkpoint.ToBenchmarkOutput()
 	outputFile := filepath.Join(*outputDir, fmt.Sprintf("benchmark-%s-%s.json", arch, output.Timestamp))
 	data, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
@@ -190,8 +303,17 @@ func main() {
 		log.Fatalf("Failed to write results: %v", err)
 	}
 
+	completedNow := len(checkpoint.Results) - completedBefore
 	log.Printf("Results saved to: %s", outputFile)
-	log.Printf("Benchmarks complete!")
+	log.Printf("Checkpoint saved to: %s", *checkpointFile)
+	log.Printf("Summary: %d total benchmarks, %d completed this run, %d skipped (already done), %d total completed",
+		totalBenchmarks, completedNow, skipped, len(checkpoint.Results))
+
+	if len(checkpoint.Results) < totalBenchmarks {
+		log.Printf("NOTE: %d benchmarks remaining. Run with -resume to continue.", totalBenchmarks-len(checkpoint.Results))
+	} else {
+		log.Printf("Benchmarks complete!")
+	}
 }
 
 func startServer(binary, serverType, port string) (*exec.Cmd, error) {

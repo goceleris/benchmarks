@@ -4,6 +4,7 @@ name: Benchmark (Fast)
 # Uses cheaper virtualized instances (c5.large, c6g.medium)
 # Each architecture launches independently with spot -> on-demand fallback
 # If spot instance is terminated mid-benchmark, automatically retries on on-demand
+# with checkpoint support to continue from where it left off
 #
 # Requires approval: PR must have 'run-benchmarks' label added by maintainer
 
@@ -298,6 +299,7 @@ jobs:
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
+          # Run with checkpoint support - saves progress after each benchmark
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
 
       - name: Upload Results
@@ -333,6 +335,7 @@ jobs:
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
+          # Run with checkpoint support - saves progress after each benchmark
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
 
       - name: Upload Results
@@ -500,10 +503,10 @@ jobs:
           echo "Waiting for x86 on-demand runner to register (60s)..."
           sleep 60
 
-  # Retry benchmark on ARM64 on-demand
+  # Retry benchmark on ARM64 on-demand - continues from checkpoint
   retry-benchmark-arm64:
     name: Retry Benchmark (ARM64)
-    needs: retry-arm64
+    needs: [retry-arm64, benchmark-arm64]
     if: needs.retry-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, fast-arm64]
     timeout-minutes: 90
@@ -512,21 +515,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Download Previous Checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-arm64
+          path: results/
+        continue-on-error: true
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.5'
 
-      - name: Build and Run
+      - name: Build and Resume
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
-          echo "RETRY: Running benchmark on ARM64 on-demand instance"
+          echo "RETRY: Resuming benchmark on ARM64 on-demand instance"
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+
+          # Check if checkpoint exists and resume from it
+          if [ -f results/checkpoint-arm64.json ]; then
+            echo "Found checkpoint, resuming from previous progress..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4 -resume
+          else
+            echo "No checkpoint found, starting fresh..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+          fi
 
       - name: Upload Results
         if: always()
@@ -537,10 +555,10 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Retry benchmark on x86 on-demand
+  # Retry benchmark on x86 on-demand - continues from checkpoint
   retry-benchmark-x86:
     name: Retry Benchmark (x86)
-    needs: retry-x86
+    needs: [retry-x86, benchmark-x86]
     if: needs.retry-x86.outputs.launched == 'true'
     runs-on: [self-hosted, fast-x86]
     timeout-minutes: 90
@@ -549,21 +567,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Download Previous Checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: fast-results-x86
+          path: results/
+        continue-on-error: true
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.5'
 
-      - name: Build and Run
+      - name: Build and Resume
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
-          echo "RETRY: Running benchmark on x86 on-demand instance"
+          echo "RETRY: Resuming benchmark on x86 on-demand instance"
           go mod download
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+
+          # Check if checkpoint exists and resume from it
+          if [ -f results/checkpoint-x86.json ]; then
+            echo "Found checkpoint, resuming from previous progress..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4 -resume
+          else
+            echo "No checkpoint found, starting fresh..."
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
+          fi
 
       - name: Upload Results
         if: always()
@@ -635,42 +668,53 @@ jobs:
 
           mkdir -p results/charts/arm64 results/charts/x86
 
-          # Determine which ARM64 results to use (prefer retry if original failed)
+          # For ARM64: prefer retry results (which include merged checkpoint data)
+          # Otherwise use original results
           if [[ "$ARM64_RETRY_SUCCESS" == "true" ]]; then
             ARM64_SOURCE="downloaded/arm64-retry"
-            echo "Using ARM64 retry results"
-          else
+            echo "Using ARM64 retry results (includes checkpoint data)"
+          elif [ -d "downloaded/arm64" ]; then
             ARM64_SOURCE="downloaded/arm64"
             echo "Using ARM64 original results"
+          else
+            ARM64_SOURCE=""
+            echo "No ARM64 results available"
           fi
 
-          # Determine which x86 results to use
+          # For x86: prefer retry results (which include merged checkpoint data)
           if [[ "$X86_RETRY_SUCCESS" == "true" ]]; then
             X86_SOURCE="downloaded/x86-retry"
-            echo "Using x86 retry results"
-          else
+            echo "Using x86 retry results (includes checkpoint data)"
+          elif [ -d "downloaded/x86" ]; then
             X86_SOURCE="downloaded/x86"
             echo "Using x86 original results"
+          else
+            X86_SOURCE=""
+            echo "No x86 results available"
           fi
 
           # Find and process ARM64 results
-          ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
-          if [ -n "$ARM64_JSON" ]; then
-            ARM64_DIR=$(dirname "$ARM64_JSON")
-            echo "Found ARM64 results in: $ARM64_DIR"
-            python scripts/generate_charts.py "$ARM64_DIR" results/charts/arm64
-          else
-            echo "No ARM64 JSON results found"
+          if [ -n "$ARM64_SOURCE" ]; then
+            ARM64_JSON=$(find "$ARM64_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$ARM64_JSON" ]; then
+              ARM64_DIR=$(dirname "$ARM64_JSON")
+              echo "Found ARM64 results in: $ARM64_DIR"
+              python scripts/generate_charts.py "$ARM64_DIR" results/charts/arm64
+            else
+              echo "No ARM64 JSON results found"
+            fi
           fi
 
           # Find and process x86 results
-          X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
-          if [ -n "$X86_JSON" ]; then
-            X86_DIR=$(dirname "$X86_JSON")
-            echo "Found x86 results in: $X86_DIR"
-            python scripts/generate_charts.py "$X86_DIR" results/charts/x86
-          else
-            echo "No x86 JSON results found"
+          if [ -n "$X86_SOURCE" ]; then
+            X86_JSON=$(find "$X86_SOURCE" -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$X86_JSON" ]; then
+              X86_DIR=$(dirname "$X86_JSON")
+              echo "Found x86 results in: $X86_DIR"
+              python scripts/generate_charts.py "$X86_DIR" results/charts/x86
+            else
+              echo "No x86 JSON results found"
+            fi
           fi
 
       - name: Upload Charts Artifact
