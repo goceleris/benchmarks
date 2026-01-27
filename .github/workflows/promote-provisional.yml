@@ -1,0 +1,343 @@
+name: Promote Provisional Results
+
+# Promotes provisional benchmark results to official by re-running on metal
+# Only runs on metal - fails if metal instances are unavailable
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Benchmark duration (e.g., 30s, 60s)"
+        required: false
+        default: "30s"
+      benchmark_mode:
+        description: "Benchmark servers to test"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - baseline
+          - theoretical
+          - all
+
+concurrency:
+  group: promote-provisional
+  cancel-in-progress: false
+
+env:
+  TF_VAR_repository_url: ${{ github.server_url }}/${{ github.repository }}
+  TF_VAR_benchmark_mode: metal
+
+jobs:
+  check-provisional:
+    name: Check for Provisional Results
+    runs-on: ubuntu-latest
+    outputs:
+      has_provisional: ${{ steps.check.outputs.has_provisional }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for Provisional Results
+        id: check
+        run: |
+          if [ -d "results/provisional" ] && [ "$(ls -A results/provisional 2>/dev/null)" ]; then
+            echo "Found provisional results to promote"
+            echo "has_provisional=true" >> $GITHUB_OUTPUT
+            cat results/provisional/TIMESTAMP || true
+          else
+            echo "No provisional results found"
+            echo "has_provisional=false" >> $GITHUB_OUTPUT
+          fi
+
+  launch-metal:
+    name: Launch Metal Infrastructure
+    runs-on: ubuntu-latest
+    needs: check-provisional
+    if: needs.check-provisional.outputs.has_provisional == 'true'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      instance_mode: ${{ steps.result.outputs.instance_mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Try Metal Spot
+        id: metal_spot
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: |
+          echo "Attempting metal spot instances..."
+          if terraform apply -auto-approve; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cleanup for Metal On-Demand
+        if: steps.metal_spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+        run: terraform destroy -auto-approve || true
+
+      - name: Try Metal On-Demand
+        id: metal_ondemand
+        if: steps.metal_spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_use_on_demand: "true"
+        run: |
+          echo "Attempting metal on-demand instances..."
+          if terraform apply -auto-approve; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set Launch Results
+        id: result
+        run: |
+          if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=metal-spot" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=metal-ondemand" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "instance_mode=none" >> $GITHUB_OUTPUT
+            echo "::error::Metal instances unavailable. Cannot promote provisional results."
+            echo "::error::Please request AWS quota increase for c5.metal (96 vCPUs) and c6g.metal (64 vCPUs)"
+            exit 1
+          fi
+
+      - name: Wait for Metal Runners
+        run: |
+          echo "Waiting for metal runners to register (120s)..."
+          sleep 120
+
+  benchmark-arm64:
+    name: Metal Benchmark (ARM64)
+    needs: launch-metal
+    if: needs.launch-metal.outputs.launched == 'true'
+    runs-on: [self-hosted, metal-arm64]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+          echo "Running OFFICIAL metal benchmarks to replace provisional results"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-results-arm64
+          path: results/
+          retention-days: 90
+
+  benchmark-x86:
+    name: Metal Benchmark (x86)
+    needs: launch-metal
+    if: needs.launch-metal.outputs.launched == 'true'
+    runs-on: [self-hosted, metal-x86]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build and Run
+        env:
+          BENCHMARK_DURATION: ${{ github.event.inputs.duration || '30s' }}
+          BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
+        run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
+          echo "Running OFFICIAL metal benchmarks to replace provisional results"
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-results-x86
+          path: results/
+          retention-days: 90
+
+  promote:
+    name: Promote to Official
+    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always() && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download ARM64 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: metal-results-arm64
+          path: downloaded/arm64
+        continue-on-error: true
+
+      - name: Download x86 Results
+        uses: actions/download-artifact@v4
+        with:
+          name: metal-results-x86
+          path: downloaded/x86
+        continue-on-error: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate Charts and Promote
+        run: |
+          pip install matplotlib numpy
+
+          mkdir -p results/latest/arm64 results/latest/x86
+
+          # Process ARM64 results
+          if [ -d "downloaded/arm64" ]; then
+            ARM64_JSON=$(find downloaded/arm64 -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$ARM64_JSON" ]; then
+              ARM64_DIR=$(dirname "$ARM64_JSON")
+              python scripts/generate_charts.py "$ARM64_DIR" results/latest/arm64
+              cp "$ARM64_DIR"/*.json results/latest/arm64/ 2>/dev/null || true
+            fi
+          fi
+
+          # Process x86 results
+          if [ -d "downloaded/x86" ]; then
+            X86_JSON=$(find downloaded/x86 -name "benchmark-*.json" 2>/dev/null | head -1)
+            if [ -n "$X86_JSON" ]; then
+              X86_DIR=$(dirname "$X86_JSON")
+              python scripts/generate_charts.py "$X86_DIR" results/latest/x86
+              cp "$X86_DIR"/*.json results/latest/x86/ 2>/dev/null || true
+            fi
+          fi
+
+          # Add metadata
+          echo "Last updated: $(date -u)" > results/latest/TIMESTAMP
+          echo "Triggered by: ${{ github.actor }}" >> results/latest/TIMESTAMP
+          echo "Event: promote-provisional" >> results/latest/TIMESTAMP
+          echo "Instance mode: ${{ needs.launch-metal.outputs.instance_mode }}" >> results/latest/TIMESTAMP
+          echo "Promoted from provisional: true" >> results/latest/TIMESTAMP
+
+      - name: Commit Promotion
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add new official results
+          git add -f results/latest/
+
+          # Remove provisional results
+          if [ -d "results/provisional" ]; then
+            git rm -rf results/provisional || true
+          fi
+
+          git commit -m "chore: promote provisional results to official [skip ci]" || echo "No changes to commit"
+          git push || echo "Push failed"
+
+      - name: Create Summary
+        run: |
+          echo "# Provisional Results Promoted to Official" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Provisional benchmark results have been replaced with official metal benchmark results." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance mode**: ${{ needs.launch-metal.outputs.instance_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
+          [ -f "results/latest/arm64/summary_arm64.md" ] && cat results/latest/arm64/summary_arm64.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## x86 Results" >> $GITHUB_STEP_SUMMARY
+          [ -f "results/latest/x86/summary_x86.md" ] && cat results/latest/x86/summary_x86.md >> $GITHUB_STEP_SUMMARY
+
+  cleanup:
+    name: Cleanup Infrastructure
+    needs: [launch-metal, benchmark-arm64, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_use_on_demand: ${{ needs.launch-metal.outputs.instance_mode == 'metal-ondemand' && 'true' || 'false' }}
+        run: |
+          terraform init
+          terraform destroy -auto-approve || true
+
+  no-provisional:
+    name: No Provisional Results
+    runs-on: ubuntu-latest
+    needs: check-provisional
+    if: needs.check-provisional.outputs.has_provisional != 'true'
+
+    steps:
+      - name: Report No Provisional
+        run: |
+          echo "::notice::No provisional results found to promote."
+          echo "# No Provisional Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "There are no provisional results to promote. Either:" >> $GITHUB_STEP_SUMMARY
+          echo "- No benchmarks have been run with provisional instances" >> $GITHUB_STEP_SUMMARY
+          echo "- Provisional results have already been promoted" >> $GITHUB_STEP_SUMMARY

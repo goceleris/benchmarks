@@ -39,6 +39,7 @@ terraform/*.tfplan
 # Results - ignore temporary benchmark outputs but keep official results
 results/*
 !results/latest/
+!results/provisional/
 !results/v*/
 !results/README.md
 

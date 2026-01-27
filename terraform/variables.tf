@@ -17,18 +17,24 @@ variable "repository_url" {
 }
 
 variable "benchmark_mode" {
-  description = "Benchmark mode: 'fast' for quick PR validation (c5.large/c6g.medium), 'metal' for official results (c5.metal/c6g.metal)"
+  description = "Benchmark mode: 'fast' for quick PR validation, 'metal' for official results, 'provisional' for best-effort when metal unavailable"
   type        = string
   default     = "fast"
 
   validation {
-    condition     = contains(["fast", "metal"], var.benchmark_mode)
-    error_message = "benchmark_mode must be 'fast' or 'metal'"
+    condition     = contains(["fast", "metal", "provisional"], var.benchmark_mode)
+    error_message = "benchmark_mode must be 'fast', 'metal', or 'provisional'"
   }
 }
 
 variable "use_on_demand" {
   description = "Use on-demand instances instead of spot (fallback when spot quota/capacity unavailable)"
+  type        = bool
+  default     = false
+}
+
+variable "use_provisional" {
+  description = "Use provisional instances (best available within quota limits) when metal unavailable"
   type        = bool
   default     = false
 }
@@ -55,32 +61,41 @@ variable "subnet_id" {
 
 # Instance type mappings
 locals {
-  # Fast mode: cheaper virtualized instances (same CPU family as metal)
+  # Fast mode: cheaper virtualized instances for PR validation
   # Metal mode: bare metal for official results
+  # Provisional mode: best available within quota limits (8 vCPUs) when metal unavailable
   instance_types = {
     fast = {
-      arm64 = "c6g.medium"  # 1 vCPU, virtualized slice of c6g.metal
-      x86   = "c5.large"    # 2 vCPU, virtualized slice of c5.metal
+      arm64 = "c6g.medium"  # 1 vCPU
+      x86   = "c5.large"    # 2 vCPU
     }
     metal = {
-      arm64 = "c6g.metal"   # Full Graviton2, bare metal
-      x86   = "c5.metal"    # Full Intel, bare metal
+      arm64 = "c6g.metal"   # 64 vCPU, bare metal
+      x86   = "c5.metal"    # 96 vCPU, bare metal
+    }
+    provisional = {
+      arm64 = "c6g.2xlarge" # 8 vCPU, best within typical quota
+      x86   = "c5.2xlarge"  # 8 vCPU, best within typical quota
     }
   }
 
   # Spot prices per mode
   spot_prices = {
     fast = {
-      arm64 = "0.10"   # ~$0.034/hr on-demand, $0.10 max spot
-      x86   = "0.20"   # ~$0.085/hr on-demand, $0.20 max spot
+      arm64 = "0.10"
+      x86   = "0.20"
     }
     metal = {
-      arm64 = "2.50"   # ~$2.176/hr on-demand
-      x86   = "4.00"   # ~$4.08/hr on-demand
+      arm64 = "2.50"
+      x86   = "4.00"
+    }
+    provisional = {
+      arm64 = "0.40"
+      x86   = "0.50"
     }
   }
 
-  # Runner labels per mode (so workflows can target correct runners)
+  # Runner labels per mode
   runner_labels = {
     fast = {
       arm64 = ["self-hosted", "fast-arm64", "linux", "arm64"]
@@ -90,21 +105,33 @@ locals {
       arm64 = ["self-hosted", "metal-arm64", "linux", "arm64"]
       x86   = ["self-hosted", "metal-x86", "linux", "x86_64"]
     }
+    provisional = {
+      arm64 = ["self-hosted", "provisional-arm64", "linux", "arm64"]
+      x86   = ["self-hosted", "provisional-x86", "linux", "x86_64"]
+    }
   }
+
+  # Effective mode: provisional overrides metal when use_provisional is true
+  effective_mode = var.use_provisional ? "provisional" : var.benchmark_mode
 }
 
 # Selected configuration based on mode
 output "selected_instance_arm64" {
   description = "Selected ARM64 instance type"
-  value       = local.instance_types[var.benchmark_mode].arm64
+  value       = local.instance_types[local.effective_mode].arm64
 }
 
 output "selected_instance_x86" {
   description = "Selected x86 instance type"
-  value       = local.instance_types[var.benchmark_mode].x86
+  value       = local.instance_types[local.effective_mode].x86
 }
 
 output "benchmark_mode" {
   description = "Current benchmark mode"
   value       = var.benchmark_mode
+}
+
+output "effective_mode" {
+  description = "Effective mode (provisional if use_provisional is true)"
+  value       = local.effective_mode
 }
