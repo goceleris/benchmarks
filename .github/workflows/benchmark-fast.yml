@@ -2,6 +2,8 @@ name: Benchmark (Fast)
 
 # Fast mode: Runs on PRs for quick trend validation
 # Uses cheaper virtualized instances (c5.large, c6g.medium)
+# Each architecture launches independently with spot -> on-demand fallback
+#
 # Requires approval: PR must have 'run-benchmarks' label added by maintainer
 
 on:
@@ -45,7 +47,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # For manual triggers, check user permissions
             PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
             if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
               echo "authorized=true" >> $GITHUB_OUTPUT
@@ -55,7 +56,6 @@ jobs:
               echo "::error::User ${{ github.actor }} not authorized (permission: $PERMISSION)"
             fi
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            # For PRs, require 'run-benchmarks' label
             if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-benchmarks') }}" == "true" ]]; then
               echo "authorized=true" >> $GITHUB_OUTPUT
               echo "PR has 'run-benchmarks' label - authorized"
@@ -67,14 +67,14 @@ jobs:
             echo "authorized=false" >> $GITHUB_OUTPUT
           fi
 
-  launch:
-    name: Launch Fast Infrastructure
+  # Launch ARM64 infrastructure independently
+  launch-arm64:
+    name: Launch ARM64 Infrastructure
     runs-on: ubuntu-latest
     needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
     outputs:
-      arm64_launched: ${{ steps.result.outputs.arm64_launched }}
-      x86_launched: ${{ steps.result.outputs.x86_launched }}
+      launched: ${{ steps.result.outputs.launched }}
       instance_mode: ${{ steps.result.outputs.instance_mode }}
 
     steps:
@@ -85,12 +85,13 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
 
-      - name: Try Spot Instances
+      - name: Try ARM64 Spot
         id: spot
         continue-on-error: true
         working-directory: terraform
@@ -98,68 +99,160 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Attempting to launch spot instances..."
-          if terraform apply -auto-approve; then
-            echo "spot_success=true" >> $GITHUB_OUTPUT
-            echo "Spot instances launched successfully"
+          echo "Attempting ARM64 spot (c6g.medium)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
           else
-            echo "spot_success=false" >> $GITHUB_OUTPUT
-            echo "Spot instances failed, will try on-demand"
+            echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Cleanup Failed Spot
-        if: steps.spot.outputs.spot_success != 'true'
+      - name: Cleanup ARM64 Spot
+        if: steps.spot.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-        run: |
-          echo "Cleaning up any partial spot resources..."
-          terraform destroy -auto-approve || true
+          TF_VAR_launch_arm64_only: "true"
+        run: terraform destroy -auto-approve || true
 
-      - name: Fallback to On-Demand
+      - name: Try ARM64 On-Demand
         id: ondemand
-        if: steps.spot.outputs.spot_success != 'true'
+        if: steps.spot.outputs.success != 'true'
+        continue-on-error: true
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
         run: |
-          echo "Launching on-demand instances as fallback..."
-          terraform apply -auto-approve
-          echo "ondemand_success=true" >> $GITHUB_OUTPUT
-
-      - name: Set Launch Results
-        id: result
-        run: |
-          if [[ "${{ steps.spot.outputs.spot_success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=spot" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.ondemand.outputs.ondemand_success }}" == "true" ]]; then
-            echo "arm64_launched=true" >> $GITHUB_OUTPUT
-            echo "x86_launched=true" >> $GITHUB_OUTPUT
-            echo "instance_mode=on-demand" >> $GITHUB_OUTPUT
+          echo "Attempting ARM64 on-demand (c6g.medium)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
           else
-            echo "arm64_launched=false" >> $GITHUB_OUTPUT
-            echo "x86_launched=false" >> $GITHUB_OUTPUT
-            echo "instance_mode=none" >> $GITHUB_OUTPUT
-            exit 1
+            echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Wait for Runners
+      - name: Set ARM64 Launch Results
+        id: result
         run: |
-          echo "Waiting for fast runners to register (60s)..."
+          if [[ "${{ steps.spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=spot" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=on-demand" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "instance_mode=none" >> $GITHUB_OUTPUT
+            echo "::error::All ARM64 launch attempts failed"
+          fi
+
+      - name: Wait for ARM64 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          echo "Waiting for ARM64 runner to register (60s)..."
+          sleep 60
+
+  # Launch x86 infrastructure independently
+  launch-x86:
+    name: Launch x86 Infrastructure
+    runs-on: ubuntu-latest
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    outputs:
+      launched: ${{ steps.result.outputs.launched }}
+      instance_mode: ${{ steps.result.outputs.instance_mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Try x86 Spot
+        id: spot
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 spot (c5.large)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cleanup x86 Spot
+        if: steps.spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
+        run: terraform destroy -auto-approve || true
+
+      - name: Try x86 On-Demand
+        id: ondemand
+        if: steps.spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_x86_only: "true"
+        run: |
+          echo "Attempting x86 on-demand (c5.large)..."
+          if terraform apply -auto-approve 2>&1; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set x86 Launch Results
+        id: result
+        run: |
+          if [[ "${{ steps.spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=spot" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "instance_mode=on-demand" >> $GITHUB_OUTPUT
+          else
+            echo "launched=false" >> $GITHUB_OUTPUT
+            echo "instance_mode=none" >> $GITHUB_OUTPUT
+            echo "::error::All x86 launch attempts failed"
+          fi
+
+      - name: Wait for x86 Runner
+        if: steps.result.outputs.launched == 'true'
+        run: |
+          echo "Waiting for x86 runner to register (60s)..."
           sleep 60
 
   benchmark-arm64:
     name: Fast Benchmark (ARM64)
-    needs: launch
-    if: needs.launch.outputs.arm64_launched == 'true'
+    needs: launch-arm64
+    if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, fast-arm64]
     timeout-minutes: 30
     continue-on-error: true
@@ -173,17 +266,14 @@ jobs:
         with:
           go-version: '1.25.5'
 
-      - name: Build Server and Benchmark Tool
-        run: |
-          go mod download
-          go build -o bin/server ./cmd/server
-          go build -o bin/bench ./cmd/bench
-
-      - name: Run Benchmarks
+      - name: Build and Run
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
 
       - name: Upload Results
@@ -197,8 +287,8 @@ jobs:
 
   benchmark-x86:
     name: Fast Benchmark (x86)
-    needs: launch
-    if: needs.launch.outputs.x86_launched == 'true'
+    needs: launch-x86
+    if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, fast-x86]
     timeout-minutes: 30
     continue-on-error: true
@@ -212,17 +302,14 @@ jobs:
         with:
           go-version: '1.25.5'
 
-      - name: Build Server and Benchmark Tool
-        run: |
-          go mod download
-          go build -o bin/server ./cmd/server
-          go build -o bin/bench ./cmd/bench
-
-      - name: Run Benchmarks
+      - name: Build and Run
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
         run: |
+          go mod download
+          go build -o bin/server ./cmd/server
+          go build -o bin/bench ./cmd/bench
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 128 -workers 4
 
       - name: Upload Results
@@ -236,9 +323,9 @@ jobs:
 
   report:
     name: Generate Report
-    needs: [authorize, launch, benchmark-arm64, benchmark-x86]
+    needs: [authorize, launch-arm64, launch-x86, benchmark-arm64, benchmark-x86]
     runs-on: ubuntu-latest
-    if: always() && needs.authorize.outputs.authorized == 'true'
+    if: always() && needs.authorize.outputs.authorized == 'true' && (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success')
     permissions:
       pull-requests: write
       contents: read
@@ -303,12 +390,18 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
+          ARM64_MODE: ${{ needs.launch-arm64.outputs.instance_mode }}
+          X86_MODE: ${{ needs.launch-x86.outputs.instance_mode }}
         run: |
           COMMENT_BODY="## Fast Benchmark Results (Preview)
 
           > **Note**: These are quick validation results using virtualized instances.
           > For official results, run the Metal benchmark after merge.
-          > **Instance mode**: ${{ needs.launch.outputs.instance_mode }}
+
+          | Architecture | Instance Mode |
+          |--------------|---------------|
+          | ARM64 | $ARM64_MODE |
+          | x86 | $X86_MODE |
 
           ---
           "
@@ -326,7 +419,7 @@ jobs:
             COMMENT_BODY+="
           ### ARM64 (Graviton)
 
-          No ARM64 results available (benchmark may have failed)
+          No ARM64 results available (benchmark may have failed or instance unavailable)
 
           ---
           "
@@ -345,7 +438,7 @@ jobs:
             COMMENT_BODY+="
           ### x86 (Intel)
 
-          No x86 results available (benchmark may have failed)
+          No x86 results available (benchmark may have failed or instance unavailable)
 
           ---
           "
@@ -379,12 +472,19 @@ jobs:
           fi
 
       - name: Create Summary
+        env:
+          ARM64_MODE: ${{ needs.launch-arm64.outputs.instance_mode }}
+          X86_MODE: ${{ needs.launch-x86.outputs.instance_mode }}
         run: |
           echo "# Fast Benchmark Results (Preview)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: These are quick validation results using virtualized instances." >> $GITHUB_STEP_SUMMARY
           echo "> For official results, run the Metal benchmark after merge." >> $GITHUB_STEP_SUMMARY
-          echo "> **Instance mode**: ${{ needs.launch.outputs.instance_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | Instance Mode |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|---------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ARM64 | $ARM64_MODE |" >> $GITHUB_STEP_SUMMARY
+          echo "| x86 | $X86_MODE |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## ARM64 Results" >> $GITHUB_STEP_SUMMARY
@@ -402,11 +502,11 @@ jobs:
             echo "No x86 results available" >> $GITHUB_STEP_SUMMARY
           fi
 
-  cleanup:
-    name: Cleanup Infrastructure
-    needs: [authorize, launch, benchmark-arm64, benchmark-x86]
+  cleanup-arm64:
+    name: Cleanup ARM64 Infrastructure
+    needs: [authorize, launch-arm64, benchmark-arm64]
     runs-on: ubuntu-latest
-    if: always() && needs.authorize.outputs.authorized == 'true'
+    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-arm64.outputs.launched == 'true'
 
     steps:
       - name: Checkout
@@ -416,14 +516,44 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
+          terraform_wrapper: false
 
-      - name: Terraform Destroy
+      - name: Terraform Destroy ARM64
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_use_on_demand: ${{ needs.launch.outputs.instance_mode == 'on-demand' && 'true' || 'false' }}
+          TF_VAR_launch_arm64_only: "true"
+          TF_VAR_use_on_demand: ${{ needs.launch-arm64.outputs.instance_mode == 'on-demand' && 'true' || 'false' }}
+        run: |
+          terraform init
+          terraform destroy -auto-approve || true
+
+  cleanup-x86:
+    name: Cleanup x86 Infrastructure
+    needs: [authorize, launch-x86, benchmark-x86]
+    runs-on: ubuntu-latest
+    if: always() && needs.authorize.outputs.authorized == 'true' && needs.launch-x86.outputs.launched == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Destroy x86
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_launch_x86_only: "true"
+          TF_VAR_use_on_demand: ${{ needs.launch-x86.outputs.instance_mode == 'on-demand' && 'true' || 'false' }}
         run: |
           terraform init
           terraform destroy -auto-approve || true
