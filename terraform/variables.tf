@@ -27,6 +27,12 @@ variable "benchmark_mode" {
   }
 }
 
+variable "use_on_demand" {
+  description = "Use on-demand instances instead of spot (fallback when spot quota/capacity unavailable)"
+  type        = bool
+  default     = false
+}
+
 # Pre-existing infrastructure references
 # These must be created manually before running Terraform
 variable "iam_instance_profile_name" {
