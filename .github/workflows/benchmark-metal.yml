@@ -2,10 +2,18 @@ name: Benchmark (Metal)
 
 # Metal mode: Official benchmarks on bare-metal instances
 # Each architecture falls back independently to provisional if quota unavailable
-# ARM64: c6g.metal (official) or c6g.2xlarge (provisional)
-# x86: c5.metal (official) or c5.2xlarge (provisional)
 #
-# If spot instance is terminated mid-benchmark, automatically retries on on-demand
+# Launch Priority (to optimize for quota and stability):
+#   ARM64: On-Demand first (more stable) -> Spot fallback
+#          Metal On-Demand -> Provisional On-Demand -> Metal Spot -> Provisional Spot
+#   x86:   Spot first (cost savings) -> On-Demand fallback
+#          Metal Spot -> Metal On-Demand -> Provisional Spot -> Provisional On-Demand
+#
+# Instance Types:
+#   ARM64: c6g.metal (official) or c6g.2xlarge (provisional)
+#   x86:   c5.metal (official) or c5.2xlarge (provisional)
+#
+# If spot instance is terminated mid-benchmark, automatically retries with checkpoint
 #
 # Results are stored with -provisional suffix if not on metal:
 #   results/latest/arm64/          (official)
@@ -167,46 +175,12 @@ jobs:
         working-directory: terraform
         run: terraform init
 
-      # Try Metal Spot
-      - name: Try ARM64 Metal Spot
-        id: metal_spot
-        continue-on-error: true
-        working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_benchmark_mode: metal
-          TF_VAR_launch_arm64_only: "true"
-        run: |
-          echo "Attempting ARM64 metal spot (c6g.metal)..."
-          set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
-          EXIT_CODE=$?
-          set -e
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 metal spot launched successfully"
-          else
-            echo "success=false" >> $GITHUB_OUTPUT
-            echo "ARM64 metal spot failed with exit code $EXIT_CODE"
-          fi
+      # ARM64 Priority: On-Demand first (more stable), then Spot
+      # Order: Metal On-Demand -> Provisional On-Demand -> Metal Spot -> Provisional Spot
 
-      # Try Metal On-Demand
-      - name: Cleanup ARM64 Metal Spot
-        if: steps.metal_spot.outputs.success != 'true'
-        working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_benchmark_mode: metal
-          TF_VAR_launch_arm64_only: "true"
-        run: terraform destroy -auto-approve -target=aws_spot_instance_request.arm64_runner || true
-
+      # Try Metal On-Demand first
       - name: Try ARM64 Metal On-Demand
         id: metal_ondemand
-        if: steps.metal_spot.outputs.success != 'true'
         continue-on-error: true
         working-directory: terraform
         env:
@@ -230,9 +204,9 @@ jobs:
             echo "ARM64 metal on-demand failed with exit code $EXIT_CODE"
           fi
 
-      # Try Provisional Spot
+      # Try Provisional On-Demand
       - name: Cleanup ARM64 Metal On-Demand
-        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
+        if: steps.metal_ondemand.outputs.success != 'true'
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -243,46 +217,9 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: terraform destroy -auto-approve || true
 
-      - name: Try ARM64 Provisional Spot
-        id: provisional_spot
-        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true'
-        continue-on-error: true
-        working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_benchmark_mode: provisional
-          TF_VAR_launch_arm64_only: "true"
-        run: |
-          echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
-          set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
-          EXIT_CODE=$?
-          set -e
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 provisional spot launched successfully"
-          else
-            echo "success=false" >> $GITHUB_OUTPUT
-            echo "ARM64 provisional spot failed with exit code $EXIT_CODE"
-          fi
-
-      # Try Provisional On-Demand
-      - name: Cleanup ARM64 Provisional Spot
-        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
-        working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
-          TF_VAR_benchmark_mode: provisional
-          TF_VAR_launch_arm64_only: "true"
-        run: terraform destroy -auto-approve || true
-
       - name: Try ARM64 Provisional On-Demand
         id: provisional_ondemand
-        if: steps.metal_spot.outputs.success != 'true' && steps.metal_ondemand.outputs.success != 'true' && steps.provisional_spot.outputs.success != 'true'
+        if: steps.metal_ondemand.outputs.success != 'true'
         continue-on-error: true
         working-directory: terraform
         env:
@@ -306,22 +243,105 @@ jobs:
             echo "ARM64 provisional on-demand failed with exit code $EXIT_CODE"
           fi
 
+      # Try Metal Spot
+      - name: Cleanup ARM64 Provisional On-Demand
+        if: steps.metal_ondemand.outputs.success != 'true' && steps.provisional_ondemand.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_use_on_demand: "true"
+          TF_VAR_launch_arm64_only: "true"
+        run: terraform destroy -auto-approve || true
+
+      - name: Try ARM64 Metal Spot
+        id: metal_spot
+        if: steps.metal_ondemand.outputs.success != 'true' && steps.provisional_ondemand.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Attempting ARM64 metal spot (c6g.metal)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 metal spot failed with exit code $EXIT_CODE"
+          fi
+
+      # Try Provisional Spot
+      - name: Cleanup ARM64 Metal Spot
+        if: steps.metal_ondemand.outputs.success != 'true' && steps.provisional_ondemand.outputs.success != 'true' && steps.metal_spot.outputs.success != 'true'
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: metal
+          TF_VAR_launch_arm64_only: "true"
+        run: terraform destroy -auto-approve -target=aws_spot_instance_request.arm64_runner || true
+
+      - name: Try ARM64 Provisional Spot
+        id: provisional_spot
+        if: steps.metal_ondemand.outputs.success != 'true' && steps.provisional_ondemand.outputs.success != 'true' && steps.metal_spot.outputs.success != 'true'
+        continue-on-error: true
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
+          TF_VAR_benchmark_mode: provisional
+          TF_VAR_launch_arm64_only: "true"
+        run: |
+          echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
+          set +e
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_runner
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot launched successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 provisional spot failed with exit code $EXIT_CODE"
+          fi
+
       - name: Set ARM64 Launch Results
         id: result
         run: |
-          if [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
-            echo "launched=true" >> $GITHUB_OUTPUT
-            echo "is_provisional=false" >> $GITHUB_OUTPUT
-            echo "instance_type=c6g.metal-spot" >> $GITHUB_OUTPUT
-            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
-            echo "was_spot=true" >> $GITHUB_OUTPUT
-            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
+          # Priority order: metal_ondemand -> provisional_ondemand -> metal_spot -> provisional_spot
+          if [[ "${{ steps.metal_ondemand.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
             echo "is_provisional=false" >> $GITHUB_OUTPUT
             echo "instance_type=c6g.metal-ondemand" >> $GITHUB_OUTPUT
             echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=true" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.2xlarge-ondemand" >> $GITHUB_OUTPUT
+            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=false" >> $GITHUB_OUTPUT
+            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.metal_spot.outputs.success }}" == "true" ]]; then
+            echo "launched=true" >> $GITHUB_OUTPUT
+            echo "is_provisional=false" >> $GITHUB_OUTPUT
+            echo "instance_type=c6g.metal-spot" >> $GITHUB_OUTPUT
+            echo "runner_label=metal-arm64" >> $GITHUB_OUTPUT
+            echo "was_spot=true" >> $GITHUB_OUTPUT
             echo "benchmark_mode=metal" >> $GITHUB_OUTPUT
           elif [[ "${{ steps.provisional_spot.outputs.success }}" == "true" ]]; then
             echo "launched=true" >> $GITHUB_OUTPUT
@@ -329,13 +349,6 @@ jobs:
             echo "instance_type=c6g.2xlarge-spot" >> $GITHUB_OUTPUT
             echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
             echo "was_spot=true" >> $GITHUB_OUTPUT
-            echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.provisional_ondemand.outputs.success }}" == "true" ]]; then
-            echo "launched=true" >> $GITHUB_OUTPUT
-            echo "is_provisional=true" >> $GITHUB_OUTPUT
-            echo "instance_type=c6g.2xlarge-ondemand" >> $GITHUB_OUTPUT
-            echo "runner_label=provisional-arm64" >> $GITHUB_OUTPUT
-            echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "benchmark_mode=provisional" >> $GITHUB_OUTPUT
           else
             echo "launched=false" >> $GITHUB_OUTPUT
@@ -1246,6 +1259,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # For releases (tag checkout = detached HEAD), fetch and checkout main first
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "Release workflow detected, checking out main branch..."
+            git fetch origin main
+            git checkout main
+            git pull origin main
+          fi
+
           # Add all results
           git add -f results/latest/
           git add -f results/PROVISIONAL_STATUS.json
@@ -1259,7 +1280,7 @@ jobs:
 
           # Use PAT for push to bypass branch protection rules
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-          git push || echo "Push failed (may need permissions)"
+          git push origin HEAD:main || echo "Push failed (may need permissions)"
 
       - name: Create Summary
         run: |
