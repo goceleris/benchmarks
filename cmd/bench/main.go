@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/goceleris/benchmarks/internal/bench"
 )
 
@@ -86,24 +88,37 @@ func main() {
 	mergeFile := flag.String("merge", "", "Merge results from another checkpoint file into output")
 
 	// Remote mode flags
-	serverIP := flag.String("server-ip", "", "Remote server IP (enables remote mode)")
+	serverIP := flag.String("server-ip", "", "Remote server IP (enables remote mode, can be empty if using SSM)")
 	controlPort := flag.String("control-port", "9999", "Control daemon port on remote server")
 	serverRetryTimeout := flag.Duration("server-retry-timeout", 10*time.Minute, "Max time to wait for server to become available")
 	serverRetryInterval := flag.Duration("server-retry-interval", 5*time.Second, "Interval between server availability checks")
+	useSSM := flag.Bool("use-ssm", false, "Use AWS SSM Parameter Store for dynamic server IP discovery")
+	ssmParamName := flag.String("ssm-param", "", "SSM parameter name for server IP (default: /celeris-benchmark/server-ip/<arch>)")
+	awsRegion := flag.String("aws-region", "us-east-1", "AWS region for SSM")
 
 	flag.Parse()
+
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x86"
+	}
 
 	// Check for environment variable override
 	if *serverIP == "" {
 		*serverIP = os.Getenv("BENCHMARK_SERVER_IP")
 	}
 
-	remoteMode := *serverIP != ""
-
-	arch := runtime.GOARCH
-	if arch == "amd64" {
-		arch = "x86"
+	// Enable SSM if specified or if no server IP is provided but we're in a remote context
+	if os.Getenv("USE_SSM_DISCOVERY") == "true" {
+		*useSSM = true
 	}
+
+	// Set default SSM parameter name based on architecture
+	if *ssmParamName == "" {
+		*ssmParamName = fmt.Sprintf("/celeris-benchmark/server-ip/%s", arch)
+	}
+
+	remoteMode := *serverIP != "" || *useSSM
 
 	// Get CPU count for scaling
 	numCPU := runtime.NumCPU()
@@ -239,6 +254,20 @@ func main() {
 			controlPort:   *controlPort,
 			retryTimeout:  *serverRetryTimeout,
 			retryInterval: *serverRetryInterval,
+			useSSM:        *useSSM,
+			ssmParamName:  *ssmParamName,
+			awsRegion:     *awsRegion,
+		}
+
+		// If using SSM and no initial IP, fetch it now
+		if *useSSM && *serverIP == "" {
+			log.Printf("Fetching server IP from SSM parameter: %s", *ssmParamName)
+			if err := rc.refreshServerIP(ctx); err != nil {
+				log.Printf("Warning: Could not fetch server IP from SSM: %v", err)
+				log.Printf("Will retry during benchmark execution...")
+			} else {
+				log.Printf("Server IP from SSM: %s", rc.serverIP)
+			}
 		}
 	}
 
@@ -428,6 +457,50 @@ type RemoteController struct {
 	controlPort   string
 	retryTimeout  time.Duration
 	retryInterval time.Duration
+	useSSM        bool   // Whether to use SSM for dynamic IP discovery
+	ssmParamName  string // SSM parameter name for server IP
+	awsRegion     string
+}
+
+// getServerIPFromSSM fetches the current server IP from AWS SSM Parameter Store
+func (rc *RemoteController) getServerIPFromSSM(ctx context.Context) (string, error) {
+	if !rc.useSSM {
+		return rc.serverIP, nil
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(rc.awsRegion))
+	if err != nil {
+		return "", fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	client := ssm.NewFromConfig(cfg)
+	output, err := client.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: &rc.ssmParamName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get SSM parameter %s: %w", rc.ssmParamName, err)
+	}
+
+	if output.Parameter == nil || output.Parameter.Value == nil {
+		return "", fmt.Errorf("SSM parameter %s has no value", rc.ssmParamName)
+	}
+
+	newIP := *output.Parameter.Value
+	if newIP != rc.serverIP {
+		log.Printf("Server IP changed: %s -> %s (discovered via SSM)", rc.serverIP, newIP)
+		rc.serverIP = newIP
+	}
+
+	return newIP, nil
+}
+
+// refreshServerIP updates the server IP from SSM if using dynamic discovery
+func (rc *RemoteController) refreshServerIP(ctx context.Context) error {
+	if !rc.useSSM {
+		return nil
+	}
+	_, err := rc.getServerIPFromSSM(ctx)
+	return err
 }
 
 // StartServer starts a server on the remote machine
@@ -504,6 +577,17 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 		default:
 		}
 
+		// Refresh IP if using SSM
+		if rc.useSSM {
+			_ = rc.refreshServerIP(ctx)
+		}
+
+		if rc.serverIP == "" {
+			log.Printf("No server IP available, waiting %s...", rc.retryInterval)
+			time.Sleep(rc.retryInterval)
+			continue
+		}
+
 		// Check if server is reachable
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", rc.serverIP, rc.serverPort), 2*time.Second)
 		if err == nil {
@@ -511,7 +595,7 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 			return nil
 		}
 
-		log.Printf("Server not available, waiting %s...", rc.retryInterval)
+		log.Printf("Server %s not available, waiting %s...", rc.serverIP, rc.retryInterval)
 		time.Sleep(rc.retryInterval)
 	}
 
@@ -530,13 +614,24 @@ func runBenchmarkWithRetry(ctx context.Context, cfg bench.Config, rc *RemoteCont
 		default:
 		}
 
+		// Refresh server IP from SSM if using dynamic discovery
+		// This handles the case where a retry server has a different IP
+		if rc.useSSM {
+			if err := rc.refreshServerIP(ctx); err != nil {
+				log.Printf("Warning: Could not refresh server IP from SSM: %v", err)
+			}
+		}
+
+		// Update the benchmark URL with current server IP
+		cfg.URL = updateURLHost(cfg.URL, rc.serverIP, rc.serverPort)
+
 		// Check server health first
 		if err := rc.WaitForServer(ctx); err != nil {
 			lastErr = err
 			log.Printf("Server unavailable during benchmark, pausing and waiting...")
 
 			// Server might have been terminated (spot instance)
-			// Wait for it to come back (retry will bring up new instance)
+			// Wait for it to come back (retry will bring up new instance with new IP)
 			pauseStart := time.Now()
 			for time.Now().Before(deadline) {
 				select {
@@ -545,9 +640,18 @@ func runBenchmarkWithRetry(ctx context.Context, cfg bench.Config, rc *RemoteCont
 				default:
 				}
 
+				// Refresh IP from SSM - retry server will have registered its new IP
+				if rc.useSSM {
+					if err := rc.refreshServerIP(ctx); err != nil {
+						log.Printf("Waiting for server IP in SSM...")
+						time.Sleep(interval)
+						continue
+					}
+				}
+
 				// Try to restart the server via control daemon
 				if err := rc.StartServer(ctx, serverType); err == nil {
-					log.Printf("Server recovered after %s pause", time.Since(pauseStart).Round(time.Second))
+					log.Printf("Server recovered after %s pause (IP: %s)", time.Since(pauseStart).Round(time.Second), rc.serverIP)
 					break
 				}
 
@@ -576,6 +680,18 @@ func runBenchmarkWithRetry(ctx context.Context, cfg bench.Config, rc *RemoteCont
 		return nil, fmt.Errorf("benchmark failed after retries: %w", lastErr)
 	}
 	return nil, fmt.Errorf("benchmark timed out")
+}
+
+// updateURLHost replaces the host:port in a URL with new values
+func updateURLHost(urlStr, newHost, newPort string) string {
+	// Simple replacement - assumes URL format http://host:port/path
+	parts := strings.SplitN(urlStr, "/", 4)
+	if len(parts) >= 4 {
+		return fmt.Sprintf("%s//%s:%s/%s", parts[0], newHost, newPort, parts[3])
+	} else if len(parts) == 3 {
+		return fmt.Sprintf("%s//%s:%s/", parts[0], newHost, newPort)
+	}
+	return urlStr
 }
 
 // isConnectionError checks if the error is a connection-related error

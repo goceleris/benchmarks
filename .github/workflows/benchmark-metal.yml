@@ -774,15 +774,17 @@ jobs:
           IS_PROVISIONAL: ${{ needs.launch-arm64.outputs.is_provisional }}
           INSTANCE_TYPE: ${{ needs.launch-arm64.outputs.instance_type }}
           SERVER_IP: ${{ needs.launch-arm64.outputs.server_private_ip }}
+          AWS_REGION: us-east-1
         run: |
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
             echo "Running PROVISIONAL benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           else
             echo "Running OFFICIAL metal benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           fi
-          # Run benchmark in remote mode, connecting to server via control daemon
+          # Run benchmark in remote mode with SSM discovery for dynamic IP updates
+          # SSM allows client to discover new server IP if spot instance is replaced
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" \
-            -server-ip "$SERVER_IP" -control-port 9999 -resume
+            -server-ip "$SERVER_IP" -control-port 9999 -use-ssm -resume
 
       - name: Upload Results
         if: always()
@@ -863,14 +865,16 @@ jobs:
           IS_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
           INSTANCE_TYPE: ${{ needs.launch-x86.outputs.instance_type }}
           SERVER_IP: ${{ needs.launch-x86.outputs.server_private_ip }}
+          AWS_REGION: us-east-1
         run: |
           if [[ "$IS_PROVISIONAL" == "true" ]]; then
             echo "Running PROVISIONAL benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           else
             echo "Running OFFICIAL metal benchmarks (server: $SERVER_IP, type: $INSTANCE_TYPE)"
           fi
+          # Run benchmark in remote mode with SSM discovery for dynamic IP updates
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" \
-            -server-ip "$SERVER_IP" -control-port 9999 -resume
+            -server-ip "$SERVER_IP" -control-port 9999 -use-ssm -resume
 
       - name: Upload Results
         if: always()
