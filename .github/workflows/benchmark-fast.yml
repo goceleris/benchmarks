@@ -507,7 +507,9 @@ jobs:
   retry-benchmark-arm64:
     name: Retry Benchmark (ARM64)
     needs: [retry-arm64, benchmark-arm64]
-    if: needs.retry-arm64.outputs.launched == 'true'
+    if: |
+      always() &&
+      needs.retry-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, fast-arm64]
     timeout-minutes: 90
 
@@ -559,7 +561,9 @@ jobs:
   retry-benchmark-x86:
     name: Retry Benchmark (x86)
     needs: [retry-x86, benchmark-x86]
-    if: needs.retry-x86.outputs.launched == 'true'
+    if: |
+      always() &&
+      needs.retry-x86.outputs.launched == 'true'
     runs-on: [self-hosted, fast-x86]
     timeout-minutes: 90
 
