@@ -102,10 +102,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 spot (c6g.medium)..."
-          if terraform apply -auto-approve 2>&1; then
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 spot failed with exit code $EXIT_CODE"
           fi
 
       - name: Cleanup ARM64 Spot
@@ -131,10 +137,16 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           echo "Attempting ARM64 on-demand (c6g.medium)..."
-          if terraform apply -auto-approve 2>&1; then
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "ARM64 on-demand failed with exit code $EXIT_CODE"
           fi
 
       - name: Set ARM64 Launch Results
@@ -193,10 +205,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 spot (c5.large)..."
-          if terraform apply -auto-approve 2>&1; then
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 spot launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 spot failed with exit code $EXIT_CODE"
           fi
 
       - name: Cleanup x86 Spot
@@ -222,10 +240,16 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           echo "Attempting x86 on-demand (c5.large)..."
-          if terraform apply -auto-approve 2>&1; then
+          set +e
+          terraform apply -auto-approve
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            echo "x86 on-demand launched successfully"
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "x86 on-demand failed with exit code $EXIT_CODE"
           fi
 
       - name: Set x86 Launch Results
