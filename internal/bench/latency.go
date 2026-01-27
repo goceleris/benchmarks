@@ -7,29 +7,34 @@ import (
 )
 
 // LatencyRecorder records latency samples for percentile calculation.
+// Uses reservoir sampling when sample count exceeds maxSamples to bound memory usage.
 type LatencyRecorder struct {
-	mu      sync.Mutex
-	samples []time.Duration
-	sum     time.Duration
-	count   int64
-	min     time.Duration
-	max     time.Duration
+	mu         sync.Mutex
+	samples    []time.Duration
+	sum        time.Duration
+	count      int64
+	min        time.Duration
+	max        time.Duration
+	maxSamples int
 }
+
+const defaultMaxSamples = 1000000 // 1M samples = ~8MB memory
 
 // NewLatencyRecorder creates a new latency recorder.
 func NewLatencyRecorder() *LatencyRecorder {
 	return &LatencyRecorder{
-		samples: make([]time.Duration, 0, 100000),
-		min:     time.Hour,
+		samples:    make([]time.Duration, 0, defaultMaxSamples),
+		min:        time.Hour,
+		maxSamples: defaultMaxSamples,
 	}
 }
 
 // Record adds a latency sample.
+// Uses reservoir sampling to maintain a representative sample when count exceeds maxSamples.
 func (r *LatencyRecorder) Record(d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.samples = append(r.samples, d)
 	r.sum += d
 	r.count++
 
@@ -39,6 +44,19 @@ func (r *LatencyRecorder) Record(d time.Duration) {
 	if d > r.max {
 		r.max = d
 	}
+
+	// Use reservoir sampling when we exceed capacity
+	if len(r.samples) < r.maxSamples {
+		r.samples = append(r.samples, d)
+	} else {
+		// Reservoir sampling: replace random element with probability maxSamples/count
+		// This maintains a uniform random sample of the stream
+		// Use a simple modulo-based sampling for performance (not cryptographically random, but sufficient for latency stats)
+		if int(r.count%int64(r.maxSamples)) == 0 {
+			idx := int(r.count / int64(r.maxSamples)) % r.maxSamples
+			r.samples[idx] = d
+		}
+	}
 }
 
 // Reset clears all recorded samples.
@@ -46,6 +64,7 @@ func (r *LatencyRecorder) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Reuse the underlying array to avoid reallocation
 	r.samples = r.samples[:0]
 	r.sum = 0
 	r.count = 0

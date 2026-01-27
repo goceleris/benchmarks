@@ -108,15 +108,15 @@ test:
 	$(GOTEST) -v ./...
 	@echo "$(GREEN)✓ Tests complete$(NC)"
 
-## benchmark: Run benchmarks using Go benchmark tool
+## benchmark: Run benchmarks using Go benchmark tool (auto-scales based on CPU count)
 benchmark: build
-	@echo "$(GREEN)Running benchmarks...$(NC)"
-	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 30s -connections 256 -workers 8
+	@echo "$(GREEN)Running benchmarks (auto-scaled to $$(nproc 2>/dev/null || sysctl -n hw.ncpu) CPUs)...$(NC)"
+	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 30s
 
-## benchmark-quick: Quick benchmark for validation
+## benchmark-quick: Quick benchmark for validation (auto-scales based on CPU count)
 benchmark-quick: build
-	@echo "$(GREEN)Running quick benchmark validation...$(NC)"
-	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 5s -connections 64 -workers 4
+	@echo "$(GREEN)Running quick benchmark validation (auto-scaled to $$(nproc 2>/dev/null || sysctl -n hw.ncpu) CPUs)...$(NC)"
+	./$(BINARY_DIR)/$(BENCH_BINARY) -mode baseline -duration 5s
 
 ## bench-charts: Test chart generation with sample data
 bench-charts:

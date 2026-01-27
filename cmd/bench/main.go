@@ -63,8 +63,10 @@ var benchmarkTypes = []struct {
 func main() {
 	mode := flag.String("mode", "baseline", "Benchmark mode: baseline, theoretical, all")
 	duration := flag.Duration("duration", 30*time.Second, "Benchmark duration")
-	connections := flag.Int("connections", 256, "Number of connections")
-	workers := flag.Int("workers", 8, "Number of worker goroutines")
+	connections := flag.Int("connections", 0, "Number of connections (0 = auto-scale based on workers)")
+	workers := flag.Int("workers", 0, "Number of worker goroutines (0 = auto-scale based on CPU)")
+	workersPerCPU := flag.Int("workers-per-cpu", 4, "Workers per CPU core when auto-scaling (for I/O-bound workloads)")
+	connectionsPerWorker := flag.Int("connections-per-worker", 2, "Connections per worker when auto-scaling")
 	warmup := flag.Duration("warmup", 5*time.Second, "Warmup duration")
 	outputDir := flag.String("output", "results", "Output directory for results")
 	port := flag.String("port", "8080", "Server port")
@@ -80,11 +82,54 @@ func main() {
 		arch = "x86"
 	}
 
+	// Get CPU count for scaling
+	numCPU := runtime.NumCPU()
+
+	// Auto-scale workers based on CPU count if not explicitly set
+	actualWorkers := *workers
+	if actualWorkers == 0 {
+		// For I/O-bound HTTP benchmarks, use multiple workers per CPU
+		// This ensures we can saturate the server even with network latency
+		actualWorkers = numCPU * *workersPerCPU
+		// Ensure minimum of 8 workers for small machines
+		if actualWorkers < 8 {
+			actualWorkers = 8
+		}
+		// Cap at reasonable maximum to avoid overwhelming the system
+		if actualWorkers > 1024 {
+			actualWorkers = 1024
+		}
+	}
+
+	// Auto-scale connections based on workers if not explicitly set
+	actualConnections := *connections
+	if actualConnections == 0 {
+		// Multiple connections per worker for better connection pool utilization
+		actualConnections = actualWorkers * *connectionsPerWorker
+		// Ensure minimum of 64 connections
+		if actualConnections < 64 {
+			actualConnections = 64
+		}
+		// Cap at reasonable maximum
+		if actualConnections > 4096 {
+			actualConnections = 4096
+		}
+	}
+
 	log.Printf("Celeris Benchmark Runner")
 	log.Printf("Architecture: %s", arch)
+	log.Printf("Available CPUs: %d", numCPU)
 	log.Printf("Duration: %s", *duration)
-	log.Printf("Connections: %d", *connections)
-	log.Printf("Workers: %d", *workers)
+	if *workers == 0 {
+		log.Printf("Workers: %d (auto-scaled: %d CPUs x %d workers/CPU)", actualWorkers, numCPU, *workersPerCPU)
+	} else {
+		log.Printf("Workers: %d (manually set)", actualWorkers)
+	}
+	if *connections == 0 {
+		log.Printf("Connections: %d (auto-scaled: %d workers x %d conn/worker)", actualConnections, actualWorkers, *connectionsPerWorker)
+	} else {
+		log.Printf("Connections: %d (manually set)", actualConnections)
+	}
 
 	if *serverBin == "" {
 		candidates := []string{
@@ -143,8 +188,9 @@ func main() {
 			Architecture: arch,
 			Config: bench.BenchmarkConfig{
 				Duration:    duration.String(),
-				Connections: *connections,
-				Workers:     *workers,
+				Connections: actualConnections,
+				Workers:     actualWorkers,
+				CPUs:        numCPU,
 			},
 			Results: []bench.ServerResult{},
 		}
@@ -236,8 +282,8 @@ func main() {
 				Method:      bt.Method,
 				Body:        bt.Body,
 				Duration:    *duration,
-				Connections: *connections,
-				Workers:     *workers,
+				Connections: actualConnections,
+				Workers:     actualWorkers,
 				WarmupTime:  *warmup,
 				KeepAlive:   true,
 				H2C:         strings.Contains(serverType, "-h2") || strings.Contains(serverType, "-hybrid"),

@@ -654,7 +654,7 @@ jobs:
           else
             echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
           fi
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
 
       - name: Upload Results
         if: always()
@@ -696,7 +696,7 @@ jobs:
           else
             echo "Running OFFICIAL metal benchmarks on $INSTANCE_TYPE"
           fi
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
 
       - name: Upload Results
         if: always()
@@ -1194,10 +1194,10 @@ jobs:
           # Check if checkpoint exists and resume from it
           if [ -f results/checkpoint-arm64.json ]; then
             echo "Found checkpoint, resuming from previous progress..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8 -resume
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"  -resume
           else
             echo "No checkpoint found, starting fresh..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
           fi
 
       - name: Upload Results
@@ -1277,10 +1277,10 @@ jobs:
           # Check if checkpoint exists and resume from it
           if [ -f results/checkpoint-x86.json ]; then
             echo "Found checkpoint, resuming from previous progress..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8 -resume
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"  -resume
           else
             echo "No checkpoint found, starting fresh..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" -connections 256 -workers 8
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
           fi
 
       - name: Upload Results
