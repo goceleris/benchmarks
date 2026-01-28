@@ -455,16 +455,16 @@ saveAndExit:
 
 // RemoteController manages communication with the control daemon
 type RemoteController struct {
-	serverIP        string
-	serverPort      string
-	controlPort     string
-	retryTimeout    time.Duration
-	retryInterval   time.Duration
-	maxUnreachable  time.Duration // Max time control daemon can be unreachable before hard fail
-	useSSM          bool          // Whether to use SSM for dynamic IP discovery
-	ssmParamName    string        // SSM parameter name for server IP
-	awsRegion       string
-	unreachableSince time.Time    // When control daemon first became unreachable (zero if reachable)
+	serverIP         string
+	serverPort       string
+	controlPort      string
+	retryTimeout     time.Duration
+	retryInterval    time.Duration
+	maxUnreachable   time.Duration // Max time control daemon can be unreachable before hard fail
+	useSSM           bool          // Whether to use SSM for dynamic IP discovery
+	ssmParamName     string        // SSM parameter name for server IP
+	awsRegion        string
+	unreachableSince time.Time // When control daemon first became unreachable (zero if reachable)
 }
 
 // getServerIPFromSSM fetches the current server IP from AWS SSM Parameter Store
