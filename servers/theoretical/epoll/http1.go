@@ -21,7 +21,7 @@ import (
 const (
 	maxEventsBase  = 1024  // Base epoll_wait batch size
 	maxConnsPerCPU = 512   // Connections per CPU per worker
-	readBufSize    = 8192  // Per-connection read buffer
+	readBufSize    = 65536 // Per-connection read buffer (64KB for large POST bodies)
 	maxConnsMin    = 1024  // Minimum connections per worker
 	maxConnsMax    = 65536 // Maximum connections per worker (fd limit)
 )

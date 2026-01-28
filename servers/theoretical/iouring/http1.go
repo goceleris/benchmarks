@@ -25,9 +25,9 @@ const (
 	IORING_ENTER_GETEVENTS = 1 << 0
 
 	// Base values for scaling
-	sqeCountBase      = 1024 // Base submission queue size
-	bufferCountPerCPU = 512  // Buffers per CPU per worker
-	bufferSize        = 8192 // Size of each buffer
+	sqeCountBase      = 1024  // Base submission queue size
+	bufferCountPerCPU = 512   // Buffers per CPU per worker
+	bufferSize        = 65536 // Size of each buffer (64KB for large POST bodies)
 
 	// Limits
 	sqeCountMin    = 1024
