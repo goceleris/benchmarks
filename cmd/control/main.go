@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -268,14 +269,16 @@ func (d *ControlDaemon) waitForReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	addr := fmt.Sprintf("localhost:%s", d.serverPort)
 
+	// Use TCP connection check instead of HTTP GET, because H2-only
+	// servers (epoll-h2, iouring-h2) don't understand HTTP/1.1 requests.
 	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://" + addr + "/")
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
-			_ = resp.Body.Close()
+			_ = conn.Close()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return fmt.Errorf("timeout waiting for server")
+	return fmt.Errorf("timeout waiting for server on %s", addr)
 }
