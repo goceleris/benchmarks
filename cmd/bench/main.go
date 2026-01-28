@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -237,15 +238,38 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Channel to signal spot interruption
+	spotInterruptChan := make(chan struct{})
+
+	// Track if we're exiting due to spot interruption (need non-zero exit code)
+	// Use atomic to avoid race between goroutine and main
+	var exitDueToSpotInterrupt atomic.Bool
+
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal %v, saving checkpoint and shutting down...", sig)
+		select {
+		case sig := <-sigChan:
+			log.Printf("Received signal %v, saving checkpoint and shutting down...", sig)
+		case <-spotInterruptChan:
+			log.Printf("Spot interruption detected, saving checkpoint and shutting down...")
+			exitDueToSpotInterrupt.Store(true)
+		}
 		if err := checkpoint.Save(*checkpointFile); err != nil {
 			log.Printf("ERROR: Failed to save checkpoint: %v", err)
 		} else {
 			log.Printf("Checkpoint saved to: %s", *checkpointFile)
 		}
 		cancel()
+	}()
+
+	// Start spot interruption monitor (checks AWS metadata for termination notice)
+	go monitorSpotInterruption(ctx, spotInterruptChan)
+
+	// Defer exit code handling - must be after checkpoint save
+	defer func() {
+		if exitDueToSpotInterrupt.Load() {
+			log.Printf("Exiting with code 1 due to spot interruption (triggers retry job)")
+			os.Exit(1)
+		}
 	}()
 
 	// Create remote controller if in remote mode
@@ -828,4 +852,101 @@ func waitForServer(ctx context.Context, host, port string, timeout time.Duration
 	}
 
 	return fmt.Errorf("timeout waiting for server on %s:%s", host, port)
+}
+
+// SpotInterruptionAction represents the AWS spot interruption notice
+type SpotInterruptionAction struct {
+	Action string `json:"action"`
+	Time   string `json:"time"`
+}
+
+// monitorSpotInterruption polls AWS metadata for spot instance interruption notices.
+// AWS provides a 2-minute warning before spot instance termination.
+// When detected, it signals the interrupt channel to trigger graceful shutdown.
+//
+// For testing, set SIMULATE_SPOT_INTERRUPT environment variable to a duration (e.g., "30s")
+// to simulate a spot interruption after that delay.
+func monitorSpotInterruption(ctx context.Context, interruptChan chan<- struct{}) {
+	// Check for simulation mode (for testing)
+	if simDelay := os.Getenv("SIMULATE_SPOT_INTERRUPT"); simDelay != "" {
+		delay, err := time.ParseDuration(simDelay)
+		if err != nil {
+			log.Printf("Invalid SIMULATE_SPOT_INTERRUPT value %q: %v", simDelay, err)
+		} else {
+			log.Printf("TESTING MODE: Will simulate spot interruption in %s", delay)
+			go func() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+					log.Printf("SIMULATED SPOT INTERRUPTION: Triggering graceful shutdown for testing")
+					close(interruptChan)
+				}
+			}()
+			return
+		}
+	}
+
+	// AWS instance metadata endpoint for spot interruption
+	const metadataURL = "http://169.254.169.254/latest/meta-data/spot/instance-action"
+	const pollInterval = 5 * time.Second
+
+	// Create HTTP client with short timeout (metadata service should be fast)
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	// Check if we're even on an EC2 instance by doing an initial probe
+	// If not on EC2, the metadata endpoint will timeout/fail - that's fine, just exit quietly
+	initialReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://169.254.169.254/latest/meta-data/", nil)
+	initialResp, initialErr := client.Do(initialReq)
+	if initialErr != nil {
+		// Not on EC2 or metadata service unavailable - silently stop monitoring
+		return
+	}
+	_ = initialResp.Body.Close()
+
+	log.Printf("Spot interruption monitor started (checking every %s)", pollInterval)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
+			if err != nil {
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				// Network error - might not be on EC2, continue polling
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				// Interruption notice received!
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+
+				var action SpotInterruptionAction
+				if err := json.Unmarshal(body, &action); err == nil {
+					log.Printf("SPOT INTERRUPTION NOTICE: action=%s, time=%s", action.Action, action.Time)
+					log.Printf("Instance will be %s at %s - initiating graceful shutdown", action.Action, action.Time)
+				} else {
+					log.Printf("SPOT INTERRUPTION NOTICE received (raw: %s)", string(body))
+				}
+
+				// Signal the main goroutine to save checkpoint and shutdown
+				close(interruptChan)
+				return
+			}
+
+			// 404 = no interruption scheduled (normal case)
+			_ = resp.Body.Close()
+		}
+	}
 }

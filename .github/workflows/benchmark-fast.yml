@@ -300,7 +300,7 @@ jobs:
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
           # Run with checkpoint support - saves progress after each benchmark
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
 
       - name: Upload Results
         if: always()
@@ -336,7 +336,7 @@ jobs:
           go build -o bin/server ./cmd/server
           go build -o bin/bench ./cmd/bench
           # Run with checkpoint support - saves progress after each benchmark
-          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+          ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
 
       - name: Upload Results
         if: always()
