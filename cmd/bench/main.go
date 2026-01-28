@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -455,6 +456,7 @@ saveAndExit:
 
 // RemoteController manages communication with the control daemon
 type RemoteController struct {
+	mu               sync.RWMutex // Protects serverIP access
 	serverIP         string
 	serverPort       string
 	controlPort      string
@@ -470,7 +472,10 @@ type RemoteController struct {
 // getServerIPFromSSM fetches the current server IP from AWS SSM Parameter Store
 func (rc *RemoteController) getServerIPFromSSM(ctx context.Context) (string, error) {
 	if !rc.useSSM {
-		return rc.serverIP, nil
+		rc.mu.RLock()
+		ip := rc.serverIP
+		rc.mu.RUnlock()
+		return ip, nil
 	}
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(rc.awsRegion))
@@ -491,10 +496,14 @@ func (rc *RemoteController) getServerIPFromSSM(ctx context.Context) (string, err
 	}
 
 	newIP := *output.Parameter.Value
-	if newIP != rc.serverIP {
-		log.Printf("Server IP changed: %s -> %s (discovered via SSM)", rc.serverIP, newIP)
+
+	rc.mu.Lock()
+	oldIP := rc.serverIP
+	if newIP != oldIP {
+		log.Printf("Server IP changed: %s -> %s (discovered via SSM)", oldIP, newIP)
 		rc.serverIP = newIP
 	}
+	rc.mu.Unlock()
 
 	return newIP, nil
 }
@@ -510,7 +519,11 @@ func (rc *RemoteController) refreshServerIP(ctx context.Context) error {
 
 // StartServer starts a server on the remote machine
 func (rc *RemoteController) StartServer(ctx context.Context, serverType string) error {
-	url := fmt.Sprintf("http://%s:%s/start?type=%s", rc.serverIP, rc.controlPort, serverType)
+	rc.mu.RLock()
+	ip := rc.serverIP
+	rc.mu.RUnlock()
+
+	url := fmt.Sprintf("http://%s:%s/start?type=%s", ip, rc.controlPort, serverType)
 
 	// Retry starting server with timeout
 	deadline := time.Now().Add(rc.retryTimeout)
@@ -573,7 +586,11 @@ func (rc *RemoteController) StartServer(ctx context.Context, serverType string) 
 
 // StopServer stops the current server on the remote machine
 func (rc *RemoteController) StopServer(ctx context.Context) error {
-	url := fmt.Sprintf("http://%s:%s/stop", rc.serverIP, rc.controlPort)
+	rc.mu.RLock()
+	ip := rc.serverIP
+	rc.mu.RUnlock()
+
+	url := fmt.Sprintf("http://%s:%s/stop", ip, rc.controlPort)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
@@ -605,14 +622,18 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 			_ = rc.refreshServerIP(ctx)
 		}
 
-		if rc.serverIP == "" {
+		rc.mu.RLock()
+		ip := rc.serverIP
+		rc.mu.RUnlock()
+
+		if ip == "" {
 			log.Printf("No server IP available, waiting %s...", rc.retryInterval)
 			time.Sleep(rc.retryInterval)
 			continue
 		}
 
 		// First check if control daemon is reachable (quick health check)
-		controlURL := fmt.Sprintf("http://%s:%s/health", rc.serverIP, rc.controlPort)
+		controlURL := fmt.Sprintf("http://%s:%s/health", ip, rc.controlPort)
 		healthReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, controlURL, nil)
 		healthResp, healthErr := http.DefaultClient.Do(healthReq)
 		if healthErr != nil {
@@ -639,13 +660,16 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 		rc.unreachableSince = time.Time{}
 
 		// Check if server port is reachable
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", rc.serverIP, rc.serverPort), 2*time.Second)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", ip, rc.serverPort), 2*time.Second)
 		if err == nil {
 			_ = conn.Close()
 			return nil
 		}
 
-		log.Printf("Server %s not available (will retry)...", rc.serverIP)
+		rc.mu.RLock()
+		ip = rc.serverIP
+		rc.mu.RUnlock()
+		log.Printf("Server %s not available (will retry)...", ip)
 		time.Sleep(rc.retryInterval)
 	}
 
