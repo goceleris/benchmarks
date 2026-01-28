@@ -1867,7 +1867,44 @@ jobs:
           terraform_version: "1.6.0"
           terraform_wrapper: false
 
-      - name: Terraform Destroy ARM64
+      - name: Direct AWS Cleanup ARM64
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Terminating ARM64 instances by tag (direct AWS API)..."
+
+          # Find and terminate all ARM64 benchmark instances by tag
+          # Tag format: benchmark-server-arm64-* or benchmark-client-arm64-*
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-*-arm64-*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            echo "Found ARM64 instances: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS || true
+            echo "Termination request sent"
+          else
+            echo "No ARM64 instances found to terminate"
+          fi
+
+          # Also cancel any spot requests
+          SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-*-arm64-*" \
+                      "Name=state,Values=open,active" \
+            --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$SPOT_IDS" ] && [ "$SPOT_IDS" != "None" ]; then
+            echo "Found ARM64 spot requests: $SPOT_IDS"
+            aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $SPOT_IDS || true
+          fi
+
+      - name: Terraform Destroy ARM64 (backup)
+        continue-on-error: true
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -1876,7 +1913,7 @@ jobs:
           TF_VAR_launch_arm64_only: "true"
         run: |
           terraform init
-          # Try destroying both spot and on-demand resources
+          # Try destroying via Terraform as backup (may have no state)
           terraform destroy -auto-approve || true
 
       - name: Cleanup Offline Runners
@@ -1912,7 +1949,44 @@ jobs:
           terraform_version: "1.6.0"
           terraform_wrapper: false
 
-      - name: Terraform Destroy x86
+      - name: Direct AWS Cleanup x86
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Terminating x86 instances by tag (direct AWS API)..."
+
+          # Find and terminate all x86 benchmark instances by tag
+          # Tag format: benchmark-server-x86-* or benchmark-client-x86-*
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-*-x86-*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            echo "Found x86 instances: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS || true
+            echo "Termination request sent"
+          else
+            echo "No x86 instances found to terminate"
+          fi
+
+          # Also cancel any spot requests
+          SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-*-x86-*" \
+                      "Name=state,Values=open,active" \
+            --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$SPOT_IDS" ] && [ "$SPOT_IDS" != "None" ]; then
+            echo "Found x86 spot requests: $SPOT_IDS"
+            aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $SPOT_IDS || true
+          fi
+
+      - name: Terraform Destroy x86 (backup)
+        continue-on-error: true
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -1921,7 +1995,7 @@ jobs:
           TF_VAR_launch_x86_only: "true"
         run: |
           terraform init
-          # Try destroying both spot and on-demand resources
+          # Try destroying via Terraform as backup (may have no state)
           terraform destroy -auto-approve || true
 
       - name: Cleanup Offline Runners
