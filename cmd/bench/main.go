@@ -849,7 +849,30 @@ type SpotInterruptionAction struct {
 // monitorSpotInterruption polls AWS metadata for spot instance interruption notices.
 // AWS provides a 2-minute warning before spot instance termination.
 // When detected, it signals the interrupt channel to trigger graceful shutdown.
+//
+// For testing, set SIMULATE_SPOT_INTERRUPT environment variable to a duration (e.g., "30s")
+// to simulate a spot interruption after that delay.
 func monitorSpotInterruption(ctx context.Context, interruptChan chan<- struct{}) {
+	// Check for simulation mode (for testing)
+	if simDelay := os.Getenv("SIMULATE_SPOT_INTERRUPT"); simDelay != "" {
+		delay, err := time.ParseDuration(simDelay)
+		if err != nil {
+			log.Printf("Invalid SIMULATE_SPOT_INTERRUPT value %q: %v", simDelay, err)
+		} else {
+			log.Printf("TESTING MODE: Will simulate spot interruption in %s", delay)
+			go func() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+					log.Printf("SIMULATED SPOT INTERRUPTION: Triggering graceful shutdown for testing")
+					close(interruptChan)
+				}
+			}()
+			return
+		}
+	}
+
 	// AWS instance metadata endpoint for spot interruption
 	const metadataURL = "http://169.254.169.254/latest/meta-data/spot/instance-action"
 	const pollInterval = 5 * time.Second
