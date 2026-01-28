@@ -281,6 +281,7 @@ jobs:
     if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, server-fast-arm64]
     timeout-minutes: 90
+    continue-on-error: true  # Don't fail workflow - retry will handle spot termination
 
     steps:
       - name: Checkout
@@ -317,6 +318,7 @@ jobs:
     if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, server-fast-x86]
     timeout-minutes: 90
+    continue-on-error: true  # Don't fail workflow - retry will handle spot termination
 
     steps:
       - name: Checkout
@@ -357,7 +359,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-arm64.outputs.launched == 'true' &&
       needs.launch-arm64.outputs.instance_mode == 'spot' &&
-      needs.benchmark-arm64.result == 'failure'
+      needs.benchmark-arm64.outcome == 'failure'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
 
@@ -435,7 +437,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-x86.outputs.launched == 'true' &&
       needs.launch-x86.outputs.instance_mode == 'spot' &&
-      needs.benchmark-x86.result == 'failure'
+      needs.benchmark-x86.outcome == 'failure'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
 
@@ -618,7 +620,7 @@ jobs:
     if: |
       always() &&
       needs.authorize.outputs.authorized == 'true' &&
-      (needs.benchmark-arm64.result == 'success' || needs.benchmark-x86.result == 'success' ||
+      (needs.benchmark-arm64.outcome == 'success' || needs.benchmark-x86.outcome == 'success' ||
        needs.retry-benchmark-arm64.result == 'success' || needs.retry-benchmark-x86.result == 'success')
     permissions:
       pull-requests: write
@@ -663,9 +665,9 @@ jobs:
 
       - name: Generate Charts
         env:
-          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.result == 'success' }}
+          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.outcome == 'success' }}
           ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
-          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.result == 'success' }}
+          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.outcome == 'success' }}
           X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.result == 'success' }}
         run: |
           pip install matplotlib numpy
@@ -965,3 +967,38 @@ jobs:
         run: |
           terraform init
           terraform destroy -auto-approve || true
+
+  final-status:
+    name: Final Status
+    needs: [benchmark-arm64, benchmark-x86, retry-benchmark-arm64, retry-benchmark-x86]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine final status
+        run: |
+          ARM64_OK="false"
+          X86_OK="false"
+
+          # Use 'outcome' for benchmark jobs (they have continue-on-error)
+          # Use 'result' for retry jobs (they don't have continue-on-error)
+          if [[ "${{ needs.benchmark-arm64.outcome }}" == "success" ]] || \
+             [[ "${{ needs.retry-benchmark-arm64.result }}" == "success" ]]; then
+            ARM64_OK="true"
+          fi
+
+          if [[ "${{ needs.benchmark-x86.outcome }}" == "success" ]] || \
+             [[ "${{ needs.retry-benchmark-x86.result }}" == "success" ]]; then
+            X86_OK="true"
+          fi
+
+          echo "ARM64: $ARM64_OK"
+          echo "x86: $X86_OK"
+
+          # At least one architecture must succeed
+          if [[ "$ARM64_OK" == "true" ]] || [[ "$X86_OK" == "true" ]]; then
+            echo "Benchmark completed successfully"
+            exit 0
+          else
+            echo "All benchmarks failed"
+            exit 1
+          fi
