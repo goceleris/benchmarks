@@ -2,11 +2,13 @@
 
 // Package iouring provides barebones HTTP servers using io_uring for maximum throughput.
 // These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
+// Buffer pool and queue sizes scale automatically based on available CPUs.
 package iouring
 
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"runtime"
 	"sync/atomic"
 	"syscall"
@@ -22,10 +24,42 @@ const (
 
 	IORING_ENTER_GETEVENTS = 1 << 0
 
-	sqeCount    = 4096
-	bufferCount = 4096
-	bufferSize  = 8192
+	// Base values for scaling
+	sqeCountBase      = 1024  // Base submission queue size
+	bufferCountPerCPU = 512   // Buffers per CPU per worker
+	bufferSize        = 65536 // Size of each buffer (64KB for large POST bodies)
+
+	// Limits
+	sqeCountMin    = 1024
+	sqeCountMax    = 16384 // io_uring limit
+	bufferCountMin = 1024
+	bufferCountMax = 65536
 )
+
+// getScaledIOUringLimits returns io_uring limits scaled to available CPUs
+func getScaledIOUringLimits() (sqeCount int, bufferCount int) {
+	numCPU := runtime.NumCPU()
+
+	// Scale submission queue with CPU count
+	sqeCount = sqeCountBase * numCPU
+	if sqeCount < sqeCountMin {
+		sqeCount = sqeCountMin
+	}
+	if sqeCount > sqeCountMax {
+		sqeCount = sqeCountMax
+	}
+
+	// Scale buffer pool with CPU count
+	bufferCount = bufferCountPerCPU * numCPU
+	if bufferCount < bufferCountMin {
+		bufferCount = bufferCountMin
+	}
+	if bufferCount > bufferCountMax {
+		bufferCount = bufferCountMax
+	}
+
+	return sqeCount, bufferCount
+}
 
 var (
 	responseSimple = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!")
@@ -113,25 +147,35 @@ type ioWorker struct {
 	sqArray       []uint32
 	buffers       [][]byte
 	connPos       []int
+	sqeCount      int
+	bufferCount   int
 }
 
 // HTTP1Server is a multi-threaded HTTP/1.1 server using io_uring.
 type HTTP1Server struct {
-	port       string
-	numWorkers int
-	workers    []*ioWorker
+	port        string
+	numWorkers  int
+	workers     []*ioWorker
+	sqeCount    int
+	bufferCount int
 }
 
 // NewHTTP1Server creates a new multi-threaded io_uring HTTP/1.1 server.
+// Queue sizes and buffer pools scale automatically based on available CPUs.
 func NewHTTP1Server(port string) *HTTP1Server {
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+
+	sqeCount, bufferCount := getScaledIOUringLimits()
+
 	return &HTTP1Server{
-		port:       port,
-		numWorkers: numWorkers,
-		workers:    make([]*ioWorker, numWorkers),
+		port:        port,
+		numWorkers:  numWorkers,
+		workers:     make([]*ioWorker, numWorkers),
+		sqeCount:    sqeCount,
+		bufferCount: bufferCount,
 	}
 }
 
@@ -144,12 +188,14 @@ func (s *HTTP1Server) Run() error {
 
 	for i := 0; i < s.numWorkers; i++ {
 		w := &ioWorker{
-			id:      i,
-			port:    portNum,
-			buffers: make([][]byte, bufferCount),
-			connPos: make([]int, bufferCount),
+			id:          i,
+			port:        portNum,
+			buffers:     make([][]byte, s.bufferCount),
+			connPos:     make([]int, s.bufferCount),
+			sqeCount:    s.sqeCount,
+			bufferCount: s.bufferCount,
 		}
-		for j := 0; j < bufferCount; j++ {
+		for j := 0; j < s.bufferCount; j++ {
 			w.buffers[j] = make([]byte, bufferSize)
 		}
 		s.workers[i] = w
@@ -161,6 +207,9 @@ func (s *HTTP1Server) Run() error {
 			}
 		}(w)
 	}
+
+	log.Printf("iouring-h1 server listening on port %s with %d workers (sqeCount=%d, bufferCount=%d per worker)",
+		s.port, s.numWorkers, s.sqeCount, s.bufferCount)
 
 	return <-errCh
 }
@@ -203,7 +252,7 @@ func (w *ioWorker) setupRing() error {
 		Flags: 0,
 	}
 
-	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
+	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
 		return fmt.Errorf("io_uring_setup: %w", errno)
 	}
@@ -250,7 +299,7 @@ func (w *ioWorker) setupRing() error {
 func (w *ioWorker) getSqe() *IoUringSqe {
 	head := atomic.LoadUint32(w.sqHead)
 	next := w.sqeTail + 1
-	if next-head > uint32(sqeCount) {
+	if next-head > uint32(w.sqeCount) {
 		return nil
 	}
 	idx := w.sqeTail & w.sqMask
@@ -312,7 +361,7 @@ func (w *ioWorker) eventLoop() error {
 			if fd == w.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					if connFd < bufferCount {
+					if connFd < w.bufferCount {
 						// Set TCP_NODELAY for low latency
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 						w.connPos[connFd] = 0
@@ -398,7 +447,9 @@ func (w *ioWorker) processRequest(fd int, data []byte) int {
 	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
 		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
 		if clIdx > 0 {
-			clEnd := bytes.IndexByte(data[clIdx+16:headerEnd], '\r')
+			// Search for \r in the rest of the data (not limited to headerEnd, since
+			// headerEnd points to the final \r\n\r\n, not the header line's \r\n)
+			clEnd := bytes.IndexByte(data[clIdx+16:], '\r')
 			if clEnd > 0 {
 				cl := parseContentLengthIO(data[clIdx+16 : clIdx+16+clEnd])
 				requestLen += cl

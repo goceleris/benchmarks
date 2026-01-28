@@ -55,13 +55,15 @@ type h2ConnState struct {
 
 // h2Worker represents a single HTTP/2 event loop worker
 type h2Worker struct {
-	id       int
-	port     int
-	epollFd  int
-	listenFd int
-	connBuf  [][]byte
-	connPos  []int
-	connH2   []*h2ConnState
+	id        int
+	port      int
+	epollFd   int
+	listenFd  int
+	connBuf   [][]byte
+	connPos   []int
+	connH2    []*h2ConnState
+	maxEvents int
+	maxConns  int
 }
 
 // HTTP2Server is a multi-threaded H2C server using raw epoll.
@@ -69,6 +71,8 @@ type HTTP2Server struct {
 	port       string
 	numWorkers int
 	workers    []*h2Worker
+	maxEvents  int
+	maxConns   int
 }
 
 // NewHTTP2Server creates a new multi-threaded epoll H2C server.
@@ -77,10 +81,13 @@ func NewHTTP2Server(port string) *HTTP2Server {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	maxEvents, maxConns := getScaledLimits()
 	return &HTTP2Server{
 		port:       port,
 		numWorkers: numWorkers,
 		workers:    make([]*h2Worker, numWorkers),
+		maxEvents:  maxEvents,
+		maxConns:   maxConns,
 	}
 }
 
@@ -93,13 +100,15 @@ func (s *HTTP2Server) Run() error {
 
 	for i := 0; i < s.numWorkers; i++ {
 		w := &h2Worker{
-			id:      i,
-			port:    portNum,
-			connBuf: make([][]byte, maxConns),
-			connPos: make([]int, maxConns),
-			connH2:  make([]*h2ConnState, maxConns),
+			id:        i,
+			port:      portNum,
+			connBuf:   make([][]byte, s.maxConns),
+			connPos:   make([]int, s.maxConns),
+			connH2:    make([]*h2ConnState, s.maxConns),
+			maxEvents: s.maxEvents,
+			maxConns:  s.maxConns,
 		}
-		for j := 0; j < maxConns; j++ {
+		for j := 0; j < s.maxConns; j++ {
 			w.connBuf[j] = make([]byte, readBufSize)
 		}
 		s.workers[i] = w
@@ -112,7 +121,8 @@ func (s *HTTP2Server) Run() error {
 		}(w)
 	}
 
-	log.Printf("epoll-h2 server listening on port %s with %d workers", s.port, s.numWorkers)
+	log.Printf("epoll-h2 server listening on port %s with %d workers (maxEvents=%d, maxConns=%d)",
+		s.port, s.numWorkers, s.maxEvents, s.maxConns)
 	return <-errCh
 }
 
@@ -155,7 +165,7 @@ func (w *h2Worker) run() error {
 }
 
 func (w *h2Worker) eventLoop() error {
-	events := make([]unix.EpollEvent, maxEvents)
+	events := make([]unix.EpollEvent, w.maxEvents)
 
 	for {
 		n, err := unix.EpollWait(w.epollFd, events, -1)
@@ -190,7 +200,7 @@ func (w *h2Worker) acceptConnections() {
 			continue
 		}
 
-		if connFd >= maxConns {
+		if connFd >= w.maxConns {
 			_ = unix.Close(connFd)
 			continue
 		}

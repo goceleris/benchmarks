@@ -36,6 +36,8 @@ type hybridWorker struct {
 	connBuf   [][]byte
 	connPos   []int
 	connState []*hybridConnState
+	maxEvents int
+	maxConns  int
 }
 
 // HybridServer is a multi-threaded server that muxes HTTP/1.1 and H2C.
@@ -43,6 +45,8 @@ type HybridServer struct {
 	port       string
 	numWorkers int
 	workers    []*hybridWorker
+	maxEvents  int
+	maxConns   int
 }
 
 // NewHybridServer creates a new multi-threaded hybrid mux server.
@@ -51,10 +55,13 @@ func NewHybridServer(port string) *HybridServer {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	maxEvents, maxConns := getScaledLimits()
 	return &HybridServer{
 		port:       port,
 		numWorkers: numWorkers,
 		workers:    make([]*hybridWorker, numWorkers),
+		maxEvents:  maxEvents,
+		maxConns:   maxConns,
 	}
 }
 
@@ -69,11 +76,13 @@ func (s *HybridServer) Run() error {
 		w := &hybridWorker{
 			id:        i,
 			port:      portNum,
-			connBuf:   make([][]byte, maxConns),
-			connPos:   make([]int, maxConns),
-			connState: make([]*hybridConnState, maxConns),
+			connBuf:   make([][]byte, s.maxConns),
+			connPos:   make([]int, s.maxConns),
+			connState: make([]*hybridConnState, s.maxConns),
+			maxEvents: s.maxEvents,
+			maxConns:  s.maxConns,
 		}
-		for j := 0; j < maxConns; j++ {
+		for j := 0; j < s.maxConns; j++ {
 			w.connBuf[j] = make([]byte, readBufSize)
 		}
 		s.workers[i] = w
@@ -86,7 +95,8 @@ func (s *HybridServer) Run() error {
 		}(w)
 	}
 
-	log.Printf("epoll-hybrid server listening on port %s with %d workers", s.port, s.numWorkers)
+	log.Printf("epoll-hybrid server listening on port %s with %d workers (maxEvents=%d, maxConns=%d)",
+		s.port, s.numWorkers, s.maxEvents, s.maxConns)
 	return <-errCh
 }
 
@@ -129,7 +139,7 @@ func (w *hybridWorker) run() error {
 }
 
 func (w *hybridWorker) eventLoop() error {
-	events := make([]unix.EpollEvent, maxEvents)
+	events := make([]unix.EpollEvent, w.maxEvents)
 
 	for {
 		n, err := unix.EpollWait(w.epollFd, events, -1)
@@ -164,7 +174,7 @@ func (w *hybridWorker) acceptConnections() {
 			continue
 		}
 
-		if connFd >= maxConns {
+		if connFd >= w.maxConns {
 			_ = unix.Close(connFd)
 			continue
 		}

@@ -2,6 +2,7 @@
 
 // Package epoll provides barebones HTTP servers using raw epoll for maximum throughput.
 // These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
+// Connection limits and buffer sizes scale automatically based on available CPUs.
 package epoll
 
 import (
@@ -16,11 +17,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Scaling constants - these scale based on CPU count
 const (
-	maxEvents   = 4096
-	maxConns    = 4096
-	readBufSize = 8192
+	maxEventsBase  = 1024  // Base epoll_wait batch size
+	maxConnsPerCPU = 512   // Connections per CPU per worker
+	readBufSize    = 65536 // Per-connection read buffer (64KB for large POST bodies)
+	maxConnsMin    = 1024  // Minimum connections per worker
+	maxConnsMax    = 65536 // Maximum connections per worker (fd limit)
 )
+
+// getScaledLimits returns connection limits scaled to available CPUs
+func getScaledLimits() (maxEvents int, maxConns int) {
+	numCPU := runtime.NumCPU()
+
+	// Scale max events with CPU count (more CPUs = more events to process)
+	maxEvents = maxEventsBase * numCPU
+	if maxEvents > 8192 {
+		maxEvents = 8192
+	}
+
+	// Scale max connections per worker
+	// On large machines, each worker handles more connections
+	maxConns = maxConnsPerCPU * numCPU
+	if maxConns < maxConnsMin {
+		maxConns = maxConnsMin
+	}
+	if maxConns > maxConnsMax {
+		maxConns = maxConnsMax
+	}
+
+	return maxEvents, maxConns
+}
 
 // HTTP/1.1 response templates (pre-formatted for zero-allocation)
 var (
@@ -33,12 +60,14 @@ var (
 
 // epollWorker represents a single event loop worker
 type epollWorker struct {
-	id       int
-	port     int
-	epollFd  int
-	listenFd int
-	connBuf  [][]byte
-	connPos  []int
+	id        int
+	port      int
+	epollFd   int
+	listenFd  int
+	connBuf   [][]byte
+	connPos   []int
+	maxEvents int
+	maxConns  int
 }
 
 // HTTP1Server is a multi-threaded HTTP/1.1 server using raw epoll.
@@ -46,18 +75,26 @@ type HTTP1Server struct {
 	port       string
 	numWorkers int
 	workers    []*epollWorker
+	maxEvents  int
+	maxConns   int
 }
 
 // NewHTTP1Server creates a new multi-threaded epoll HTTP/1.1 server.
+// Connection limits scale automatically based on available CPUs.
 func NewHTTP1Server(port string) *HTTP1Server {
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+
+	maxEvents, maxConns := getScaledLimits()
+
 	return &HTTP1Server{
 		port:       port,
 		numWorkers: numWorkers,
 		workers:    make([]*epollWorker, numWorkers),
+		maxEvents:  maxEvents,
+		maxConns:   maxConns,
 	}
 }
 
@@ -70,13 +107,15 @@ func (s *HTTP1Server) Run() error {
 
 	for i := 0; i < s.numWorkers; i++ {
 		w := &epollWorker{
-			id:      i,
-			port:    portNum,
-			connBuf: make([][]byte, maxConns),
-			connPos: make([]int, maxConns),
+			id:        i,
+			port:      portNum,
+			connBuf:   make([][]byte, s.maxConns),
+			connPos:   make([]int, s.maxConns),
+			maxEvents: s.maxEvents,
+			maxConns:  s.maxConns,
 		}
 		// Pre-allocate buffers for this worker
-		for j := 0; j < maxConns; j++ {
+		for j := 0; j < s.maxConns; j++ {
 			w.connBuf[j] = make([]byte, readBufSize)
 		}
 		s.workers[i] = w
@@ -89,7 +128,8 @@ func (s *HTTP1Server) Run() error {
 		}(w)
 	}
 
-	log.Printf("epoll-h1 server listening on port %s with %d workers", s.port, s.numWorkers)
+	log.Printf("epoll-h1 server listening on port %s with %d workers (maxEvents=%d, maxConns=%d per worker)",
+		s.port, s.numWorkers, s.maxEvents, s.maxConns)
 
 	// Wait for any worker to fail
 	return <-errCh
@@ -137,7 +177,7 @@ func (w *epollWorker) run() error {
 }
 
 func (w *epollWorker) eventLoop() error {
-	events := make([]unix.EpollEvent, maxEvents)
+	events := make([]unix.EpollEvent, w.maxEvents)
 
 	for {
 		n, err := unix.EpollWait(w.epollFd, events, -1)
@@ -172,7 +212,7 @@ func (w *epollWorker) acceptConnections() {
 			continue
 		}
 
-		if connFd >= maxConns {
+		if connFd >= w.maxConns {
 			_ = unix.Close(connFd)
 			continue
 		}
@@ -248,7 +288,9 @@ func processHTTP1Request(fd int, data []byte) int {
 	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
 		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
 		if clIdx > 0 {
-			clEnd := bytes.IndexByte(data[clIdx+16:headerEnd], '\r')
+			// Search for \r in the rest of the data (not limited to headerEnd, since
+			// headerEnd points to the final \r\n\r\n, not the header line's \r\n)
+			clEnd := bytes.IndexByte(data[clIdx+16:], '\r')
 			if clEnd > 0 {
 				cl := parseContentLength(data[clIdx+16 : clIdx+16+clEnd])
 				requestLen += cl

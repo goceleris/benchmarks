@@ -42,6 +42,7 @@ type BenchmarkConfig struct {
 	Duration    string `json:"duration"`
 	Connections int    `json:"connections"`
 	Workers     int    `json:"workers"`
+	CPUs        int    `json:"cpus,omitempty"`
 }
 
 // ServerResult holds results for a single server benchmark.

@@ -74,13 +74,17 @@ type h2ioWorker struct {
 	buffers       [][]byte
 	connPos       []int
 	connH2        []*h2ioConnState
+	sqeCount      int
+	bufferCount   int
 }
 
 // HTTP2Server is a multi-threaded H2C server using io_uring.
 type HTTP2Server struct {
-	port       string
-	numWorkers int
-	workers    []*h2ioWorker
+	port        string
+	numWorkers  int
+	workers     []*h2ioWorker
+	sqeCount    int
+	bufferCount int
 }
 
 // NewHTTP2Server creates a new multi-threaded io_uring H2C server.
@@ -89,10 +93,13 @@ func NewHTTP2Server(port string) *HTTP2Server {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	sqeCount, bufferCount := getScaledIOUringLimits()
 	return &HTTP2Server{
-		port:       port,
-		numWorkers: numWorkers,
-		workers:    make([]*h2ioWorker, numWorkers),
+		port:        port,
+		numWorkers:  numWorkers,
+		workers:     make([]*h2ioWorker, numWorkers),
+		sqeCount:    sqeCount,
+		bufferCount: bufferCount,
 	}
 }
 
@@ -105,13 +112,15 @@ func (s *HTTP2Server) Run() error {
 
 	for i := 0; i < s.numWorkers; i++ {
 		w := &h2ioWorker{
-			id:      i,
-			port:    portNum,
-			buffers: make([][]byte, bufferCount),
-			connPos: make([]int, bufferCount),
-			connH2:  make([]*h2ioConnState, bufferCount),
+			id:          i,
+			port:        portNum,
+			buffers:     make([][]byte, s.bufferCount),
+			connPos:     make([]int, s.bufferCount),
+			connH2:      make([]*h2ioConnState, s.bufferCount),
+			sqeCount:    s.sqeCount,
+			bufferCount: s.bufferCount,
 		}
-		for j := 0; j < bufferCount; j++ {
+		for j := 0; j < s.bufferCount; j++ {
 			w.buffers[j] = make([]byte, bufferSize)
 		}
 		s.workers[i] = w
@@ -162,7 +171,7 @@ func (w *h2ioWorker) run() error {
 
 func (w *h2ioWorker) setupRing() error {
 	params := &IoUringParams{Flags: 0}
-	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
+	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
 		return fmt.Errorf("io_uring_setup: %w", errno)
 	}
@@ -209,7 +218,7 @@ func (w *h2ioWorker) setupRing() error {
 func (w *h2ioWorker) getSqe() *IoUringSqe {
 	head := atomic.LoadUint32(w.sqHead)
 	next := w.sqeTail + 1
-	if next-head > uint32(sqeCount) {
+	if next-head > uint32(w.sqeCount) {
 		return nil
 	}
 	idx := w.sqeTail & w.sqMask
@@ -269,7 +278,7 @@ func (w *h2ioWorker) eventLoop() error {
 			if fd == w.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					if connFd < bufferCount {
+					if connFd < w.bufferCount {
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 						w.connPos[connFd] = 0

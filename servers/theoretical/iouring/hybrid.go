@@ -47,13 +47,17 @@ type hybridioWorker struct {
 	buffers       [][]byte
 	connPos       []int
 	connState     []*hybridioConnState
+	sqeCount      int
+	bufferCount   int
 }
 
 // HybridServer is a multi-threaded server that muxes HTTP/1.1 and H2C using io_uring.
 type HybridServer struct {
-	port       string
-	numWorkers int
-	workers    []*hybridioWorker
+	port        string
+	numWorkers  int
+	workers     []*hybridioWorker
+	sqeCount    int
+	bufferCount int
 }
 
 // NewHybridServer creates a new multi-threaded io_uring hybrid mux server.
@@ -62,10 +66,13 @@ func NewHybridServer(port string) *HybridServer {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	sqeCount, bufferCount := getScaledIOUringLimits()
 	return &HybridServer{
-		port:       port,
-		numWorkers: numWorkers,
-		workers:    make([]*hybridioWorker, numWorkers),
+		port:        port,
+		numWorkers:  numWorkers,
+		workers:     make([]*hybridioWorker, numWorkers),
+		sqeCount:    sqeCount,
+		bufferCount: bufferCount,
 	}
 }
 
@@ -78,13 +85,15 @@ func (s *HybridServer) Run() error {
 
 	for i := 0; i < s.numWorkers; i++ {
 		w := &hybridioWorker{
-			id:        i,
-			port:      portNum,
-			buffers:   make([][]byte, bufferCount),
-			connPos:   make([]int, bufferCount),
-			connState: make([]*hybridioConnState, bufferCount),
+			id:          i,
+			port:        portNum,
+			buffers:     make([][]byte, s.bufferCount),
+			connPos:     make([]int, s.bufferCount),
+			connState:   make([]*hybridioConnState, s.bufferCount),
+			sqeCount:    s.sqeCount,
+			bufferCount: s.bufferCount,
 		}
-		for j := 0; j < bufferCount; j++ {
+		for j := 0; j < s.bufferCount; j++ {
 			w.buffers[j] = make([]byte, bufferSize)
 		}
 		s.workers[i] = w
@@ -136,7 +145,7 @@ func (w *hybridioWorker) run() error {
 func (w *hybridioWorker) setupRing() error {
 	params := &IoUringParams{Flags: 0}
 
-	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, sqeCount, uintptr(unsafe.Pointer(params)), 0)
+	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
 		return fmt.Errorf("io_uring_setup: %w", errno)
 	}
@@ -183,7 +192,7 @@ func (w *hybridioWorker) setupRing() error {
 func (w *hybridioWorker) getSqe() *IoUringSqe {
 	head := atomic.LoadUint32(w.sqHead)
 	next := w.sqeTail + 1
-	if next-head > uint32(sqeCount) {
+	if next-head > uint32(w.sqeCount) {
 		return nil
 	}
 	idx := w.sqeTail & w.sqMask
@@ -243,7 +252,7 @@ func (w *hybridioWorker) eventLoop() error {
 			if fd == w.listenFd && !isSend {
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
-					if connFd < bufferCount {
+					if connFd < w.bufferCount {
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 						_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 						w.connPos[connFd] = 0

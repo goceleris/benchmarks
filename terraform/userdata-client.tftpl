@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Log all output for debugging
 exec > >(tee /var/log/user-data.log) 2>&1
-echo "=== Benchmark Runner Bootstrap Started at $(date) ==="
+echo "=== Benchmark Client Bootstrap Started at $(date) ==="
 
 # Variables passed from Terraform
 ARCHITECTURE="${architecture}"
@@ -11,32 +11,20 @@ RUNNER_LABELS="${runner_labels}"
 REPOSITORY_URL="${repository_url}"
 GH_PAT="${gh_pat_runner_token}"
 RUNNER_VERSION="${runner_version}"
-
-# Get instance private IP (for later SSM registration)
-PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-echo "Instance private IP: $PRIVATE_IP"
+SERVER_IP="${server_ip}"
 
 # Derive repository owner and name from URL
 REPO_PATH=$(echo "$REPOSITORY_URL" | sed 's|https://github.com/||')
 
+echo "=== Configuration ==="
+echo "Architecture: $ARCHITECTURE"
+echo "Server IP: $SERVER_IP"
+echo "Runner Labels: $RUNNER_LABELS"
+
 echo "=== Installing Dependencies ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip awscli
-
-# Register server IP in SSM for client discovery (optional, requires IAM permissions)
-SSM_PARAM="/celeris-benchmark/server-ip/$ARCHITECTURE"
-echo "Registering server IP in SSM: $SSM_PARAM"
-if aws ssm put-parameter \
-    --name "$SSM_PARAM" \
-    --value "$PRIVATE_IP" \
-    --type String \
-    --overwrite \
-    --region us-east-1 2>/dev/null; then
-    echo "Successfully registered IP in SSM"
-else
-    echo "Warning: Failed to register IP in SSM (may lack IAM permissions - this is optional)"
-fi
+apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip
 
 # Install Go 1.22
 echo "=== Installing Go ==="
@@ -51,6 +39,10 @@ rm -rf /usr/local/go
 tar -C /usr/local -xzf "go$${GO_VERSION}.linux-$${GO_ARCH}.tar.gz"
 export PATH=$PATH:/usr/local/go/bin
 echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+
+# Set SERVER_IP as system-wide environment variable
+echo "BENCHMARK_SERVER_IP=$SERVER_IP" >> /etc/environment
+echo "export BENCHMARK_SERVER_IP=$SERVER_IP" >> /etc/profile
 
 # Create runner directory
 echo "=== Setting up GitHub Actions Runner ==="
@@ -95,15 +87,19 @@ fi
 echo "=== Configuring Runner ==="
 echo "Registering with URL: $REPOSITORY_URL"
 echo "Registering with labels: $RUNNER_LABELS"
-echo "Runner name: benchmark-server-$ARCHITECTURE-$(date +%s)"
+echo "Runner name: benchmark-client-$ARCHITECTURE-$(date +%s)"
 sudo -u ubuntu ./config.sh \
     --url "$REPOSITORY_URL" \
     --token "$REG_TOKEN" \
-    --name "benchmark-server-$ARCHITECTURE-$(date +%s)" \
+    --name "benchmark-client-$ARCHITECTURE-$(date +%s)" \
     --labels "$RUNNER_LABELS" \
     --unattended \
     --ephemeral \
     --replace
+
+# Create environment file for runner with SERVER_IP
+echo "BENCHMARK_SERVER_IP=$SERVER_IP" > "$RUNNER_DIR/.env"
+chown ubuntu:ubuntu "$RUNNER_DIR/.env"
 
 # Run the runner (blocks until job completes)
 echo "=== Starting Runner ==="
