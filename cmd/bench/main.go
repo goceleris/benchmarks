@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -240,12 +241,17 @@ func main() {
 	// Channel to signal spot interruption
 	spotInterruptChan := make(chan struct{})
 
+	// Track if we're exiting due to spot interruption (need non-zero exit code)
+	// Use atomic to avoid race between goroutine and main
+	var exitDueToSpotInterrupt atomic.Bool
+
 	go func() {
 		select {
 		case sig := <-sigChan:
 			log.Printf("Received signal %v, saving checkpoint and shutting down...", sig)
 		case <-spotInterruptChan:
 			log.Printf("Spot interruption detected, saving checkpoint and shutting down...")
+			exitDueToSpotInterrupt.Store(true)
 		}
 		if err := checkpoint.Save(*checkpointFile); err != nil {
 			log.Printf("ERROR: Failed to save checkpoint: %v", err)
@@ -257,6 +263,14 @@ func main() {
 
 	// Start spot interruption monitor (checks AWS metadata for termination notice)
 	go monitorSpotInterruption(ctx, spotInterruptChan)
+
+	// Defer exit code handling - must be after checkpoint save
+	defer func() {
+		if exitDueToSpotInterrupt.Load() {
+			log.Printf("Exiting with code 1 due to spot interruption (triggers retry job)")
+			os.Exit(1)
+		}
+	}()
 
 	// Create remote controller if in remote mode
 	var rc *RemoteController
