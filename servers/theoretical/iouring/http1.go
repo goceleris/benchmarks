@@ -447,7 +447,9 @@ func (w *ioWorker) processRequest(fd int, data []byte) int {
 	if len(data) >= 4 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' {
 		clIdx := bytes.Index(data[:headerEnd], []byte("Content-Length: "))
 		if clIdx > 0 {
-			clEnd := bytes.IndexByte(data[clIdx+16:headerEnd], '\r')
+			// Search for \r in the rest of the data (not limited to headerEnd, since
+			// headerEnd points to the final \r\n\r\n, not the header line's \r\n)
+			clEnd := bytes.IndexByte(data[clIdx+16:], '\r')
 			if clEnd > 0 {
 				cl := parseContentLengthIO(data[clIdx+16 : clIdx+16+clEnd])
 				requestLen += cl
