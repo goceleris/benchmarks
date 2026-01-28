@@ -295,8 +295,6 @@ jobs:
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
-          # Simulate spot interruption after 2 minutes for testing checkpoint recovery
-          SIMULATE_SPOT_INTERRUPT: "5m"
         run: |
           go mod download
           go build -o bin/server ./cmd/server
@@ -333,8 +331,6 @@ jobs:
         env:
           BENCHMARK_DURATION: ${{ github.event.inputs.duration || '15s' }}
           BENCHMARK_MODE: ${{ github.event.inputs.benchmark_mode || 'all' }}
-          # Simulate spot interruption after 2 minutes for testing checkpoint recovery
-          SIMULATE_SPOT_INTERRUPT: "5m"
         run: |
           go mod download
           go build -o bin/server ./cmd/server
