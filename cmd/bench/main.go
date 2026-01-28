@@ -93,6 +93,7 @@ func main() {
 	controlPort := flag.String("control-port", "9999", "Control daemon port on remote server")
 	serverRetryTimeout := flag.Duration("server-retry-timeout", 10*time.Minute, "Max time to wait for server to become available")
 	serverRetryInterval := flag.Duration("server-retry-interval", 5*time.Second, "Interval between server availability checks")
+	maxUnreachable := flag.Duration("max-unreachable", 3*time.Minute, "Max time control daemon can be unreachable before failing (0 = disabled)")
 	useSSM := flag.Bool("use-ssm", false, "Use AWS SSM Parameter Store for dynamic server IP discovery")
 	ssmParamName := flag.String("ssm-param", "", "SSM parameter name for server IP (default: /celeris-benchmark/server-ip/<arch>)")
 	awsRegion := flag.String("aws-region", "us-east-1", "AWS region for SSM")
@@ -250,14 +251,15 @@ func main() {
 	var rc *RemoteController
 	if remoteMode {
 		rc = &RemoteController{
-			serverIP:      *serverIP,
-			serverPort:    *port,
-			controlPort:   *controlPort,
-			retryTimeout:  *serverRetryTimeout,
-			retryInterval: *serverRetryInterval,
-			useSSM:        *useSSM,
-			ssmParamName:  *ssmParamName,
-			awsRegion:     *awsRegion,
+			serverIP:       *serverIP,
+			serverPort:     *port,
+			controlPort:    *controlPort,
+			retryTimeout:   *serverRetryTimeout,
+			retryInterval:  *serverRetryInterval,
+			maxUnreachable: *maxUnreachable,
+			useSSM:         *useSSM,
+			ssmParamName:   *ssmParamName,
+			awsRegion:      *awsRegion,
 		}
 
 		// If using SSM and no initial IP, fetch it now
@@ -453,14 +455,16 @@ saveAndExit:
 
 // RemoteController manages communication with the control daemon
 type RemoteController struct {
-	serverIP      string
-	serverPort    string
-	controlPort   string
-	retryTimeout  time.Duration
-	retryInterval time.Duration
-	useSSM        bool   // Whether to use SSM for dynamic IP discovery
-	ssmParamName  string // SSM parameter name for server IP
-	awsRegion     string
+	serverIP        string
+	serverPort      string
+	controlPort     string
+	retryTimeout    time.Duration
+	retryInterval   time.Duration
+	maxUnreachable  time.Duration // Max time control daemon can be unreachable before hard fail
+	useSSM          bool          // Whether to use SSM for dynamic IP discovery
+	ssmParamName    string        // SSM parameter name for server IP
+	awsRegion       string
+	unreachableSince time.Time    // When control daemon first became unreachable (zero if reachable)
 }
 
 // getServerIPFromSSM fetches the current server IP from AWS SSM Parameter Store
@@ -525,10 +529,28 @@ func (rc *RemoteController) StartServer(ctx context.Context, serverType string) 
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("Control daemon not reachable, retrying in %s...", rc.retryInterval)
+			// Control daemon is unreachable - track how long
+			if rc.unreachableSince.IsZero() {
+				rc.unreachableSince = time.Now()
+				log.Printf("Control daemon not reachable (started tracking unreachable time)")
+			}
+
+			unreachableDuration := time.Since(rc.unreachableSince)
+
+			// Fail fast if unreachable for too long (server likely terminated)
+			if rc.maxUnreachable > 0 && unreachableDuration > rc.maxUnreachable {
+				return fmt.Errorf("control daemon unreachable for %s (max %s) - server likely terminated, failing fast",
+					unreachableDuration.Round(time.Second), rc.maxUnreachable)
+			}
+
+			log.Printf("Control daemon not reachable (%s), retrying in %s...",
+				unreachableDuration.Round(time.Second), rc.retryInterval)
 			time.Sleep(rc.retryInterval)
 			continue
 		}
+
+		// Control daemon is reachable - reset unreachable tracking
+		rc.unreachableSince = time.Time{}
 
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
@@ -589,14 +611,41 @@ func (rc *RemoteController) WaitForServer(ctx context.Context) error {
 			continue
 		}
 
-		// Check if server is reachable
+		// First check if control daemon is reachable (quick health check)
+		controlURL := fmt.Sprintf("http://%s:%s/health", rc.serverIP, rc.controlPort)
+		healthReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, controlURL, nil)
+		healthResp, healthErr := http.DefaultClient.Do(healthReq)
+		if healthErr != nil {
+			// Control daemon unreachable - track how long
+			if rc.unreachableSince.IsZero() {
+				rc.unreachableSince = time.Now()
+			}
+			unreachableDuration := time.Since(rc.unreachableSince)
+
+			// Fail fast if unreachable for too long
+			if rc.maxUnreachable > 0 && unreachableDuration > rc.maxUnreachable {
+				return fmt.Errorf("control daemon unreachable for %s - server likely terminated",
+					unreachableDuration.Round(time.Second))
+			}
+
+			log.Printf("Control daemon unreachable (%s), waiting %s...",
+				unreachableDuration.Round(time.Second), rc.retryInterval)
+			time.Sleep(rc.retryInterval)
+			continue
+		}
+		_ = healthResp.Body.Close()
+
+		// Control daemon is reachable - reset unreachable tracking
+		rc.unreachableSince = time.Time{}
+
+		// Check if server port is reachable
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", rc.serverIP, rc.serverPort), 2*time.Second)
 		if err == nil {
 			_ = conn.Close()
 			return nil
 		}
 
-		log.Printf("Server %s not available, waiting %s...", rc.serverIP, rc.retryInterval)
+		log.Printf("Server %s not available (will retry)...", rc.serverIP)
 		time.Sleep(rc.retryInterval)
 	}
 
