@@ -34,6 +34,7 @@ type ControlDaemon struct {
 	status     ServerStatus
 	cmd        *exec.Cmd
 	cancelFunc context.CancelFunc
+	doneChan   chan struct{} // signals when process exits (Wait() can only be called once)
 }
 
 func main() {
@@ -179,10 +180,31 @@ func (d *ControlDaemon) startServer(serverType string) error {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
+	// Create done channel for this process (Wait() can only be called once)
+	doneChan := make(chan struct{})
+
 	d.mu.Lock()
 	d.cmd = cmd
 	d.cancelFunc = cancel
+	d.doneChan = doneChan
 	d.mu.Unlock()
+
+	// Monitor process in background - this is the ONLY place cmd.Wait() is called
+	go func() {
+		err := cmd.Wait()
+		close(doneChan) // Signal that process has exited
+		d.mu.Lock()
+		if d.cmd == cmd {
+			d.status.Status = "stopped"
+			if err != nil {
+				d.status.Error = err.Error()
+			}
+			d.cmd = nil
+			d.cancelFunc = nil
+			d.doneChan = nil
+		}
+		d.mu.Unlock()
+	}()
 
 	// Wait for server to be ready
 	if err := d.waitForReady(5 * time.Second); err != nil {
@@ -196,21 +218,6 @@ func (d *ControlDaemon) startServer(serverType string) error {
 	d.status.Error = ""
 	d.mu.Unlock()
 
-	// Monitor process in background
-	go func() {
-		err := cmd.Wait()
-		d.mu.Lock()
-		if d.cmd == cmd {
-			d.status.Status = "stopped"
-			if err != nil {
-				d.status.Error = err.Error()
-			}
-			d.cmd = nil
-			d.cancelFunc = nil
-		}
-		d.mu.Unlock()
-	}()
-
 	return nil
 }
 
@@ -218,6 +225,8 @@ func (d *ControlDaemon) stopServer() {
 	d.mu.Lock()
 	cmd := d.cmd
 	cancel := d.cancelFunc
+	doneChan := d.doneChan
+	serverType := d.status.ServerType
 	d.status.Status = "stopping"
 	d.mu.Unlock()
 
@@ -228,30 +237,30 @@ func (d *ControlDaemon) stopServer() {
 		return
 	}
 
+	log.Printf("Stopping server: %s", serverType)
+
 	// Send SIGTERM
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 
-	// Wait with timeout
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-
+	// Wait for process to exit using the done channel (NOT cmd.Wait() - can only call once!)
 	select {
-	case <-done:
+	case <-doneChan:
+		log.Printf("Server %s stopped gracefully", serverType)
 	case <-time.After(5 * time.Second):
+		// Timeout - force kill
+		log.Printf("Server %s did not stop in time, force killing", serverType)
 		if cancel != nil {
 			cancel()
 		}
 		_ = cmd.Process.Kill()
-		<-done
+		<-doneChan // Wait for the monitoring goroutine to finish
 	}
 
 	d.mu.Lock()
 	d.status.Status = "stopped"
 	d.cmd = nil
 	d.cancelFunc = nil
+	d.doneChan = nil
 	d.mu.Unlock()
 }
 
