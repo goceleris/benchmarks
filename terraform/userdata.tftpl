@@ -38,9 +38,9 @@ else
     echo "Warning: Failed to register IP in SSM (may lack IAM permissions - this is optional)"
 fi
 
-# Install Go 1.22
+# Install Go 1.25.5
 echo "=== Installing Go ==="
-GO_VERSION="1.22.5"
+GO_VERSION="1.25.5"
 if [ "$ARCHITECTURE" = "arm64" ]; then
     GO_ARCH="arm64"
 else
