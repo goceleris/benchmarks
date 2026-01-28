@@ -2011,3 +2011,36 @@ jobs:
               gh api -X DELETE repos/${{ github.repository }}/actions/runners/$id || true
             done
           fi
+
+  final-status:
+    name: Final Status
+    needs: [benchmark-arm64, benchmark-x86, retry-benchmark-arm64, retry-benchmark-x86]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine final status
+        run: |
+          ARM64_OK="false"
+          X86_OK="false"
+
+          if [[ "${{ needs.benchmark-arm64.result }}" == "success" ]] || \
+             [[ "${{ needs.retry-benchmark-arm64.result }}" == "success" ]]; then
+            ARM64_OK="true"
+          fi
+
+          if [[ "${{ needs.benchmark-x86.result }}" == "success" ]] || \
+             [[ "${{ needs.retry-benchmark-x86.result }}" == "success" ]]; then
+            X86_OK="true"
+          fi
+
+          echo "ARM64: $ARM64_OK"
+          echo "x86: $X86_OK"
+
+          # At least one architecture must succeed
+          if [[ "$ARM64_OK" == "true" ]] || [[ "$X86_OK" == "true" ]]; then
+            echo "Benchmark completed successfully"
+            exit 0
+          else
+            echo "All benchmarks failed"
+            exit 1
+          fi
