@@ -615,9 +615,10 @@ func runBenchmarkWithRetry(ctx context.Context, cfg bench.Config, rc *RemoteCont
 		default:
 		}
 
-		// Refresh server IP from SSM if using dynamic discovery
+		// Refresh server IP from SSM if using dynamic discovery AND we don't have a working IP
 		// This handles the case where a retry server has a different IP
-		if rc.useSSM {
+		// Skip SSM refresh if we already have a valid server IP to avoid warning spam
+		if rc.useSSM && rc.serverIP == "" {
 			if err := rc.refreshServerIP(ctx); err != nil {
 				log.Printf("Warning: Could not refresh server IP from SSM: %v", err)
 			}
