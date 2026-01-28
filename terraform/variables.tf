@@ -112,17 +112,18 @@ locals {
     }
   }
 
-  # Client instances: modest sizes, always on-demand
+  # Client instances: sized to saturate server, always on-demand
   # Fast mode: very small (just needs to send HTTP requests)
-  # Metal/Provisional mode: 8 vCPU (enough to saturate server)
+  # Metal mode: large enough to saturate bare-metal servers (need ~1/3 server vCPUs)
+  # Provisional mode: 8 vCPU (matches server size)
   client_instance_types = {
     fast = {
       arm64 = "t4g.small"   # 2 vCPU, burstable
       x86   = "t3.small"    # 2 vCPU, burstable
     }
     metal = {
-      arm64 = "c6g.2xlarge" # 8 vCPU
-      x86   = "c5.2xlarge"  # 8 vCPU
+      arm64 = "c6g.4xlarge" # 16 vCPU (to saturate 64 vCPU server)
+      x86   = "c5.9xlarge"  # 36 vCPU (to saturate 96 vCPU server)
     }
     provisional = {
       arm64 = "c6g.2xlarge" # 8 vCPU
