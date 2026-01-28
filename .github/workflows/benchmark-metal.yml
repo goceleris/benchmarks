@@ -954,13 +954,14 @@ jobs:
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_benchmark_mode: ${{ needs.launch-arm64.outputs.benchmark_mode }}
           TF_VAR_launch_arm64_only: "true"
+          TF_VAR_launch_client: "true"
           AWS_REGION: us-east-1
         run: |
           echo "Attempting to recover checkpoint from failed ARM64 instance..."
 
-          # Refresh state and get instance ID
-          terraform refresh -target=aws_spot_instance_request.arm64_runner 2>/dev/null || true
-          INSTANCE_ID=$(terraform output -raw arm64_instance_id 2>/dev/null || echo "")
+          # Refresh state and get instance ID from CLIENT instance (where benchmarks run in fast mode)
+          terraform refresh -target=aws_instance.arm64_client 2>/dev/null || true
+          INSTANCE_ID=$(terraform output -raw arm64_client_instance_id 2>/dev/null || echo "")
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "null" ]; then
             echo "No instance ID found in terraform state"
@@ -1162,13 +1163,14 @@ jobs:
           TF_VAR_gh_pat_runner_token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
           TF_VAR_benchmark_mode: ${{ needs.launch-x86.outputs.benchmark_mode }}
           TF_VAR_launch_x86_only: "true"
+          TF_VAR_launch_client: "true"
           AWS_REGION: us-east-1
         run: |
           echo "Attempting to recover checkpoint from failed x86 instance..."
 
-          # Refresh state and get instance ID
-          terraform refresh -target=aws_spot_instance_request.x86_server 2>/dev/null || true
-          INSTANCE_ID=$(terraform output -raw x86_instance_id 2>/dev/null || echo "")
+          # Refresh state and get instance ID from CLIENT instance (where benchmarks run in fast mode)
+          terraform refresh -target=aws_instance.x86_client 2>/dev/null || true
+          INSTANCE_ID=$(terraform output -raw x86_client_instance_id 2>/dev/null || echo "")
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "null" ]; then
             echo "No instance ID found in terraform state"
