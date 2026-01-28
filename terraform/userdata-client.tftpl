@@ -26,9 +26,9 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl jq git build-essential linux-tools-generic unzip zip
 
-# Install Go 1.22
+# Install Go 1.25.5
 echo "=== Installing Go ==="
-GO_VERSION="1.22.5"
+GO_VERSION="1.25.5"
 if [ "$ARCHITECTURE" = "arm64" ]; then
     GO_ARCH="arm64"
 else

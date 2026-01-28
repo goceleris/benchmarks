@@ -14,6 +14,7 @@ resource "aws_spot_instance_request" "arm64_server" {
   spot_price             = local.spot_prices[local.effective_mode].arm64
   wait_for_fulfillment   = true
   spot_type              = "one-time"
+  availability_zone      = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
@@ -54,6 +55,7 @@ resource "aws_spot_instance_request" "x86_server" {
   spot_price             = local.spot_prices[local.effective_mode].x86
   wait_for_fulfillment   = true
   spot_type              = "one-time"
+  availability_zone      = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
@@ -89,8 +91,9 @@ resource "aws_spot_instance_request" "x86_server" {
 resource "aws_instance" "arm64_server_ondemand" {
   count = (var.use_on_demand && !var.launch_x86_only && !var.launch_client) ? 1 : 0
 
-  ami           = data.aws_ami.ubuntu_arm64.id
-  instance_type = local.server_instance_types[local.effective_mode].arm64
+  ami               = data.aws_ami.ubuntu_arm64.id
+  instance_type     = local.server_instance_types[local.effective_mode].arm64
+  availability_zone = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
@@ -125,8 +128,9 @@ resource "aws_instance" "arm64_server_ondemand" {
 resource "aws_instance" "x86_server_ondemand" {
   count = (var.use_on_demand && !var.launch_arm64_only && !var.launch_client) ? 1 : 0
 
-  ami           = data.aws_ami.ubuntu_x86.id
-  instance_type = local.server_instance_types[local.effective_mode].x86
+  ami               = data.aws_ami.ubuntu_x86.id
+  instance_type     = local.server_instance_types[local.effective_mode].x86
+  availability_zone = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
@@ -167,8 +171,9 @@ resource "aws_instance" "x86_server_ondemand" {
 resource "aws_instance" "arm64_client" {
   count = (var.launch_client && !var.launch_x86_only) ? 1 : 0
 
-  ami           = data.aws_ami.ubuntu_arm64.id
-  instance_type = local.client_instance_types[local.effective_mode].arm64
+  ami               = data.aws_ami.ubuntu_arm64.id
+  instance_type     = local.client_instance_types[local.effective_mode].arm64
+  availability_zone = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
@@ -204,8 +209,9 @@ resource "aws_instance" "arm64_client" {
 resource "aws_instance" "x86_client" {
   count = (var.launch_client && !var.launch_arm64_only) ? 1 : 0
 
-  ami           = data.aws_ami.ubuntu_x86.id
-  instance_type = local.client_instance_types[local.effective_mode].x86
+  ami               = data.aws_ami.ubuntu_x86.id
+  instance_type     = local.client_instance_types[local.effective_mode].x86
+  availability_zone = local.availability_zone
 
   iam_instance_profile   = var.iam_instance_profile_name != "" ? var.iam_instance_profile_name : null
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : null
