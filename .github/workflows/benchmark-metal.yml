@@ -959,7 +959,7 @@ jobs:
           echo "Attempting to recover checkpoint from failed ARM64 instance..."
 
           # Refresh state and get instance ID
-          terraform refresh -target=aws_spot_instance_request.arm64_runner 2>/dev/null || true
+          terraform refresh -target=aws_spot_instance_request.arm64_server 2>/dev/null || true
           INSTANCE_ID=$(terraform output -raw arm64_instance_id 2>/dev/null || echo "")
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "null" ]; then
