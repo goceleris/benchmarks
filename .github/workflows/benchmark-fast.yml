@@ -371,7 +371,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-arm64.outputs.launched == 'true' &&
       needs.launch-arm64.outputs.instance_mode == 'spot' &&
-      needs.benchmark-arm64.outcome == 'failure'
+      needs.benchmark-arm64.outputs.success != 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
 
@@ -449,7 +449,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-x86.outputs.launched == 'true' &&
       needs.launch-x86.outputs.instance_mode == 'spot' &&
-      needs.benchmark-x86.outcome == 'failure'
+      needs.benchmark-x86.outputs.success != 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
 
@@ -644,8 +644,8 @@ jobs:
     if: |
       always() &&
       needs.authorize.outputs.authorized == 'true' &&
-      (needs.benchmark-arm64.outcome == 'success' || needs.benchmark-x86.outcome == 'success' ||
-       needs.retry-benchmark-arm64.result == 'success' || needs.retry-benchmark-x86.result == 'success')
+      (needs.benchmark-arm64.outputs.success == 'true' || needs.benchmark-x86.outputs.success == 'true' ||
+       needs.retry-benchmark-arm64.outputs.success == 'true' || needs.retry-benchmark-x86.outputs.success == 'true')
     permissions:
       pull-requests: write
       contents: read
@@ -689,10 +689,10 @@ jobs:
 
       - name: Generate Charts
         env:
-          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.outcome == 'success' }}
-          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
-          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.outcome == 'success' }}
-          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.result == 'success' }}
+          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.outputs.success == 'true' }}
+          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.outputs.success == 'true' }}
+          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.outputs.success == 'true' }}
+          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.outputs.success == 'true' }}
         run: |
           pip install matplotlib numpy
 
