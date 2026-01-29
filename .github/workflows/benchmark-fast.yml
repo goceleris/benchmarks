@@ -282,6 +282,8 @@ jobs:
     runs-on: [self-hosted, server-fast-arm64]
     timeout-minutes: 90
     continue-on-error: true  # Don't fail workflow - retry will handle spot termination
+    outputs:
+      success: ${{ steps.report-success.outputs.success }}
 
     steps:
       - name: Checkout
@@ -302,6 +304,10 @@ jobs:
           go build -o bin/bench ./cmd/bench
           # Run with checkpoint support - saves progress after each benchmark
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
+
+      - name: Report Success
+        id: report-success
+        run: echo "success=true" >> $GITHUB_OUTPUT
 
       - name: Upload Results
         if: always()
@@ -319,6 +325,8 @@ jobs:
     runs-on: [self-hosted, server-fast-x86]
     timeout-minutes: 90
     continue-on-error: true  # Don't fail workflow - retry will handle spot termination
+    outputs:
+      success: ${{ steps.report-success.outputs.success }}
 
     steps:
       - name: Checkout
@@ -339,6 +347,10 @@ jobs:
           go build -o bin/bench ./cmd/bench
           # Run with checkpoint support - saves progress after each benchmark
           ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
+
+      - name: Report Success
+        id: report-success
+        run: echo "success=true" >> $GITHUB_OUTPUT
 
       - name: Upload Results
         if: always()
@@ -514,6 +526,8 @@ jobs:
       needs.retry-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, server-fast-arm64]
     timeout-minutes: 90
+    outputs:
+      success: ${{ steps.report-success.outputs.success }}
 
     steps:
       - name: Checkout
@@ -547,8 +561,12 @@ jobs:
             ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"  -resume
           else
             echo "No checkpoint found, starting fresh..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
           fi
+
+      - name: Report Success
+        id: report-success
+        run: echo "success=true" >> $GITHUB_OUTPUT
 
       - name: Upload Results
         if: always()
@@ -568,6 +586,8 @@ jobs:
       needs.retry-x86.outputs.launched == 'true'
     runs-on: [self-hosted, server-fast-x86]
     timeout-minutes: 90
+    outputs:
+      success: ${{ steps.report-success.outputs.success }}
 
     steps:
       - name: Checkout
@@ -601,8 +621,12 @@ jobs:
             ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"  -resume
           else
             echo "No checkpoint found, starting fresh..."
-            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION" 
+            ./bin/bench -mode "$BENCHMARK_MODE" -duration "$BENCHMARK_DURATION"
           fi
+
+      - name: Report Success
+        id: report-success
+        run: echo "success=true" >> $GITHUB_OUTPUT
 
       - name: Upload Results
         if: always()
@@ -976,38 +1000,29 @@ jobs:
     steps:
       - name: Determine final status
         env:
-          # Capture all job results for debugging
-          BENCH_ARM64_OUTCOME: ${{ needs.benchmark-arm64.outcome }}
-          BENCH_ARM64_RESULT: ${{ needs.benchmark-arm64.result }}
-          BENCH_X86_OUTCOME: ${{ needs.benchmark-x86.outcome }}
-          BENCH_X86_RESULT: ${{ needs.benchmark-x86.result }}
-          RETRY_ARM64_RESULT: ${{ needs.retry-benchmark-arm64.result }}
-          RETRY_X86_RESULT: ${{ needs.retry-benchmark-x86.result }}
+          # Use job outputs to track actual success (not needs.*.outcome which doesn't exist)
+          # Jobs set outputs.success='true' only if all steps succeed
+          BENCH_ARM64_SUCCESS: ${{ needs.benchmark-arm64.outputs.success }}
+          BENCH_X86_SUCCESS: ${{ needs.benchmark-x86.outputs.success }}
+          RETRY_ARM64_SUCCESS: ${{ needs.retry-benchmark-arm64.outputs.success }}
+          RETRY_X86_SUCCESS: ${{ needs.retry-benchmark-x86.outputs.success }}
         run: |
           echo "=== Job Results Debug ==="
-          echo "benchmark-arm64: outcome='$BENCH_ARM64_OUTCOME' result='$BENCH_ARM64_RESULT'"
-          echo "benchmark-x86: outcome='$BENCH_X86_OUTCOME' result='$BENCH_X86_RESULT'"
-          echo "retry-benchmark-arm64: result='$RETRY_ARM64_RESULT'"
-          echo "retry-benchmark-x86: result='$RETRY_X86_RESULT'"
+          echo "benchmark-arm64: success='$BENCH_ARM64_SUCCESS'"
+          echo "benchmark-x86: success='$BENCH_X86_SUCCESS'"
+          echo "retry-benchmark-arm64: success='$RETRY_ARM64_SUCCESS'"
+          echo "retry-benchmark-x86: success='$RETRY_X86_SUCCESS'"
           echo "========================="
 
           ARM64_OK="false"
           X86_OK="false"
 
-          # For benchmark jobs with continue-on-error:
-          # - 'outcome' = actual result (success/failure)
-          # - 'result' = always 'success' due to continue-on-error
-          # Check outcome first, but also accept result='success' if outcome is empty
-          # (handles edge cases where outcome might not be set)
-          if [[ "$BENCH_ARM64_OUTCOME" == "success" ]] || \
-             [[ "$RETRY_ARM64_RESULT" == "success" ]] || \
-             [[ -z "$BENCH_ARM64_OUTCOME" && "$BENCH_ARM64_RESULT" == "success" ]]; then
+          # Check if benchmark or retry succeeded (output is 'true' only on actual success)
+          if [[ "$BENCH_ARM64_SUCCESS" == "true" ]] || [[ "$RETRY_ARM64_SUCCESS" == "true" ]]; then
             ARM64_OK="true"
           fi
 
-          if [[ "$BENCH_X86_OUTCOME" == "success" ]] || \
-             [[ "$RETRY_X86_RESULT" == "success" ]] || \
-             [[ -z "$BENCH_X86_OUTCOME" && "$BENCH_X86_RESULT" == "success" ]]; then
+          if [[ "$BENCH_X86_SUCCESS" == "true" ]] || [[ "$RETRY_X86_SUCCESS" == "true" ]]; then
             X86_OK="true"
           fi
 
