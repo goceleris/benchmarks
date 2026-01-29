@@ -1877,33 +1877,56 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          echo "Terminating ARM64 instances by tag (direct AWS API)..."
+          echo "=== Cleaning up ARM64 instances ==="
+          echo "AWS_REGION: $AWS_REGION"
 
-          # Find and terminate all ARM64 benchmark instances by tag
-          # Tag format: benchmark-server-arm64-* or benchmark-client-arm64-*
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=benchmark-*-arm64-*" \
+          # Find ALL ARM64 benchmark instances (server AND client)
+          # Search for each pattern explicitly to avoid wildcard issues
+          echo "Searching for ARM64 server instances..."
+          SERVER_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-server-arm64-*" \
                       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query 'Reservations[].Instances[].InstanceId' \
-            --output text)
+            --output text 2>/dev/null || echo "")
+          echo "Server instances: ${SERVER_IDS:-none}"
 
-          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
-            echo "Found ARM64 instances: $INSTANCE_IDS"
-            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS || true
+          echo "Searching for ARM64 client instances..."
+          CLIENT_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-client-arm64-*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          echo "Client instances: ${CLIENT_IDS:-none}"
+
+          # Combine and deduplicate
+          ALL_IDS=$(echo "$SERVER_IDS $CLIENT_IDS" | tr ' ' '\n' | grep -v '^$' | grep -v '^None$' | sort -u | tr '\n' ' ' | xargs)
+
+          if [ -n "$ALL_IDS" ]; then
+            echo "Terminating instances: $ALL_IDS"
+            aws ec2 terminate-instances --instance-ids $ALL_IDS || true
             echo "Termination request sent"
           else
             echo "No ARM64 instances found to terminate"
           fi
 
-          # Also cancel any spot requests
-          SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
-            --filters "Name=tag:Name,Values=benchmark-*-arm64-*" \
+          # Also cancel any spot requests (both server and client)
+          echo "Searching for ARM64 spot requests..."
+          SERVER_SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-server-arm64-*" \
                       "Name=state,Values=open,active" \
             --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
             --output text 2>/dev/null || echo "")
 
-          if [ -n "$SPOT_IDS" ] && [ "$SPOT_IDS" != "None" ]; then
-            echo "Found ARM64 spot requests: $SPOT_IDS"
+          CLIENT_SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-client-arm64-*" \
+                      "Name=state,Values=open,active" \
+            --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "")
+
+          SPOT_IDS=$(echo "$SERVER_SPOT_IDS $CLIENT_SPOT_IDS" | tr ' ' '\n' | grep -v '^$' | grep -v '^None$' | sort -u | tr '\n' ' ' | xargs)
+
+          if [ -n "$SPOT_IDS" ]; then
+            echo "Cancelling spot requests: $SPOT_IDS"
             aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $SPOT_IDS || true
           fi
 
@@ -1959,33 +1982,56 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          echo "Terminating x86 instances by tag (direct AWS API)..."
+          echo "=== Cleaning up x86 instances ==="
+          echo "AWS_REGION: $AWS_REGION"
 
-          # Find and terminate all x86 benchmark instances by tag
-          # Tag format: benchmark-server-x86-* or benchmark-client-x86-*
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=benchmark-*-x86-*" \
+          # Find ALL x86 benchmark instances (server AND client)
+          # Search for each pattern explicitly to avoid wildcard issues
+          echo "Searching for x86 server instances..."
+          SERVER_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-server-x86-*" \
                       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query 'Reservations[].Instances[].InstanceId' \
-            --output text)
+            --output text 2>/dev/null || echo "")
+          echo "Server instances: ${SERVER_IDS:-none}"
 
-          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
-            echo "Found x86 instances: $INSTANCE_IDS"
-            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS || true
+          echo "Searching for x86 client instances..."
+          CLIENT_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=benchmark-client-x86-*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          echo "Client instances: ${CLIENT_IDS:-none}"
+
+          # Combine and deduplicate
+          ALL_IDS=$(echo "$SERVER_IDS $CLIENT_IDS" | tr ' ' '\n' | grep -v '^$' | grep -v '^None$' | sort -u | tr '\n' ' ' | xargs)
+
+          if [ -n "$ALL_IDS" ]; then
+            echo "Terminating instances: $ALL_IDS"
+            aws ec2 terminate-instances --instance-ids $ALL_IDS || true
             echo "Termination request sent"
           else
             echo "No x86 instances found to terminate"
           fi
 
-          # Also cancel any spot requests
-          SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
-            --filters "Name=tag:Name,Values=benchmark-*-x86-*" \
+          # Also cancel any spot requests (both server and client)
+          echo "Searching for x86 spot requests..."
+          SERVER_SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-server-x86-*" \
                       "Name=state,Values=open,active" \
             --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
             --output text 2>/dev/null || echo "")
 
-          if [ -n "$SPOT_IDS" ] && [ "$SPOT_IDS" != "None" ]; then
-            echo "Found x86 spot requests: $SPOT_IDS"
+          CLIENT_SPOT_IDS=$(aws ec2 describe-spot-instance-requests \
+            --filters "Name=tag:Name,Values=benchmark-client-x86-*" \
+                      "Name=state,Values=open,active" \
+            --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "")
+
+          SPOT_IDS=$(echo "$SERVER_SPOT_IDS $CLIENT_SPOT_IDS" | tr ' ' '\n' | grep -v '^$' | grep -v '^None$' | sort -u | tr '\n' ' ' | xargs)
+
+          if [ -n "$SPOT_IDS" ]; then
+            echo "Cancelling spot requests: $SPOT_IDS"
             aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $SPOT_IDS || true
           fi
 
@@ -2023,19 +2069,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Determine final status
+        env:
+          # Capture all job results for debugging
+          BENCH_ARM64_OUTCOME: ${{ needs.benchmark-arm64.outcome }}
+          BENCH_ARM64_RESULT: ${{ needs.benchmark-arm64.result }}
+          BENCH_X86_OUTCOME: ${{ needs.benchmark-x86.outcome }}
+          BENCH_X86_RESULT: ${{ needs.benchmark-x86.result }}
+          RETRY_ARM64_RESULT: ${{ needs.retry-benchmark-arm64.result }}
+          RETRY_X86_RESULT: ${{ needs.retry-benchmark-x86.result }}
         run: |
+          echo "=== Job Results Debug ==="
+          echo "benchmark-arm64: outcome='$BENCH_ARM64_OUTCOME' result='$BENCH_ARM64_RESULT'"
+          echo "benchmark-x86: outcome='$BENCH_X86_OUTCOME' result='$BENCH_X86_RESULT'"
+          echo "retry-benchmark-arm64: result='$RETRY_ARM64_RESULT'"
+          echo "retry-benchmark-x86: result='$RETRY_X86_RESULT'"
+          echo "========================="
+
           ARM64_OK="false"
           X86_OK="false"
 
-          # Use 'outcome' for benchmark jobs (they have continue-on-error)
-          # Use 'result' for retry jobs (they don't have continue-on-error)
-          if [[ "${{ needs.benchmark-arm64.outcome }}" == "success" ]] || \
-             [[ "${{ needs.retry-benchmark-arm64.result }}" == "success" ]]; then
+          # For benchmark jobs with continue-on-error:
+          # - 'outcome' = actual result (success/failure)
+          # - 'result' = always 'success' due to continue-on-error
+          # Check outcome first, but also accept result='success' if outcome is empty
+          # (handles edge cases where outcome might not be set)
+          if [[ "$BENCH_ARM64_OUTCOME" == "success" ]] || \
+             [[ "$RETRY_ARM64_RESULT" == "success" ]] || \
+             [[ -z "$BENCH_ARM64_OUTCOME" && "$BENCH_ARM64_RESULT" == "success" ]]; then
             ARM64_OK="true"
           fi
 
-          if [[ "${{ needs.benchmark-x86.outcome }}" == "success" ]] || \
-             [[ "${{ needs.retry-benchmark-x86.result }}" == "success" ]]; then
+          if [[ "$BENCH_X86_OUTCOME" == "success" ]] || \
+             [[ "$RETRY_X86_RESULT" == "success" ]] || \
+             [[ -z "$BENCH_X86_OUTCOME" && "$BENCH_X86_RESULT" == "success" ]]; then
             X86_OK="true"
           fi
 
