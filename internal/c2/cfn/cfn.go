@@ -24,17 +24,17 @@ type Client struct {
 
 // WorkerStackParams contains parameters for creating a worker stack.
 type WorkerStackParams struct {
-	RunID             string
-	Mode              string // fast, med, metal
-	Architecture      string // arm64, x86
-	AvailabilityZone  string
-	SpotPrice         string
-	SubnetID          string
-	SecurityGroupID   string
+	RunID              string
+	Mode               string // fast, med, metal
+	Architecture       string // arm64, x86
+	AvailabilityZone   string
+	SpotPrice          string
+	SubnetID           string
+	SecurityGroupID    string
 	InstanceProfileArn string
-	C2Endpoint        string
-	BenchmarkDuration string
-	BenchmarkMode     string // baseline, theoretical, all
+	C2Endpoint         string
+	BenchmarkDuration  string
+	BenchmarkMode      string // baseline, theoretical, all
 }
 
 // StackStatus represents the status of a CloudFormation stack.

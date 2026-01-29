@@ -33,10 +33,10 @@ type SpotPrice struct {
 
 // BidResult contains the recommended bid and AZ for an instance type.
 type BidResult struct {
-	InstanceType string
-	AZ           string
-	CurrentPrice float64
-	BidPrice     float64
+	InstanceType  string
+	AZ            string
+	CurrentPrice  float64
+	BidPrice      float64
 	OnDemandPrice float64
 }
 
@@ -82,9 +82,9 @@ func (c *Client) GetSpotPrices(ctx context.Context, instanceType string) ([]Spot
 	startTime := time.Now().Add(-1 * time.Hour)
 
 	input := &ec2.DescribeSpotPriceHistoryInput{
-		InstanceTypes: []types.InstanceType{types.InstanceType(instanceType)},
+		InstanceTypes:       []types.InstanceType{types.InstanceType(instanceType)},
 		ProductDescriptions: []string{"Linux/UNIX"},
-		StartTime:     &startTime,
+		StartTime:           &startTime,
 	}
 
 	result, err := c.ec2.DescribeSpotPriceHistory(ctx, input)
@@ -299,20 +299,20 @@ func (c *Client) getOnDemandPrice(ctx context.Context, instanceType string) (flo
 
 	prices := map[string]float64{
 		// ARM64
-		"c6g.medium":   0.034,
-		"c6g.xlarge":   0.136,
-		"c6g.2xlarge":  0.272,
-		"c6g.4xlarge":  0.544,
-		"c6g.metal":    2.176,
-		"t4g.small":    0.0168,
+		"c6g.medium":  0.034,
+		"c6g.xlarge":  0.136,
+		"c6g.2xlarge": 0.272,
+		"c6g.4xlarge": 0.544,
+		"c6g.metal":   2.176,
+		"t4g.small":   0.0168,
 
 		// x86
-		"c5.large":     0.085,
-		"c5.xlarge":    0.17,
-		"c5.2xlarge":   0.34,
-		"c5.9xlarge":   1.53,
-		"c5.metal":     4.08,
-		"t3.small":     0.0208,
+		"c5.large":   0.085,
+		"c5.xlarge":  0.17,
+		"c5.2xlarge": 0.34,
+		"c5.9xlarge": 1.53,
+		"c5.metal":   4.08,
+		"t3.small":   0.0208,
 	}
 
 	if price, ok := prices[instanceType]; ok {
@@ -325,7 +325,7 @@ func (c *Client) getOnDemandPrice(ctx context.Context, instanceType string) (flo
 // parsePrice converts a price string to float64.
 func parsePrice(s string) float64 {
 	var price float64
-	fmt.Sscanf(s, "%f", &price)
+	_, _ = fmt.Sscanf(s, "%f", &price)
 	return price
 }
 

@@ -87,7 +87,7 @@ func (h *Handler) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // handleHealth returns health status.
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleStartBenchmark starts a new benchmark run.
@@ -117,7 +117,7 @@ func (h *Handler) handleStartBenchmark(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"run_id": run.ID,
 		"status": run.Status,
 	})
@@ -159,7 +159,7 @@ func (h *Handler) handleBenchmarkStatus(w http.ResponseWriter, r *http.Request, 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"run_id":     run.ID,
 		"status":     run.Status,
 		"mode":       run.Mode,
@@ -180,7 +180,7 @@ func (h *Handler) handleBenchmarkResults(w http.ResponseWriter, r *http.Request,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(run.Results)
+	_ = json.NewEncoder(w).Encode(run.Results)
 }
 
 // handleBenchmarkCancel cancels a running benchmark.
@@ -196,7 +196,7 @@ func (h *Handler) handleBenchmarkCancel(w http.ResponseWriter, r *http.Request, 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "cancelled"})
 }
 
 // handleListResults lists all benchmark runs.
@@ -208,7 +208,7 @@ func (h *Handler) handleListResults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(runs)
+	_ = json.NewEncoder(w).Encode(runs)
 }
 
 // handleGetResult returns a specific result.
@@ -226,7 +226,7 @@ func (h *Handler) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(run)
+	_ = json.NewEncoder(w).Encode(run)
 }
 
 // Worker API endpoints (called by worker instances)
@@ -269,7 +269,7 @@ func (h *Handler) handleWorkerRegister(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Worker registered: %s %s-%s (%s)", req.RunID, req.Arch, req.Role, req.PrivateIP)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
 }
 
 // handleWorkerAssignment returns the server IP for a client worker.
@@ -286,12 +286,12 @@ func (h *Handler) handleWorkerAssignment(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		// Server not ready yet
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{})
+		_ = json.NewEncoder(w).Encode(map[string]string{})
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"server_ip": serverIP})
+	_ = json.NewEncoder(w).Encode(map[string]string{"server_ip": serverIP})
 }
 
 // handleWorkerHeartbeat updates worker health status.
@@ -311,10 +311,10 @@ func (h *Handler) handleWorkerHeartbeat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.config.Store.UpdateWorkerStatus(req.RunID, req.Arch, req.Role, "running")
+	_ = h.config.Store.UpdateWorkerStatus(req.RunID, req.Arch, req.Role, "running")
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleWorkerComplete marks a worker as complete.
@@ -335,17 +335,17 @@ func (h *Handler) handleWorkerComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.config.Store.UpdateWorkerStatus(req.RunID, req.Arch, req.Role, "completed")
+	_ = h.config.Store.UpdateWorkerStatus(req.RunID, req.Arch, req.Role, "completed")
 
 	if req.Role == "client" {
 		// Client completion triggers arch completion
-		h.config.Store.CompleteArch(req.RunID, req.Arch)
+		_ = h.config.Store.CompleteArch(req.RunID, req.Arch)
 	}
 
 	log.Printf("Worker completed: %s %s-%s", req.RunID, req.Arch, req.Role)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleWorkerResults receives benchmark results from a worker.
@@ -373,7 +373,7 @@ func (h *Handler) handleWorkerResults(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received %d results for %s %s", len(req.Results), req.RunID, req.Arch)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleAdmin handles admin operations.
@@ -384,15 +384,15 @@ func (h *Handler) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case "logs":
 		// TODO: Return recent logs
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("Logs endpoint not implemented yet"))
+		_, _ = w.Write([]byte("Logs endpoint not implemented yet"))
 	case "update":
 		// TODO: Trigger self-update
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
 	case "restart":
 		// TODO: Trigger restart
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
 	default:
 		http.Error(w, "Unknown action", http.StatusNotFound)
 	}

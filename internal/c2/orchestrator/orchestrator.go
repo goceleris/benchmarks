@@ -8,20 +8,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/goceleris/benchmarks/internal/c2/cfn"
 	"github.com/goceleris/benchmarks/internal/c2/github"
 	"github.com/goceleris/benchmarks/internal/c2/spot"
 	"github.com/goceleris/benchmarks/internal/c2/store"
-	"github.com/google/uuid"
 )
 
 // Default timeouts
 const (
-	WorkerStartTimeout   = 10 * time.Minute
-	BenchmarkTimeout     = 3 * time.Hour
-	HealthCheckInterval  = 30 * time.Second
-	WorkerHealthTimeout  = 5 * time.Minute
-	CleanupInterval      = 1 * time.Hour
+	WorkerStartTimeout  = 10 * time.Minute
+	BenchmarkTimeout    = 3 * time.Hour
+	HealthCheckInterval = 30 * time.Second
+	WorkerHealthTimeout = 5 * time.Minute
+	CleanupInterval     = 1 * time.Hour
 )
 
 // Default durations per mode
@@ -40,10 +41,10 @@ type Config struct {
 	AWSRegion string
 
 	// Infrastructure config (should come from C2 stack outputs)
-	SubnetID          string
-	SecurityGroupID   string
+	SubnetID           string
+	SecurityGroupID    string
 	InstanceProfileArn string
-	C2Endpoint        string
+	C2Endpoint         string
 }
 
 // Orchestrator coordinates benchmark runs.
@@ -149,7 +150,7 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		run.Status = "completed"
 	}
 	run.EndedAt = time.Now()
-	o.config.Store.UpdateRun(run)
+	_ = o.config.Store.UpdateRun(run)
 
 	// Cleanup workers
 	o.cleanupRun(ctx, run.ID)
@@ -183,17 +184,17 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 
 	// Create worker stack
 	stackName, err := o.config.CFN.CreateWorkerStack(ctx, cfn.WorkerStackParams{
-		RunID:             run.ID,
-		Mode:              run.Mode,
-		Architecture:      arch,
-		AvailabilityZone:  serverBid.AZ,
-		SpotPrice:         fmt.Sprintf("%.4f", serverBid.BidPrice),
-		SubnetID:          o.config.SubnetID,
-		SecurityGroupID:   o.config.SecurityGroupID,
+		RunID:              run.ID,
+		Mode:               run.Mode,
+		Architecture:       arch,
+		AvailabilityZone:   serverBid.AZ,
+		SpotPrice:          fmt.Sprintf("%.4f", serverBid.BidPrice),
+		SubnetID:           o.config.SubnetID,
+		SecurityGroupID:    o.config.SecurityGroupID,
 		InstanceProfileArn: o.config.InstanceProfileArn,
-		C2Endpoint:        o.config.C2Endpoint,
-		BenchmarkDuration: run.Duration,
-		BenchmarkMode:     benchMode,
+		C2Endpoint:         o.config.C2Endpoint,
+		BenchmarkDuration:  run.Duration,
+		BenchmarkMode:      benchMode,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create worker stack: %w", err)
@@ -202,13 +203,13 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 	// Wait for stack to be ready
 	_, err = o.config.CFN.WaitForStack(ctx, stackName, WorkerStartTimeout)
 	if err != nil {
-		o.config.CFN.DeleteStack(ctx, stackName)
+		_ = o.config.CFN.DeleteStack(ctx, stackName)
 		return fmt.Errorf("worker stack failed: %w", err)
 	}
 
 	// Wait for workers to register
 	if err := o.waitForWorkers(ctx, run.ID, arch, WorkerStartTimeout); err != nil {
-		o.config.CFN.DeleteStack(ctx, stackName)
+		_ = o.config.CFN.DeleteStack(ctx, stackName)
 		return fmt.Errorf("workers did not register: %w", err)
 	}
 
@@ -218,7 +219,7 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 	}
 
 	// Mark architecture as complete
-	o.config.Store.CompleteArch(run.ID, arch)
+	_ = o.config.Store.CompleteArch(run.ID, arch)
 
 	log.Printf("%s benchmarks completed for run %s", arch, run.ID)
 	return nil
@@ -359,7 +360,7 @@ func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 
 	run.Status = "cancelled"
 	run.EndedAt = time.Now()
-	o.config.Store.UpdateRun(run)
+	_ = o.config.Store.UpdateRun(run)
 
 	o.cleanupRun(ctx, runID)
 
@@ -412,7 +413,7 @@ func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 		// Check for timeout
 		if time.Since(run.StartedAt) > BenchmarkTimeout {
 			log.Printf("Run %s exceeded timeout, cancelling", run.ID)
-			o.CancelRun(ctx, run.ID)
+			_ = o.CancelRun(ctx, run.ID)
 		}
 	}
 }
@@ -444,7 +445,7 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 		// Clean up stale running runs (shouldn't happen normally)
 		if run.Status == "running" && time.Since(run.StartedAt) > 24*time.Hour {
 			log.Printf("Cleaning up stale run %s", run.ID)
-			o.CancelRun(ctx, run.ID)
+			_ = o.CancelRun(ctx, run.ID)
 		}
 	}
 }

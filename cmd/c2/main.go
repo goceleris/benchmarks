@@ -43,7 +43,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 	log.SetOutput(logFile)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -63,7 +63,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Initialize AWS clients
 	spotClient, err := spot.NewClient(awsRegion)
@@ -109,7 +109,7 @@ func main() {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	})
 
 	httpServer := &http.Server{

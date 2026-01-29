@@ -112,7 +112,7 @@ func (c *Client) getDefaultBranchSHA(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -152,7 +152,7 @@ func (c *Client) createBranch(ctx context.Context, name, sha string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -177,9 +177,9 @@ func (c *Client) createOrUpdateFile(ctx context.Context, branch, path string, co
 		var existing struct {
 			SHA string `json:"sha"`
 		}
-		json.NewDecoder(resp.Body).Decode(&existing)
+		_ = json.NewDecoder(resp.Body).Decode(&existing)
 		existingSHA = existing.SHA
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
 	// Create/update file
@@ -206,7 +206,7 @@ func (c *Client) createOrUpdateFile(ctx context.Context, branch, path string, co
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -239,7 +239,7 @@ func (c *Client) createPR(ctx context.Context, branch, title, body string) (stri
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)

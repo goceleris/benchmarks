@@ -31,7 +31,7 @@ type Store struct {
 // Run represents a benchmark run.
 type Run struct {
 	ID        string    `json:"id"`
-	Mode      string    `json:"mode"` // fast, med, metal
+	Mode      string    `json:"mode"`   // fast, med, metal
 	Status    string    `json:"status"` // pending, running, completed, failed
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`
@@ -47,38 +47,38 @@ type Run struct {
 
 // Worker represents a registered worker instance.
 type Worker struct {
-	RunID      string    `json:"run_id"`
-	Role       string    `json:"role"` // server, client
-	Arch       string    `json:"arch"` // arm64, x86
-	InstanceID string    `json:"instance_id"`
-	PrivateIP  string    `json:"private_ip"`
-	Status     string    `json:"status"` // pending, running, completed, failed, terminated
+	RunID        string    `json:"run_id"`
+	Role         string    `json:"role"` // server, client
+	Arch         string    `json:"arch"` // arm64, x86
+	InstanceID   string    `json:"instance_id"`
+	PrivateIP    string    `json:"private_ip"`
+	Status       string    `json:"status"` // pending, running, completed, failed, terminated
 	RegisteredAt time.Time `json:"registered_at"`
-	LastSeen   time.Time `json:"last_seen"`
+	LastSeen     time.Time `json:"last_seen"`
 }
 
 // ArchResult holds benchmark results for one architecture.
 type ArchResult struct {
-	Arch         string         `json:"arch"`
-	Status       string         `json:"status"` // pending, running, completed, failed
-	StartedAt    time.Time      `json:"started_at"`
-	CompletedAt  time.Time      `json:"completed_at,omitempty"`
-	Benchmarks   []BenchResult  `json:"benchmarks"`
-	InstanceType string         `json:"instance_type"`
-	WasSpot      bool           `json:"was_spot"`
+	Arch         string        `json:"arch"`
+	Status       string        `json:"status"` // pending, running, completed, failed
+	StartedAt    time.Time     `json:"started_at"`
+	CompletedAt  time.Time     `json:"completed_at,omitempty"`
+	Benchmarks   []BenchResult `json:"benchmarks"`
+	InstanceType string        `json:"instance_type"`
+	WasSpot      bool          `json:"was_spot"`
 }
 
 // BenchResult holds results for a single benchmark.
 type BenchResult struct {
-	ServerType    string        `json:"server_type"`
-	BenchmarkType string        `json:"benchmark_type"`
-	RequestsPerSec float64      `json:"requests_per_sec"`
-	LatencyAvg    time.Duration `json:"latency_avg"`
-	LatencyP50    time.Duration `json:"latency_p50"`
-	LatencyP99    time.Duration `json:"latency_p99"`
-	LatencyMax    time.Duration `json:"latency_max"`
-	TotalRequests int64         `json:"total_requests"`
-	Errors        int64         `json:"errors"`
+	ServerType     string        `json:"server_type"`
+	BenchmarkType  string        `json:"benchmark_type"`
+	RequestsPerSec float64       `json:"requests_per_sec"`
+	LatencyAvg     time.Duration `json:"latency_avg"`
+	LatencyP50     time.Duration `json:"latency_p50"`
+	LatencyP99     time.Duration `json:"latency_p99"`
+	LatencyMax     time.Duration `json:"latency_max"`
+	TotalRequests  int64         `json:"total_requests"`
+	Errors         int64         `json:"errors"`
 }
 
 // New creates a new Store with the given data directory.
