@@ -463,7 +463,7 @@ jobs:
 
       - name: Download ARM64 Results
         if: needs.benchmark-arm64.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: metal-results-arm64
           path: downloaded/arm64
@@ -471,7 +471,7 @@ jobs:
 
       - name: Download x86 Results
         if: needs.benchmark-x86.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: metal-results-x86
           path: downloaded/x86

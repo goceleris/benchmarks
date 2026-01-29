@@ -1368,7 +1368,7 @@ jobs:
 
       - name: Download Previous Checkpoint
         id: download_original
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-arm64
           path: results/
@@ -1376,7 +1376,7 @@ jobs:
 
       - name: Download Recovered Checkpoint
         if: steps.download_original.outcome == 'failure'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: recovered-checkpoint-arm64
           path: results/
@@ -1457,7 +1457,7 @@ jobs:
 
       - name: Download Previous Checkpoint
         id: download_original
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-x86
           path: results/
@@ -1465,7 +1465,7 @@ jobs:
 
       - name: Download Recovered Checkpoint
         if: steps.download_original.outcome == 'failure'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: recovered-checkpoint-x86
           path: results/
@@ -1545,28 +1545,28 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download ARM64 Results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-arm64
           path: downloaded/arm64
         continue-on-error: true
 
       - name: Download ARM64 Retry Results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-arm64-retry
           path: downloaded/arm64-retry
         continue-on-error: true
 
       - name: Download x86 Results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-x86
           path: downloaded/x86
         continue-on-error: true
 
       - name: Download x86 Retry Results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-results-x86-retry
           path: downloaded/x86-retry
