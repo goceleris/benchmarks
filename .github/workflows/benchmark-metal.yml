@@ -175,6 +175,49 @@ jobs:
         working-directory: terraform
         run: terraform init
 
+      # Wait for vCPU capacity before launching (handles orphaned instances from previous runs)
+      - name: Wait for vCPU Capacity
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Checking vCPU capacity before ARM64 launch..."
+
+          # ARM64 metal needs: server (64) + client (8) = 72 vCPUs
+          # With 192 limit, we need usage to be below 120 vCPUs
+          REQUIRED_FREE=72
+          MAX_USAGE=$((192 - REQUIRED_FREE))
+          MAX_WAIT=1800  # 30 minutes
+          POLL_INTERVAL=30
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Get current running instance vCPU count
+            VCPU_COUNT=$(aws ec2 describe-instances \
+              --filters "Name=instance-state-name,Values=running,pending" \
+              --query 'Reservations[].Instances[].CpuOptions.CoreCount' \
+              --output text | awk '{sum=0; for(i=1;i<=NF;i++) sum+=$i*2; print sum}')
+
+            # Handle empty result
+            VCPU_COUNT=${VCPU_COUNT:-0}
+
+            echo "Current vCPU usage: $VCPU_COUNT / 192 (need <= $MAX_USAGE for ARM64 launch)"
+
+            if [ "$VCPU_COUNT" -le "$MAX_USAGE" ]; then
+              echo "Sufficient vCPU capacity available!"
+              break
+            fi
+
+            echo "Waiting ${POLL_INTERVAL}s for capacity... (${ELAPSED}s / ${MAX_WAIT}s)"
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "::warning::Timeout waiting for vCPU capacity. Proceeding anyway..."
+          fi
+
       # ARM64 Priority: Spot first (cost savings), On-Demand fallback
       # Order: Metal Spot -> Metal On-Demand -> Provisional Spot -> Provisional On-Demand
 
@@ -192,12 +235,18 @@ jobs:
         run: |
           echo "Attempting ARM64 metal spot (c6g.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 metal spot launched successfully"
+            if terraform state list | grep -q "aws_spot_instance_request.arm64_server"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "ARM64 metal spot launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "ARM64 metal spot: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "ARM64 metal spot failed with exit code $EXIT_CODE"
@@ -230,12 +279,18 @@ jobs:
         run: |
           echo "Attempting ARM64 metal on-demand (c6g.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 metal on-demand launched successfully"
+            if terraform state list | grep -q "aws_instance.arm64_server_ondemand"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "ARM64 metal on-demand launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "ARM64 metal on-demand: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "ARM64 metal on-demand failed with exit code $EXIT_CODE"
@@ -268,12 +323,18 @@ jobs:
         run: |
           echo "Attempting ARM64 provisional spot (c6g.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_spot_instance_request.arm64_server 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 provisional spot launched successfully"
+            if terraform state list | grep -q "aws_spot_instance_request.arm64_server"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "ARM64 provisional spot launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "ARM64 provisional spot: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "ARM64 provisional spot failed with exit code $EXIT_CODE"
@@ -306,12 +367,18 @@ jobs:
         run: |
           echo "Attempting ARM64 provisional on-demand (c6g.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_instance.arm64_server_ondemand 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "ARM64 provisional on-demand launched successfully"
+            if terraform state list | grep -q "aws_instance.arm64_server_ondemand"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "ARM64 provisional on-demand launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "ARM64 provisional on-demand: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "ARM64 provisional on-demand failed with exit code $EXIT_CODE"
@@ -364,7 +431,7 @@ jobs:
             echo "instance_type=none" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "::error::All ARM64 launch attempts failed"
-            exit 0
+            exit 1
           fi
 
           # Get server private IP from terraform output
@@ -531,12 +598,19 @@ jobs:
         run: |
           echo "Attempting x86 metal spot (c5.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
+          # Verify resource was actually created (terraform exits 0 even with "0 added")
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "x86 metal spot launched successfully"
+            if terraform state list | grep -q "aws_spot_instance_request.x86_server"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "x86 metal spot launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "x86 metal spot: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "x86 metal spot failed with exit code $EXIT_CODE"
@@ -569,12 +643,18 @@ jobs:
         run: |
           echo "Attempting x86 metal on-demand (c5.metal)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "x86 metal on-demand launched successfully"
+            if terraform state list | grep -q "aws_instance.x86_server_ondemand"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "x86 metal on-demand launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "x86 metal on-demand: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "x86 metal on-demand failed with exit code $EXIT_CODE"
@@ -607,12 +687,18 @@ jobs:
         run: |
           echo "Attempting x86 provisional spot (c5.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_spot_instance_request.x86_server 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "x86 provisional spot launched successfully"
+            if terraform state list | grep -q "aws_spot_instance_request.x86_server"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "x86 provisional spot launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "x86 provisional spot: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "x86 provisional spot failed with exit code $EXIT_CODE"
@@ -645,12 +731,18 @@ jobs:
         run: |
           echo "Attempting x86 provisional on-demand (c5.2xlarge)..."
           set +e
-          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand
-          EXIT_CODE=$?
+          terraform apply -auto-approve -target=aws_instance.x86_server_ondemand 2>&1 | tee /tmp/tf_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
           set -e
+
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "success=true" >> $GITHUB_OUTPUT
-            echo "x86 provisional on-demand launched successfully"
+            if terraform state list | grep -q "aws_instance.x86_server_ondemand"; then
+              echo "success=true" >> $GITHUB_OUTPUT
+              echo "x86 provisional on-demand launched successfully"
+            else
+              echo "success=false" >> $GITHUB_OUTPUT
+              echo "x86 provisional on-demand: terraform succeeded but resource not in state"
+            fi
           else
             echo "success=false" >> $GITHUB_OUTPUT
             echo "x86 provisional on-demand failed with exit code $EXIT_CODE"
@@ -702,7 +794,7 @@ jobs:
             echo "instance_type=none" >> $GITHUB_OUTPUT
             echo "was_spot=false" >> $GITHUB_OUTPUT
             echo "::error::All x86 launch attempts failed"
-            exit 0
+            exit 1
           fi
 
           # Get server private IP from terraform output
@@ -2188,11 +2280,17 @@ jobs:
           echo "ARM64: $ARM64_OK"
           echo "x86: $X86_OK"
 
-          # At least one architecture must succeed
-          if [[ "$ARM64_OK" == "true" ]] || [[ "$X86_OK" == "true" ]]; then
-            echo "Benchmark completed successfully"
+          # BOTH architectures must succeed
+          if [[ "$ARM64_OK" == "true" ]] && [[ "$X86_OK" == "true" ]]; then
+            echo "All benchmarks completed successfully"
             exit 0
+          elif [[ "$ARM64_OK" == "true" ]]; then
+            echo "::error::x86 benchmarks failed or did not run"
+            exit 1
+          elif [[ "$X86_OK" == "true" ]]; then
+            echo "::error::ARM64 benchmarks failed or did not run"
+            exit 1
           else
-            echo "All benchmarks failed"
+            echo "::error::All benchmarks failed"
             exit 1
           fi

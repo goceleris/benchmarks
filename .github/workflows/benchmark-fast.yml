@@ -1029,11 +1029,17 @@ jobs:
           echo "ARM64: $ARM64_OK"
           echo "x86: $X86_OK"
 
-          # At least one architecture must succeed
-          if [[ "$ARM64_OK" == "true" ]] || [[ "$X86_OK" == "true" ]]; then
-            echo "Benchmark completed successfully"
+          # BOTH architectures must succeed
+          if [[ "$ARM64_OK" == "true" ]] && [[ "$X86_OK" == "true" ]]; then
+            echo "All benchmarks completed successfully"
             exit 0
+          elif [[ "$ARM64_OK" == "true" ]]; then
+            echo "::error::x86 benchmarks failed or did not run"
+            exit 1
+          elif [[ "$X86_OK" == "true" ]]; then
+            echo "::error::ARM64 benchmarks failed or did not run"
+            exit 1
           else
-            echo "All benchmarks failed"
+            echo "::error::All benchmarks failed"
             exit 1
           fi
