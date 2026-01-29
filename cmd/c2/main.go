@@ -3,12 +3,13 @@
 // - Exposes a REST API for triggering and monitoring benchmarks
 // - Manages spot instance lifecycle for workers
 // - Collects and stores benchmark results
-// - Generates charts and creates PRs with results
+// - Creates PRs with results
 package main
 
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/goceleris/benchmarks/internal/c2/api"
 	"github.com/goceleris/benchmarks/internal/c2/cfn"
+	"github.com/goceleris/benchmarks/internal/c2/config"
 	"github.com/goceleris/benchmarks/internal/c2/github"
 	"github.com/goceleris/benchmarks/internal/c2/orchestrator"
 	"github.com/goceleris/benchmarks/internal/c2/spot"
@@ -44,7 +46,10 @@ func main() {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	defer func() { _ = logFile.Close() }()
-	log.SetOutput(logFile)
+
+	// Log to both file and stdout
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(multiWriter)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	log.Println("=== C2 Server Starting ===")
@@ -57,6 +62,23 @@ func main() {
 	if awsRegion == "" {
 		awsRegion = "us-east-1"
 	}
+	log.Printf("Using AWS region: %s", awsRegion)
+
+	// Load configuration from SSM and CloudFormation
+	ctx := context.Background()
+	configLoader, err := config.NewLoader(awsRegion)
+	if err != nil {
+		log.Fatalf("Failed to create config loader: %v", err)
+	}
+
+	cfg, err := configLoader.Load(ctx)
+	if err != nil {
+		log.Printf("Warning: Config loading had errors: %v", err)
+	}
+	cfg.Region = awsRegion
+
+	log.Printf("Config loaded - SubnetID: %s, SecurityGroupID: %s, C2Endpoint: %s",
+		cfg.SubnetID, cfg.SecurityGroupID, cfg.C2Endpoint)
 
 	// Initialize store
 	db, err := store.New(*dataDir)
@@ -64,46 +86,64 @@ func main() {
 		log.Fatalf("Failed to initialize store: %v", err)
 	}
 	defer func() { _ = db.Close() }()
+	log.Println("BadgerDB initialized")
 
 	// Initialize AWS clients
 	spotClient, err := spot.NewClient(awsRegion)
 	if err != nil {
 		log.Fatalf("Failed to initialize spot client: %v", err)
 	}
+	log.Println("Spot client initialized")
 
 	cfnClient, err := cfn.NewClient(awsRegion)
 	if err != nil {
 		log.Fatalf("Failed to initialize CloudFormation client: %v", err)
 	}
+	log.Println("CloudFormation client initialized")
 
-	// Initialize GitHub client
-	ghClient, err := github.NewClient()
-	if err != nil {
-		log.Printf("Warning: GitHub client not initialized: %v", err)
+	// Initialize GitHub client (optional - only needed for PR creation)
+	var ghClient *github.Client
+	if cfg.GitHubToken != "" {
+		ghClient, err = github.NewClientWithToken(cfg.GitHubToken)
+		if err != nil {
+			log.Printf("Warning: GitHub client not initialized: %v", err)
+		} else {
+			log.Println("GitHub client initialized")
+		}
+	} else {
+		log.Println("Warning: GitHub token not set, PR creation disabled")
 	}
 
-	// Initialize orchestrator
+	// Initialize orchestrator with full config
 	orch := orchestrator.New(orchestrator.Config{
-		Store:     db,
-		Spot:      spotClient,
-		CFN:       cfnClient,
-		GitHub:    ghClient,
-		AWSRegion: awsRegion,
+		Store:              db,
+		Spot:               spotClient,
+		CFN:                cfnClient,
+		GitHub:             ghClient,
+		AWSRegion:          awsRegion,
+		SubnetID:           cfg.SubnetID,
+		SecurityGroupID:    cfg.SecurityGroupID,
+		InstanceProfileArn: cfg.InstanceProfileArn,
+		C2Endpoint:         cfg.C2Endpoint,
 	})
+	log.Println("Orchestrator initialized")
 
 	// Start background workers
-	ctx, cancel := context.WithCancel(context.Background())
+	bgCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go orch.RunHealthChecker(ctx)
-	go orch.RunCleanupWorker(ctx)
-	go db.RunGC(ctx)
+	go orch.RunHealthChecker(bgCtx)
+	go orch.RunCleanupWorker(bgCtx)
+	go db.RunGC(bgCtx)
+	log.Println("Background workers started")
 
-	// Initialize API
-	apiHandler := api.New(api.Config{
+	// Initialize API with config
+	apiHandler := api.NewWithConfig(api.Config{
 		Store:        db,
 		Orchestrator: orch,
+		APIKey:       cfg.APIKey,
 	})
+	log.Println("API handler initialized")
 
 	// HTTP server (health checks, ACME)
 	httpMux := http.NewServeMux()
@@ -111,6 +151,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
+	// Also serve API on HTTP for internal access
+	httpMux.Handle("/api/", apiHandler)
 
 	httpServer := &http.Server{
 		Addr:    *httpAddr,
@@ -138,19 +180,17 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("HTTPS server listening on %s", *addr)
 		if *certFile != "" && *keyFile != "" {
+			log.Printf("HTTPS server listening on %s", *addr)
 			if err := httpsServer.ListenAndServeTLS(*certFile, *keyFile); err != http.ErrServerClosed {
 				log.Printf("HTTPS server error: %v", err)
 			}
 		} else {
-			// For development/initial setup, run without TLS
-			log.Println("Warning: Running without TLS (use -cert and -key for production)")
-			if err := httpsServer.ListenAndServe(); err != http.ErrServerClosed {
-				log.Printf("Server error: %v", err)
-			}
+			log.Printf("Warning: TLS not configured, HTTPS server disabled")
 		}
 	}()
+
+	log.Println("=== C2 Server Ready ===")
 
 	<-sigChan
 	log.Println("Shutting down...")

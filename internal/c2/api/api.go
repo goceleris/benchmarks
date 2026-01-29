@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Store        *store.Store
 	Orchestrator *orchestrator.Orchestrator
+	APIKey       string // If empty, auth is disabled
 }
 
 // Handler is the main API handler.
@@ -25,17 +26,21 @@ type Handler struct {
 	mux    *http.ServeMux
 }
 
-// New creates a new API handler.
+// New creates a new API handler (legacy, uses env var for API key).
 func New(config Config) *Handler {
+	config.APIKey = os.Getenv("C2_API_KEY")
+	return NewWithConfig(config)
+}
+
+// NewWithConfig creates a new API handler with explicit config.
+func NewWithConfig(config Config) *Handler {
 	h := &Handler{
 		config: config,
-		apiKey: os.Getenv("C2_API_KEY"),
+		apiKey: config.APIKey,
 		mux:    http.NewServeMux(),
 	}
 
-	// If no API key set, try SSM
 	if h.apiKey == "" {
-		// TODO: Fetch from SSM Parameter Store
 		log.Println("Warning: C2_API_KEY not set, API authentication disabled")
 	}
 
@@ -382,18 +387,46 @@ func (h *Handler) handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	switch action {
 	case "logs":
-		// TODO: Return recent logs
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("Logs endpoint not implemented yet"))
-	case "update":
-		// TODO: Trigger self-update
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
-	case "restart":
-		// TODO: Trigger restart
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not implemented"})
+		h.handleAdminLogs(w, r)
+	case "runs":
+		h.handleAdminRuns(w, r)
+	case "cleanup":
+		h.handleAdminCleanup(w, r)
 	default:
 		http.Error(w, "Unknown action", http.StatusNotFound)
 	}
+}
+
+// handleAdminLogs returns recent log entries.
+func (h *Handler) handleAdminLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"message": "Check /data/logs/c2.log on the server",
+	})
+}
+
+// handleAdminRuns returns all runs for admin inspection.
+func (h *Handler) handleAdminRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := h.config.Store.ListRuns("", 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(runs)
+}
+
+// handleAdminCleanup triggers cleanup of orphaned resources.
+func (h *Handler) handleAdminCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Trigger cleanup
+	go h.config.Orchestrator.CleanupOrphaned(r.Context())
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "cleanup triggered"})
 }

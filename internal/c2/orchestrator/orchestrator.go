@@ -40,7 +40,7 @@ type Config struct {
 	GitHub    *github.Client
 	AWSRegion string
 
-	// Infrastructure config (should come from C2 stack outputs)
+	// Infrastructure config (from C2 stack outputs)
 	SubnetID           string
 	SecurityGroupID    string
 	InstanceProfileArn string
@@ -64,6 +64,20 @@ func New(config Config) *Orchestrator {
 func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode string) (*store.Run, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	// Validate infrastructure config
+	if o.config.SubnetID == "" {
+		return nil, fmt.Errorf("infrastructure not configured: SubnetID is missing")
+	}
+	if o.config.SecurityGroupID == "" {
+		return nil, fmt.Errorf("infrastructure not configured: SecurityGroupID is missing")
+	}
+	if o.config.InstanceProfileArn == "" {
+		return nil, fmt.Errorf("infrastructure not configured: InstanceProfileArn is missing")
+	}
+	if o.config.C2Endpoint == "" {
+		return nil, fmt.Errorf("infrastructure not configured: C2Endpoint is missing")
+	}
 
 	// Check for existing running runs
 	running, err := o.config.Store.GetRunningRuns()
@@ -98,6 +112,9 @@ func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode s
 	if err := o.config.Store.CreateRun(run); err != nil {
 		return nil, fmt.Errorf("failed to create run: %w", err)
 	}
+
+	log.Printf("Created benchmark run %s (mode: %s, duration: %s, benchMode: %s)",
+		runID, mode, duration, benchMode)
 
 	// Start workers in background
 	go o.runBenchmarks(context.Background(), run, benchMode)
@@ -248,6 +265,7 @@ func (o *Orchestrator) waitForWorkers(ctx context.Context, runID, arch string, t
 		clientOK := run.Workers[clientKey] != nil && run.Workers[clientKey].Status == "running"
 
 		if serverOK && clientOK {
+			log.Printf("Both workers registered for %s %s", runID, arch)
 			return nil
 		}
 
@@ -327,23 +345,26 @@ func (o *Orchestrator) cleanupRun(ctx context.Context, runID string) {
 	}
 
 	if len(instanceIDs) > 0 {
+		log.Printf("Terminating %d orphaned instances for run %s", len(instanceIDs), runID)
 		if err := o.config.Spot.TerminateInstances(ctx, instanceIDs); err != nil {
 			log.Printf("Warning: Failed to terminate instances: %v", err)
 		}
 	}
 }
 
-// finalizeResults generates charts and creates a PR.
+// finalizeResults creates a PR with benchmark results.
 func (o *Orchestrator) finalizeResults(ctx context.Context, run *store.Run) {
 	log.Printf("Finalizing results for run %s", run.ID)
 
-	// TODO: Generate charts
-	// TODO: Create PR with results
-
+	// Create PR with results
 	if o.config.GitHub != nil {
 		if err := o.config.GitHub.CreateResultsPR(ctx, run); err != nil {
 			log.Printf("Warning: Failed to create PR: %v", err)
+		} else {
+			log.Printf("Successfully created results PR for run %s", run.ID)
 		}
+	} else {
+		log.Printf("GitHub client not configured, skipping PR creation")
 	}
 }
 
@@ -364,6 +385,7 @@ func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 
 	o.cleanupRun(ctx, runID)
 
+	log.Printf("Cancelled run %s", runID)
 	return nil
 }
 
@@ -406,7 +428,6 @@ func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 			if worker.Status == "running" && time.Since(worker.LastSeen) > WorkerHealthTimeout {
 				log.Printf("Worker %s for run %s appears unhealthy (last seen: %s)",
 					key, run.ID, worker.LastSeen)
-				// Could trigger recovery here
 			}
 		}
 
@@ -435,7 +456,6 @@ func (o *Orchestrator) RunCleanupWorker(ctx context.Context) {
 
 // cleanupOldRuns removes data older than TTL.
 func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
-	// BadgerDB handles TTL automatically, but we can also clean up orphaned resources
 	runs, err := o.config.Store.ListRuns("", 0)
 	if err != nil {
 		return
@@ -448,4 +468,55 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 			_ = o.CancelRun(ctx, run.ID)
 		}
 	}
+}
+
+// CleanupOrphaned cleans up orphaned resources (instances, stacks).
+func (o *Orchestrator) CleanupOrphaned(ctx context.Context) {
+	log.Println("Starting orphaned resource cleanup")
+
+	// Find all instances tagged with celeris-benchmarks
+	instances, err := o.config.Spot.DescribeAllWorkerInstances(ctx)
+	if err != nil {
+		log.Printf("Warning: Failed to describe instances: %v", err)
+		return
+	}
+
+	// Get active run IDs
+	activeRuns := make(map[string]bool)
+	runs, err := o.config.Store.GetRunningRuns()
+	if err == nil {
+		for _, run := range runs {
+			activeRuns[run.ID] = true
+		}
+	}
+
+	// Terminate instances not associated with active runs
+	var orphanedIDs []string
+	for _, inst := range instances {
+		if inst.InstanceId == nil {
+			continue
+		}
+
+		// Find RunId tag
+		var runID string
+		for _, tag := range inst.Tags {
+			if tag.Key != nil && *tag.Key == "RunId" && tag.Value != nil {
+				runID = *tag.Value
+				break
+			}
+		}
+
+		if runID == "" || !activeRuns[runID] {
+			orphanedIDs = append(orphanedIDs, *inst.InstanceId)
+		}
+	}
+
+	if len(orphanedIDs) > 0 {
+		log.Printf("Terminating %d orphaned instances", len(orphanedIDs))
+		if err := o.config.Spot.TerminateInstances(ctx, orphanedIDs); err != nil {
+			log.Printf("Warning: Failed to terminate orphaned instances: %v", err)
+		}
+	}
+
+	log.Println("Orphaned resource cleanup complete")
 }

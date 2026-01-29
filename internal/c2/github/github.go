@@ -28,12 +28,19 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a new GitHub client.
+// NewClient creates a new GitHub client from environment variable.
 func NewClient() (*Client, error) {
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
-		// TODO: Fetch from SSM Parameter Store
 		return nil, fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	return NewClientWithToken(token)
+}
+
+// NewClientWithToken creates a new GitHub client with the given token.
+func NewClientWithToken(token string) (*Client, error) {
+	if token == "" {
+		return nil, fmt.Errorf("token is required")
 	}
 
 	return &Client{
@@ -74,10 +81,8 @@ func (c *Client) CreateResultsPR(ctx context.Context, run *store.Run) error {
 		}
 	}
 
-	// Create PR
-	prURL, err := c.createPR(ctx, branchName,
-		fmt.Sprintf("chore: update benchmark results (%s) [skip ci]", run.Mode),
-		fmt.Sprintf(`## Benchmark Results
+	// Build PR body with results summary
+	prBody := fmt.Sprintf(`## Benchmark Results
 
 Run ID: %s
 Mode: %s
@@ -85,9 +90,25 @@ Duration: %s
 
 ### Results Summary
 
-| Architecture | Status | Benchmarks |
-|--------------|--------|------------|
-`, run.ID, run.Mode, run.Duration))
+| Architecture | Status | Benchmarks | Top RPS |
+|--------------|--------|------------|---------|
+`, run.ID, run.Mode, run.Duration)
+
+	for arch, result := range run.Results {
+		topRPS := 0.0
+		for _, bench := range result.Benchmarks {
+			if bench.RequestsPerSec > topRPS {
+				topRPS = bench.RequestsPerSec
+			}
+		}
+		prBody += fmt.Sprintf("| %s | %s | %d | %.0f |\n",
+			arch, result.Status, len(result.Benchmarks), topRPS)
+	}
+
+	// Create PR
+	prURL, err := c.createPR(ctx, branchName,
+		fmt.Sprintf("chore: update benchmark results (%s) [skip ci]", run.Mode),
+		prBody)
 
 	if err != nil {
 		return fmt.Errorf("failed to create PR: %w", err)

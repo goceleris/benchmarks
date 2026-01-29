@@ -285,18 +285,39 @@ func (c *Client) TerminateInstances(ctx context.Context, instanceIDs []string) e
 	return err
 }
 
-// CheckSpotInterruption checks if any instances have spot interruption notices.
-func (c *Client) CheckSpotInterruption(ctx context.Context, instanceIDs []string) ([]string, error) {
-	// This would require IMDSv2 access from each instance
-	// For now, we rely on the instances self-reporting via the C2 API
-	return nil, nil
+// DescribeAllWorkerInstances returns all worker instances for the celeris-benchmarks project.
+func (c *Client) DescribeAllWorkerInstances(ctx context.Context) ([]types.Instance, error) {
+	input := &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{
+				Name:   strPtr("tag:Project"),
+				Values: []string{"celeris-benchmarks"},
+			},
+			{
+				Name:   strPtr("instance-state-name"),
+				Values: []string{"pending", "running"},
+			},
+		},
+	}
+
+	result, err := c.ec2.DescribeInstances(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	var instances []types.Instance
+	for _, res := range result.Reservations {
+		instances = append(instances, res.Instances...)
+	}
+
+	return instances, nil
 }
 
 // getOnDemandPrice retrieves the on-demand price for an instance type.
+// Uses hardcoded prices for us-east-1 region (prices are region-specific).
 func (c *Client) getOnDemandPrice(ctx context.Context, instanceType string) (float64, error) {
-	// On-demand pricing is complex to query; use hardcoded approximations for now
-	// TODO: Implement proper pricing API query
-
+	// Hardcoded on-demand prices for us-east-1 (updated periodically)
+	// These serve as caps for spot bids
 	prices := map[string]float64{
 		// ARM64
 		"c6g.medium":  0.034,

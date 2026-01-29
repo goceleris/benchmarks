@@ -321,8 +321,31 @@ Resources:
             git clone https://github.com/goceleris/benchmarks.git .
             go build -o /usr/local/bin/c2 ./cmd/c2
 
-            # Create systemd service
-            cat > /etc/systemd/system/c2.service << 'SERVICEEOF'
+            # Get secrets from SSM
+            GITHUB_TOKEN=$(aws ssm get-parameter --name /celeris/github-token --with-decryption --query 'Parameter.Value' --output text --region ${AWS::Region} || echo "")
+            API_KEY=$(aws ssm get-parameter --name /celeris/api-key --with-decryption --query 'Parameter.Value' --output text --region ${AWS::Region} || echo "")
+
+            # Get infrastructure config from CloudFormation
+            WORKER_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 --query 'Stacks[0].Outputs[?OutputKey==`WorkerSecurityGroupId`].OutputValue' --output text --region ${AWS::Region} || echo "")
+            WORKER_PROFILE=$(aws cloudformation describe-stacks --stack-name celeris-c2 --query 'Stacks[0].Outputs[?OutputKey==`WorkerInstanceProfileArn`].OutputValue' --output text --region ${AWS::Region} || echo "")
+            C2_EIP=$(aws cloudformation describe-stacks --stack-name celeris-c2 --query 'Stacks[0].Outputs[?OutputKey==`C2ElasticIP`].OutputValue' --output text --region ${AWS::Region} || echo "")
+
+            # Get instance ID and associate EIP
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            if [ -n "$C2_EIP" ]; then
+              ALLOC_ID=$(aws ec2 describe-addresses --public-ips "$C2_EIP" --query 'Addresses[0].AllocationId' --output text --region ${AWS::Region})
+              aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" --region ${AWS::Region} || echo "Warning: Could not associate EIP"
+            fi
+
+            # Get a public subnet from the VPC
+            VPC_ID=$(aws ec2 describe-security-groups --group-ids "$WORKER_SG" --query 'SecurityGroups[0].VpcId' --output text --region ${AWS::Region} || echo "")
+            SUBNET_ID=""
+            if [ -n "$VPC_ID" ]; then
+              SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" --query 'Subnets[0].SubnetId' --output text --region ${AWS::Region} || echo "")
+            fi
+
+            # Create systemd service with environment variables
+            cat > /etc/systemd/system/c2.service << SERVICEEOF
             [Unit]
             Description=Celeris C2 Benchmark Orchestrator
             After=network.target
@@ -331,10 +354,16 @@ Resources:
             Type=simple
             User=root
             WorkingDirectory=/opt/celeris
-            ExecStart=/usr/local/bin/c2 -data-dir /data/badger -log-dir /data/logs
+            ExecStart=/usr/local/bin/c2 -data-dir /data/badger -log-dir /data/logs -http-addr :8080
             Restart=always
             RestartSec=5
             Environment=AWS_REGION=${AWS::Region}
+            Environment=GITHUB_TOKEN=$GITHUB_TOKEN
+            Environment=C2_API_KEY=$API_KEY
+            Environment=SECURITY_GROUP_ID=$WORKER_SG
+            Environment=INSTANCE_PROFILE_ARN=$WORKER_PROFILE
+            Environment=SUBNET_ID=$SUBNET_ID
+            Environment=C2_ENDPOINT=http://$C2_EIP:8080
 
             [Install]
             WantedBy=multi-user.target
@@ -345,6 +374,7 @@ Resources:
             systemctl start c2
 
             echo "=== C2 Server Bootstrap Complete ==="
+            echo "C2 Endpoint: http://$C2_EIP:8080"
         TagSpecifications:
           - ResourceType: instance
             Tags:
