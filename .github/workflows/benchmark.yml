@@ -4,6 +4,7 @@ on:
   release:
     types: [published]
   pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       mode:
@@ -37,6 +38,13 @@ jobs:
     name: Run Benchmark
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    if: |
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       (github.event.label.name == 'bench-fast' ||
+        github.event.label.name == 'bench-med' ||
+        github.event.label.name == 'bench-metal'))
 
     steps:
       - name: Determine Benchmark Mode
@@ -46,8 +54,16 @@ jobs:
             echo "mode=metal" >> $GITHUB_OUTPUT
             echo "Running METAL benchmarks for release"
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "mode=fast" >> $GITHUB_OUTPUT
-            echo "Running FAST benchmarks for PR"
+            # Determine mode from label
+            LABEL="${{ github.event.label.name }}"
+            case "$LABEL" in
+              bench-fast) MODE="fast" ;;
+              bench-med)  MODE="med" ;;
+              bench-metal) MODE="metal" ;;
+              *) MODE="fast" ;;
+            esac
+            echo "mode=$MODE" >> $GITHUB_OUTPUT
+            echo "Running $MODE benchmarks for PR (label: $LABEL)"
           else
             echo "mode=${{ inputs.mode || 'fast' }}" >> $GITHUB_OUTPUT
             echo "Running ${{ inputs.mode || 'fast' }} benchmarks (manual trigger)"
