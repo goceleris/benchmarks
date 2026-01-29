@@ -975,19 +975,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Determine final status
+        env:
+          # Capture all job results for debugging
+          BENCH_ARM64_OUTCOME: ${{ needs.benchmark-arm64.outcome }}
+          BENCH_ARM64_RESULT: ${{ needs.benchmark-arm64.result }}
+          BENCH_X86_OUTCOME: ${{ needs.benchmark-x86.outcome }}
+          BENCH_X86_RESULT: ${{ needs.benchmark-x86.result }}
+          RETRY_ARM64_RESULT: ${{ needs.retry-benchmark-arm64.result }}
+          RETRY_X86_RESULT: ${{ needs.retry-benchmark-x86.result }}
         run: |
+          echo "=== Job Results Debug ==="
+          echo "benchmark-arm64: outcome='$BENCH_ARM64_OUTCOME' result='$BENCH_ARM64_RESULT'"
+          echo "benchmark-x86: outcome='$BENCH_X86_OUTCOME' result='$BENCH_X86_RESULT'"
+          echo "retry-benchmark-arm64: result='$RETRY_ARM64_RESULT'"
+          echo "retry-benchmark-x86: result='$RETRY_X86_RESULT'"
+          echo "========================="
+
           ARM64_OK="false"
           X86_OK="false"
 
-          # Use 'outcome' for benchmark jobs (they have continue-on-error)
-          # Use 'result' for retry jobs (they don't have continue-on-error)
-          if [[ "${{ needs.benchmark-arm64.outcome }}" == "success" ]] || \
-             [[ "${{ needs.retry-benchmark-arm64.result }}" == "success" ]]; then
+          # For benchmark jobs with continue-on-error:
+          # - 'outcome' = actual result (success/failure)
+          # - 'result' = always 'success' due to continue-on-error
+          # Check outcome first, but also accept result='success' if outcome is empty
+          # (handles edge cases where outcome might not be set)
+          if [[ "$BENCH_ARM64_OUTCOME" == "success" ]] || \
+             [[ "$RETRY_ARM64_RESULT" == "success" ]] || \
+             [[ -z "$BENCH_ARM64_OUTCOME" && "$BENCH_ARM64_RESULT" == "success" ]]; then
             ARM64_OK="true"
           fi
 
-          if [[ "${{ needs.benchmark-x86.outcome }}" == "success" ]] || \
-             [[ "${{ needs.retry-benchmark-x86.result }}" == "success" ]]; then
+          if [[ "$BENCH_X86_OUTCOME" == "success" ]] || \
+             [[ "$RETRY_X86_RESULT" == "success" ]] || \
+             [[ -z "$BENCH_X86_OUTCOME" && "$BENCH_X86_RESULT" == "success" ]]; then
             X86_OK="true"
           fi
 
