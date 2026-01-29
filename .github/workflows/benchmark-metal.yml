@@ -441,11 +441,14 @@ jobs:
           fi
 
   # Launch x86 infrastructure with independent fallback
+  # TEMPORARY: Run x86 after ARM64 completes to stay within vCPU quota (192 limit)
+  # TODO: Revert to parallel execution once quota increase is approved
+  # Original: needs: [authorize, preflight]
   launch-x86:
     name: Launch x86 Infrastructure
     runs-on: ubuntu-latest
-    needs: [authorize, preflight]
-    if: needs.authorize.outputs.authorized == 'true'
+    needs: [authorize, preflight, cleanup-arm64]
+    if: always() && needs.authorize.outputs.authorized == 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
