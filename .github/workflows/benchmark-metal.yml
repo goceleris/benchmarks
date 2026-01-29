@@ -738,6 +738,7 @@ jobs:
     if: needs.launch-arm64.outputs.launched == 'true'
     runs-on: [self-hosted, "${{ needs.launch-arm64.outputs.server_runner_label }}"]
     timeout-minutes: 120
+    continue-on-error: true  # Server runs until terminated by cleanup - this is expected
 
     steps:
       - name: Checkout
@@ -837,6 +838,7 @@ jobs:
     if: needs.launch-x86.outputs.launched == 'true'
     runs-on: [self-hosted, "${{ needs.launch-x86.outputs.server_runner_label }}"]
     timeout-minutes: 120
+    continue-on-error: true  # Server runs until terminated by cleanup - this is expected
 
     steps:
       - name: Checkout
@@ -937,7 +939,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-arm64.outputs.launched == 'true' &&
       needs.launch-arm64.outputs.was_spot == 'true' &&
-      needs.benchmark-arm64.outcome == 'failure'
+      needs.benchmark-arm64.outputs.success != 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
@@ -1146,7 +1148,7 @@ jobs:
       needs.authorize.outputs.authorized == 'true' &&
       needs.launch-x86.outputs.launched == 'true' &&
       needs.launch-x86.outputs.was_spot == 'true' &&
-      needs.benchmark-x86.outcome == 'failure'
+      needs.benchmark-x86.outputs.success != 'true'
     outputs:
       launched: ${{ steps.result.outputs.launched }}
       is_provisional: ${{ steps.result.outputs.is_provisional }}
@@ -1533,8 +1535,8 @@ jobs:
     if: |
       always() &&
       needs.authorize.outputs.authorized == 'true' &&
-      (needs.benchmark-arm64.outcome == 'success' || needs.benchmark-x86.outcome == 'success' ||
-       needs.retry-benchmark-arm64.result == 'success' || needs.retry-benchmark-x86.result == 'success')
+      (needs.benchmark-arm64.outputs.success == 'true' || needs.benchmark-x86.outputs.success == 'true' ||
+       needs.retry-benchmark-arm64.outputs.success == 'true' || needs.retry-benchmark-x86.outputs.success == 'true')
     permissions:
       contents: write
 
@@ -1582,15 +1584,15 @@ jobs:
           ARM64_LAUNCHED: ${{ needs.launch-arm64.outputs.launched }}
           ARM64_RETRY_PROVISIONAL: ${{ needs.retry-arm64.outputs.is_provisional }}
           ARM64_RETRY_INSTANCE: ${{ needs.retry-arm64.outputs.instance_type }}
-          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.outcome == 'success' }}
-          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.result == 'success' }}
+          ARM64_ORIGINAL_SUCCESS: ${{ needs.benchmark-arm64.outputs.success == 'true' }}
+          ARM64_RETRY_SUCCESS: ${{ needs.retry-benchmark-arm64.outputs.success == 'true' }}
           X86_PROVISIONAL: ${{ needs.launch-x86.outputs.is_provisional }}
           X86_INSTANCE: ${{ needs.launch-x86.outputs.instance_type }}
           X86_LAUNCHED: ${{ needs.launch-x86.outputs.launched }}
           X86_RETRY_PROVISIONAL: ${{ needs.retry-x86.outputs.is_provisional }}
           X86_RETRY_INSTANCE: ${{ needs.retry-x86.outputs.instance_type }}
-          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.outcome == 'success' }}
-          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.result == 'success' }}
+          X86_ORIGINAL_SUCCESS: ${{ needs.benchmark-x86.outputs.success == 'true' }}
+          X86_RETRY_SUCCESS: ${{ needs.retry-benchmark-x86.outputs.success == 'true' }}
           IS_RELEASE: ${{ github.event_name == 'release' }}
           VERSION: ${{ github.event.release.tag_name || 'latest' }}
         run: |
