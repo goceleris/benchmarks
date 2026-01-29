@@ -476,6 +476,14 @@ saveAndExit:
 	} else {
 		log.Printf("Benchmarks complete!")
 	}
+
+	// Shutdown the control daemon if in remote mode and benchmarks completed successfully
+	if remoteMode && rc != nil && len(checkpoint.Results) >= totalBenchmarks {
+		log.Printf("Shutting down control daemon...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = rc.ShutdownDaemon(shutdownCtx)
+		shutdownCancel()
+	}
 }
 
 // RemoteController manages communication with the control daemon
@@ -626,6 +634,35 @@ func (rc *RemoteController) StopServer(ctx context.Context) error {
 	}
 	_ = resp.Body.Close()
 
+	return nil
+}
+
+// ShutdownDaemon tells the control daemon to shut down completely
+func (rc *RemoteController) ShutdownDaemon(ctx context.Context) error {
+	rc.mu.RLock()
+	ip := rc.serverIP
+	rc.mu.RUnlock()
+
+	if ip == "" {
+		return nil // No server to shutdown
+	}
+
+	url := fmt.Sprintf("http://%s:%s/shutdown", ip, rc.controlPort)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// Server might already be shutting down, that's ok
+		log.Printf("Note: Control daemon may already be shutting down: %v", err)
+		return nil
+	}
+	_ = resp.Body.Close()
+
+	log.Printf("Shutdown signal sent to control daemon")
 	return nil
 }
 

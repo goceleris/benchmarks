@@ -29,13 +29,14 @@ type ServerStatus struct {
 
 // ControlDaemon manages server processes
 type ControlDaemon struct {
-	mu         sync.Mutex
-	serverBin  string
-	serverPort string
-	status     ServerStatus
-	cmd        *exec.Cmd
-	cancelFunc context.CancelFunc
-	doneChan   chan struct{} // signals when process exits (Wait() can only be called once)
+	mu           sync.Mutex
+	serverBin    string
+	serverPort   string
+	status       ServerStatus
+	cmd          *exec.Cmd
+	cancelFunc   context.CancelFunc
+	doneChan     chan struct{} // signals when process exits (Wait() can only be called once)
+	shutdownChan chan struct{} // signals daemon shutdown request
 }
 
 func main() {
@@ -58,8 +59,9 @@ func main() {
 	}
 
 	daemon := &ControlDaemon{
-		serverBin:  *serverBin,
-		serverPort: *serverPort,
+		serverBin:    *serverBin,
+		serverPort:   *serverPort,
+		shutdownChan: make(chan struct{}),
 		status: ServerStatus{
 			Status: "stopped",
 			Port:   *serverPort,
@@ -71,6 +73,7 @@ func main() {
 	mux.HandleFunc("/start", daemon.handleStart)
 	mux.HandleFunc("/stop", daemon.handleStop)
 	mux.HandleFunc("/health", daemon.handleHealth)
+	mux.HandleFunc("/shutdown", daemon.handleShutdown)
 
 	server := &http.Server{
 		Addr:    ":" + *controlPort,
@@ -82,8 +85,12 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
-		log.Println("Shutting down control daemon...")
+		select {
+		case <-sigChan:
+			log.Println("Shutting down control daemon (signal)...")
+		case <-daemon.shutdownChan:
+			log.Println("Shutting down control daemon (API request)...")
+		}
 		daemon.stopServer()
 		_ = server.Shutdown(context.Background())
 	}()
@@ -156,6 +163,23 @@ func (d *ControlDaemon) handleStop(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+func (d *ControlDaemon) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	log.Println("Shutdown requested via API")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("Shutting down"))
+
+	// Signal shutdown in a goroutine to allow response to be sent
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(d.shutdownChan)
+	}()
 }
 
 func (d *ControlDaemon) startServer(serverType string) error {
