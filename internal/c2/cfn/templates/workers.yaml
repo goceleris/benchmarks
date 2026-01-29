@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Celeris Benchmark Worker Instances - Ephemeral spot instances for benchmarks
+
+Parameters:
+  RunId:
+    Type: String
+    Description: Unique identifier for this benchmark run
+
+  Mode:
+    Type: String
+    AllowedValues:
+      - fast
+      - med
+      - metal
+    Description: Benchmark mode determines instance sizes
+
+  Architecture:
+    Type: String
+    AllowedValues:
+      - arm64
+      - x86
+    Description: CPU architecture for workers
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: AZ for worker placement (server and client must be co-located)
+
+  SpotPrice:
+    Type: String
+    Description: Maximum spot price bid
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for worker instances
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for workers
+
+  InstanceProfileArn:
+    Type: String
+    Description: IAM instance profile ARN for workers
+
+  C2Endpoint:
+    Type: String
+    Description: C2 server endpoint for reporting
+
+  GitHubRepo:
+    Type: String
+    Default: goceleris/benchmarks
+    Description: GitHub repository for benchmark code
+
+  BenchmarkDuration:
+    Type: String
+    Default: '30s'
+    Description: Duration for each benchmark
+
+  BenchmarkMode:
+    Type: String
+    Default: all
+    AllowedValues:
+      - baseline
+      - theoretical
+      - all
+    Description: Which servers to benchmark
+
+Mappings:
+  InstanceTypes:
+    fast:
+      arm64Server: c6g.medium
+      arm64Client: t4g.small
+      x86Server: c5.large
+      x86Client: t3.small
+    med:
+      arm64Server: c6g.2xlarge
+      arm64Client: c6g.xlarge
+      x86Server: c5.2xlarge
+      x86Client: c5.xlarge
+    metal:
+      arm64Server: c6g.metal
+      arm64Client: c6g.4xlarge
+      x86Server: c5.metal
+      x86Client: c5.9xlarge
+
+Conditions:
+  IsArm64: !Equals [!Ref Architecture, arm64]
+
+Resources:
+  # Server Instance (Spot)
+  ServerSpotRequest:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+        TargetCapacity: 1
+        TerminateInstancesWithExpiration: true
+        Type: request
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref ServerLaunchTemplate
+              Version: !GetAtt ServerLaunchTemplate.LatestVersionNumber
+            Overrides:
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypes, !Ref Mode, arm64Server]
+                  - !FindInMap [InstanceTypes, !Ref Mode, x86Server]
+                SpotPrice: !Ref SpotPrice
+
+  ServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'celeris-server-${RunId}-${Architecture}'
+      LaunchTemplateData:
+        ImageId: !If
+          - IsArm64
+          - !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id}}'
+          - !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+        IamInstanceProfile:
+          Arn: !Ref InstanceProfileArn
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time
+            InstanceInterruptionBehavior: terminate
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            exec > >(tee /var/log/worker-init.log) 2>&1
+            echo "=== Benchmark Server Bootstrap Started ==="
+
+            # Metadata
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+            # Install dependencies
+            apt-get update -qq
+            apt-get install -y -qq curl jq git build-essential
+
+            # Install Go
+            GO_ARCH="${Architecture}"
+            if [ "$GO_ARCH" = "x86" ]; then GO_ARCH="amd64"; fi
+            curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
+            tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
+            export PATH=$PATH:/usr/local/go/bin
+
+            # Clone and build
+            cd /opt
+            git clone https://github.com/${GitHubRepo}.git benchmarks
+            cd benchmarks
+            go build -o /usr/local/bin/server ./cmd/server
+
+            # Register with C2
+            curl -sf -X POST "${C2Endpoint}/api/worker/register" \
+              -H "Content-Type: application/json" \
+              -d "{\"run_id\":\"${RunId}\",\"role\":\"server\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"private_ip\":\"$PRIVATE_IP\"}"
+
+            # Start server (control daemon mode)
+            echo "Starting server in control mode..."
+            /usr/local/bin/server -mode control -port 8080 -control-port 9999
+
+            echo "=== Benchmark Server Exiting ==="
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'celeris-server-${RunId}-${Architecture}'
+              - Key: Project
+                Value: celeris-benchmarks
+              - Key: Role
+                Value: server
+              - Key: RunId
+                Value: !Ref RunId
+              - Key: Architecture
+                Value: !Ref Architecture
+
+  # Client Instance (Spot)
+  ClientSpotRequest:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+        TargetCapacity: 1
+        TerminateInstancesWithExpiration: true
+        Type: request
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref ClientLaunchTemplate
+              Version: !GetAtt ClientLaunchTemplate.LatestVersionNumber
+            Overrides:
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypes, !Ref Mode, arm64Client]
+                  - !FindInMap [InstanceTypes, !Ref Mode, x86Client]
+                SpotPrice: !Ref SpotPrice
+
+  ClientLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'celeris-client-${RunId}-${Architecture}'
+      LaunchTemplateData:
+        ImageId: !If
+          - IsArm64
+          - !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id}}'
+          - !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+        IamInstanceProfile:
+          Arn: !Ref InstanceProfileArn
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time
+            InstanceInterruptionBehavior: terminate
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            exec > >(tee /var/log/worker-init.log) 2>&1
+            echo "=== Benchmark Client Bootstrap Started ==="
+
+            # Metadata
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+            # Install dependencies
+            apt-get update -qq
+            apt-get install -y -qq curl jq git build-essential
+
+            # Install Go
+            GO_ARCH="${Architecture}"
+            if [ "$GO_ARCH" = "x86" ]; then GO_ARCH="amd64"; fi
+            curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
+            tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
+            export PATH=$PATH:/usr/local/go/bin
+
+            # Clone and build
+            cd /opt
+            git clone https://github.com/${GitHubRepo}.git benchmarks
+            cd benchmarks
+            go build -o /usr/local/bin/bench ./cmd/bench
+
+            # Register with C2
+            curl -sf -X POST "${C2Endpoint}/api/worker/register" \
+              -H "Content-Type: application/json" \
+              -d "{\"run_id\":\"${RunId}\",\"role\":\"client\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"private_ip\":\"$PRIVATE_IP\"}"
+
+            # Wait for server to be ready (C2 will provide server IP)
+            echo "Waiting for server assignment from C2..."
+            while true; do
+              RESPONSE=$(curl -sf "${C2Endpoint}/api/worker/assignment?run_id=${RunId}&arch=${Architecture}" || echo "{}")
+              SERVER_IP=$(echo "$RESPONSE" | jq -r '.server_ip // empty')
+              if [ -n "$SERVER_IP" ]; then
+                echo "Got server IP: $SERVER_IP"
+                break
+              fi
+              sleep 5
+            done
+
+            # Run benchmarks
+            echo "Starting benchmarks against $SERVER_IP..."
+            /usr/local/bin/bench \
+              -mode "${BenchmarkMode}" \
+              -duration "${BenchmarkDuration}" \
+              -server-ip "$SERVER_IP" \
+              -control-port 9999 \
+              -c2-endpoint "${C2Endpoint}" \
+              -run-id "${RunId}" \
+              -arch "${Architecture}"
+
+            # Report completion
+            curl -sf -X POST "${C2Endpoint}/api/worker/complete" \
+              -H "Content-Type: application/json" \
+              -d "{\"run_id\":\"${RunId}\",\"role\":\"client\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\"}"
+
+            echo "=== Benchmark Client Complete ==="
+            shutdown -h now
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'celeris-client-${RunId}-${Architecture}'
+              - Key: Project
+                Value: celeris-benchmarks
+              - Key: Role
+                Value: client
+              - Key: RunId
+                Value: !Ref RunId
+              - Key: Architecture
+                Value: !Ref Architecture
+
+Outputs:
+  ServerSpotFleetId:
+    Description: Server Spot Fleet Request ID
+    Value: !Ref ServerSpotRequest
+
+  ClientSpotFleetId:
+    Description: Client Spot Fleet Request ID
+    Value: !Ref ClientSpotRequest

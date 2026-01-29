@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Celeris Benchmark C2 (Command & Control) Server - Always-on orchestrator
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+    Description: C2 server instance type (t4g.nano is ~$3/month)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access (optional debugging)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for C2 server
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for C2 server
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub PAT for PR creation and runner management
+
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key for authenticating requests to C2
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Optional domain name for C2 (leave empty for IP-based access)
+
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed to access C2 API
+
+Resources:
+  # Security Group for C2 Server
+  C2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: celeris-c2-sg
+      GroupDescription: Security group for C2 benchmark orchestrator
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # HTTPS API access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTPS API access
+        # HTTP for Let's Encrypt ACME challenge
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for ACME challenge
+        # SSH for debugging (optional)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: celeris-c2-sg
+        - Key: Project
+          Value: celeris-benchmarks
+
+  # Security Group for Workers (referenced by workers.yaml)
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: celeris-worker-sg
+      GroupDescription: Security group for benchmark worker instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Allow all traffic from C2
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref C2SecurityGroup
+          Description: All traffic from C2
+        # Allow traffic between workers (same SG)
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref WorkerSecurityGroup
+          Description: All traffic between workers
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: celeris-worker-sg
+        - Key: Project
+          Value: celeris-benchmarks
+
+  # Self-referencing ingress rule for workers
+  WorkerSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref WorkerSecurityGroup
+      Description: Allow traffic between workers
+
+  # IAM Role for C2 Server
+  C2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: celeris-c2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: C2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 permissions for managing workers
+              - Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSpotPriceHistory
+                  - ec2:RequestSpotInstances
+                  - ec2:CancelSpotInstanceRequests
+                  - ec2:DescribeSpotInstanceRequests
+                  - ec2:CreateTags
+                  - ec2:DescribeImages
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeAvailabilityZones
+                Resource: '*'
+              # CloudFormation for worker stacks
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:UpdateStack
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/celeris-workers-*/*'
+              # SSM Parameter Store for secrets
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/celeris/*'
+              # IAM PassRole for workers
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt WorkerRole.Arn
+      Tags:
+        - Key: Project
+          Value: celeris-benchmarks
+
+  # IAM Instance Profile for C2
+  C2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: celeris-c2-profile
+      Roles:
+        - !Ref C2Role
+
+  # IAM Role for Worker Instances
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: celeris-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: WorkerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow workers to report to C2 (via SSM for discovery)
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/celeris/*'
+      Tags:
+        - Key: Project
+          Value: celeris-benchmarks
+
+  # IAM Instance Profile for Workers
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: celeris-worker-profile
+      Roles:
+        - !Ref WorkerRole
+
+  # EBS Volume for persistent data (BadgerDB)
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 8
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: celeris-c2-data
+        - Key: Project
+          Value: celeris-benchmarks
+    DeletionPolicy: Retain
+
+  # Elastic IP for stable access
+  C2ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: celeris-c2-eip
+        - Key: Project
+          Value: celeris-benchmarks
+
+  # SSM Parameters for secrets
+  GitHubTokenParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /celeris/github-token
+      Type: String
+      Value: !Ref GitHubToken
+      Description: GitHub PAT for C2 operations
+      Tags:
+        Project: celeris-benchmarks
+
+  ApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /celeris/api-key
+      Type: String
+      Value: !Ref ApiKey
+      Description: API key for C2 authentication
+      Tags:
+        Project: celeris-benchmarks
+
+  # Launch Template for C2 (used by ASG for auto-recovery)
+  C2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: celeris-c2-template
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt C2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref C2SecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            exec > >(tee /var/log/c2-init.log) 2>&1
+            echo "=== C2 Server Bootstrap Started ==="
+
+            # Install dependencies
+            apt-get update -qq
+            apt-get install -y -qq curl jq git awscli nvme-cli
+
+            # Wait for and mount data volume
+            echo "Waiting for data volume..."
+            while [ ! -e /dev/nvme1n1 ]; do sleep 1; done
+
+            # Format if new volume
+            if ! blkid /dev/nvme1n1; then
+              mkfs.ext4 /dev/nvme1n1
+            fi
+
+            mkdir -p /data
+            mount /dev/nvme1n1 /data
+            echo '/dev/nvme1n1 /data ext4 defaults,nofail 0 2' >> /etc/fstab
+
+            # Create directories
+            mkdir -p /data/badger /data/logs /opt/celeris
+
+            # Install Go
+            curl -sLO https://go.dev/dl/go1.23.4.linux-arm64.tar.gz
+            tar -C /usr/local -xzf go1.23.4.linux-arm64.tar.gz
+            export PATH=$PATH:/usr/local/go/bin
+            echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+
+            # Clone and build C2
+            cd /opt/celeris
+            git clone https://github.com/goceleris/benchmarks.git .
+            go build -o /usr/local/bin/c2 ./cmd/c2
+
+            # Create systemd service
+            cat > /etc/systemd/system/c2.service << 'SERVICEEOF'
+            [Unit]
+            Description=Celeris C2 Benchmark Orchestrator
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=root
+            WorkingDirectory=/opt/celeris
+            ExecStart=/usr/local/bin/c2 -data-dir /data/badger -log-dir /data/logs
+            Restart=always
+            RestartSec=5
+            Environment=AWS_REGION=${AWS::Region}
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICEEOF
+
+            systemctl daemon-reload
+            systemctl enable c2
+            systemctl start c2
+
+            echo "=== C2 Server Bootstrap Complete ==="
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: celeris-c2
+              - Key: Project
+                Value: celeris-benchmarks
+
+  # Auto Scaling Group for auto-recovery (min=max=1)
+  C2AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: celeris-c2-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref C2LaunchTemplate
+        Version: !GetAtt C2LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: celeris-c2
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: celeris-benchmarks
+          PropagateAtLaunch: true
+
+  # Attach EIP to instance when it launches
+  # Note: This requires a Lambda function or manual attachment
+  # For simplicity, we'll use a static EIP that gets attached via user data
+
+Outputs:
+  C2SecurityGroupId:
+    Description: Security Group ID for C2 server
+    Value: !Ref C2SecurityGroup
+    Export:
+      Name: celeris-c2-sg-id
+
+  WorkerSecurityGroupId:
+    Description: Security Group ID for worker instances
+    Value: !Ref WorkerSecurityGroup
+    Export:
+      Name: celeris-worker-sg-id
+
+  WorkerInstanceProfileArn:
+    Description: Instance Profile ARN for workers
+    Value: !GetAtt WorkerInstanceProfile.Arn
+    Export:
+      Name: celeris-worker-profile-arn
+
+  C2ElasticIP:
+    Description: Elastic IP for C2 server
+    Value: !Ref C2ElasticIP
+    Export:
+      Name: celeris-c2-eip
+
+  DataVolumeId:
+    Description: EBS Volume ID for persistent data
+    Value: !Ref DataVolume
+    Export:
+      Name: celeris-c2-data-volume

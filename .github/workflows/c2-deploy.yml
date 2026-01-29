@@ -1,0 +1,184 @@
+name: Deploy C2
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - deploy
+          - update
+          - destroy
+        default: update
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Deploy C2 Infrastructure
+    runs-on: ubuntu-latest
+    if: inputs.action == 'deploy'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy C2 Stack
+        run: |
+          echo "Deploying C2 infrastructure..."
+
+          aws cloudformation deploy \
+            --template-file cloudformation/c2.yaml \
+            --stack-name celeris-c2 \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              VpcId=${{ secrets.VPC_ID }} \
+              SubnetId=${{ secrets.SUBNET_ID }} \
+              KeyName=${{ secrets.KEY_NAME }} \
+              GitHubToken=${{ secrets.GH_PAT_RUNNER_TOKEN }} \
+              ApiKey=${{ secrets.C2_API_KEY }} \
+            --tags \
+              Project=celeris-benchmarks
+
+          echo "C2 stack deployed successfully"
+
+      - name: Get Stack Outputs
+        run: |
+          echo "## C2 Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          aws cloudformation describe-stacks \
+            --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs' \
+            --output table >> $GITHUB_STEP_SUMMARY
+
+  update:
+    name: Update C2 Binary
+    runs-on: ubuntu-latest
+    if: inputs.action == 'update'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get C2 Instance ID
+        id: instance
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=celeris-c2" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "::error::C2 instance not found"
+            exit 1
+          fi
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Found C2 instance: $INSTANCE_ID"
+
+      - name: Update C2 Binary
+        run: |
+          echo "Updating C2 binary on ${{ steps.instance.outputs.instance_id }}..."
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "cd /opt/celeris",
+              "git fetch origin main",
+              "git reset --hard origin/main",
+              "export PATH=$PATH:/usr/local/go/bin",
+              "go build -o /usr/local/bin/c2 ./cmd/c2",
+              "systemctl restart c2",
+              "sleep 5",
+              "systemctl status c2"
+            ]' \
+            --output text --query 'Command.CommandId')
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Wait for command to complete
+          for i in {1..12}; do
+            sleep 10
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ steps.instance.outputs.instance_id }}" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "Command status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then
+              echo "C2 update completed successfully"
+              break
+            elif [[ "$STATUS" == "Failed" ]]; then
+              echo "::error::C2 update failed"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ steps.instance.outputs.instance_id }}" \
+                --query 'StandardErrorContent' --output text
+              exit 1
+            fi
+          done
+
+      - name: Verify C2 Health
+        run: |
+          C2_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "Checking C2 health at $C2_IP..."
+
+          for i in {1..6}; do
+            if curl -sf "http://$C2_IP:8080/health" > /dev/null; then
+              echo "C2 is healthy!"
+              exit 0
+            fi
+            echo "Waiting for C2 to be ready..."
+            sleep 10
+          done
+
+          echo "::warning::C2 health check failed (may still be starting)"
+
+  destroy:
+    name: Destroy C2 Infrastructure
+    runs-on: ubuntu-latest
+    if: inputs.action == 'destroy'
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Destroy C2 Stack
+        run: |
+          echo "::warning::Destroying C2 infrastructure..."
+
+          # Note: Data volume has DeletionPolicy: Retain
+          aws cloudformation delete-stack --stack-name celeris-c2
+
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete --stack-name celeris-c2
+
+          echo "C2 stack destroyed"
+          echo "Note: EBS data volume was retained and must be deleted manually"

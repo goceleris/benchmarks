@@ -1,0 +1,157 @@
+name: Benchmark
+
+on:
+  release:
+    types: [published]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Benchmark mode'
+        required: false
+        type: choice
+        options:
+          - fast
+          - med
+          - metal
+        default: fast
+      duration:
+        description: 'Benchmark duration (e.g., 10s, 30s, 60s)'
+        required: false
+        default: ''
+      bench_mode:
+        description: 'Servers to benchmark'
+        required: false
+        type: choice
+        options:
+          - all
+          - baseline
+          - theoretical
+        default: all
+
+env:
+  C2_URL: ${{ secrets.C2_URL }}
+
+jobs:
+  benchmark:
+    name: Run Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Determine Benchmark Mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "mode=metal" >> $GITHUB_OUTPUT
+            echo "Running METAL benchmarks for release"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "mode=fast" >> $GITHUB_OUTPUT
+            echo "Running FAST benchmarks for PR"
+          else
+            echo "mode=${{ inputs.mode || 'fast' }}" >> $GITHUB_OUTPUT
+            echo "Running ${{ inputs.mode || 'fast' }} benchmarks (manual trigger)"
+          fi
+
+      - name: Start Benchmark
+        id: start
+        run: |
+          echo "Starting benchmark (mode: ${{ steps.mode.outputs.mode }})"
+
+          PARAMS="mode=${{ steps.mode.outputs.mode }}"
+          if [[ -n "${{ inputs.duration }}" ]]; then
+            PARAMS="$PARAMS&duration=${{ inputs.duration }}"
+          fi
+          if [[ -n "${{ inputs.bench_mode }}" ]]; then
+            PARAMS="$PARAMS&bench_mode=${{ inputs.bench_mode }}"
+          fi
+
+          RESPONSE=$(curl -sf -X POST \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/start?$PARAMS")
+
+          RUN_ID=$(echo "$RESPONSE" | jq -r '.run_id')
+          if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo "::error::Failed to start benchmark: $RESPONSE"
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Benchmark started: $RUN_ID"
+
+      - name: Wait for Completion
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          echo "Waiting for benchmark $RUN_ID to complete..."
+
+          POLL_INTERVAL=30
+          MAX_WAIT=14400  # 4 hours
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RESPONSE=$(curl -sf \
+              -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+              "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{"status":"unknown"}')
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.status')
+            echo "[$((ELAPSED/60))m] Status: $STATUS"
+
+            case $STATUS in
+              completed)
+                echo "Benchmark completed successfully!"
+                exit 0
+                ;;
+              failed|cancelled)
+                ERROR=$(echo "$RESPONSE" | jq -r '.error // "Unknown error"')
+                echo "::error::Benchmark failed: $ERROR"
+                exit 1
+                ;;
+              pending|running)
+                # Show progress
+                WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
+                if [[ "$WORKERS" != "{}" ]]; then
+                  echo "Workers: $WORKERS"
+                fi
+                ;;
+              *)
+                echo "Unknown status: $STATUS"
+                ;;
+            esac
+
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          echo "::error::Timeout waiting for benchmark completion"
+          exit 1
+
+      - name: Get Results Summary
+        if: always()
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No run ID available"
+            exit 0
+          fi
+
+          RESPONSE=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
+
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** $RUN_ID" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** $(echo "$RESPONSE" | jq -r '.status // "unknown"')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Results table
+          echo "### Results by Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | Status | Benchmarks |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|--------|------------|" >> $GITHUB_STEP_SUMMARY
+
+          for arch in arm64 x86; do
+            STATUS=$(echo "$RESPONSE" | jq -r ".results.$arch.status // \"pending\"")
+            COUNT=$(echo "$RESPONSE" | jq -r ".results.$arch.benchmarks | length // 0")
+            echo "| $arch | $STATUS | $COUNT |" >> $GITHUB_STEP_SUMMARY
+          done
