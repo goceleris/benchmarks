@@ -141,8 +141,198 @@ jobs:
           echo "::error::Timeout waiting for benchmark completion"
           exit 1
 
-      - name: Get Results Summary
-        if: always()
+      - name: Get Full Results
+        id: results
+        if: success()
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No run ID available"
+            exit 0
+          fi
+
+          # Fetch full results
+          RESULTS=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/results" || echo '{}')
+
+          # Store results for later steps
+          echo "$RESULTS" > results.json
+          echo "results_file=results.json" >> $GITHUB_OUTPUT
+
+          # Get status
+          STATUS_RESPONSE=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
+
+          echo "$STATUS_RESPONSE" > status.json
+          echo "status=$(echo "$STATUS_RESPONSE" | jq -r '.status // "unknown"')" >> $GITHUB_OUTPUT
+
+      - name: Generate Results Summary
+        if: success()
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          MODE="${{ steps.mode.outputs.mode }}"
+
+          # Generate markdown summary
+          echo "## Benchmark Results - ${MODE^^} Mode" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** \`$RUN_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.results.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for arch in arm64 x86; do
+            ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
+            ARCH_STATUS=$(echo "$ARCH_RESULTS" | jq -r '.status // "pending"')
+            BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
+            COUNT=$(echo "$BENCHMARKS" | jq 'length')
+
+            if [[ "$COUNT" -gt 0 ]]; then
+              echo "### $arch Results" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Server | Req/sec | Avg Latency | P99 Latency | Errors |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|---------|-------------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+
+              echo "$BENCHMARKS" | jq -r '.[] | "| \(.server_type) | \(.requests_per_sec | floor) | \(.latency_avg / 1000000 | . * 100 | floor / 100)ms | \(.latency_p99 / 1000000 | . * 100 | floor / 100)ms | \(.errors) |"' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Save Results for Commit
+        if: |
+          success() &&
+          steps.mode.outputs.mode == 'metal' &&
+          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        run: |
+          # Save results to temp location before checkout overwrites workspace
+          cp results.json /tmp/benchmark_results.json
+
+      - name: Checkout Repository
+        if: |
+          success() &&
+          steps.mode.outputs.mode == 'metal' &&
+          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit Metal Results to Repository
+        if: |
+          success() &&
+          steps.mode.outputs.mode == 'metal' &&
+          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          echo "Committing metal results to repository..."
+
+          # Restore results from temp location
+          cp /tmp/benchmark_results.json results.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Determine result paths
+          PATHS=("results/latest")
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            PATHS+=("results/$TAG")
+          fi
+
+          # Process each architecture
+          for arch in arm64 x86; do
+            ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
+            BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
+            COUNT=$(echo "$BENCHMARKS" | jq 'length')
+
+            if [[ "$COUNT" -gt 0 ]]; then
+              for path in "${PATHS[@]}"; do
+                mkdir -p "$path/$arch"
+
+                # Create results JSON with metadata
+                jq -n \
+                  --arg run_id "$RUN_ID" \
+                  --arg arch "$arch" \
+                  --arg mode "metal" \
+                  --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --arg ref "${{ github.ref }}" \
+                  --arg sha "${{ github.sha }}" \
+                  --argjson benchmarks "$BENCHMARKS" \
+                  '{
+                    run_id: $run_id,
+                    architecture: $arch,
+                    mode: $mode,
+                    timestamp: $timestamp,
+                    git_ref: $ref,
+                    git_sha: $sha,
+                    benchmarks: $benchmarks
+                  }' > "$path/$arch/results.json"
+
+                git add "$path/$arch/results.json"
+              done
+            fi
+          done
+
+          # Commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            COMMIT_MSG="chore: update benchmark results"
+            if [[ "${{ github.event_name }}" == "release" ]]; then
+              COMMIT_MSG="chore: add benchmark results for ${{ github.event.release.tag_name }}"
+            fi
+            git commit -m "$COMMIT_MSG"
+            git push
+            echo "Results committed successfully"
+          fi
+
+      - name: Post PR Comment with Results
+        if: |
+          success() &&
+          github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          MODE="${{ steps.mode.outputs.mode }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Build comment body
+          COMMENT="## Benchmark Results - ${MODE^^} Mode\n\n"
+          COMMENT+="**Run ID:** \`$RUN_ID\`\n"
+          COMMENT+="**Status:** ${{ steps.results.outputs.status }}\n\n"
+
+          for arch in arm64 x86; do
+            ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
+            BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
+            COUNT=$(echo "$BENCHMARKS" | jq 'length')
+
+            if [[ "$COUNT" -gt 0 ]]; then
+              COMMENT+="### $arch Results\n\n"
+              COMMENT+="| Server | Req/sec | Avg Latency | P99 Latency | Errors |\n"
+              COMMENT+="|--------|---------|-------------|-------------|--------|\n"
+
+              while IFS= read -r row; do
+                COMMENT+="$row\n"
+              done < <(echo "$BENCHMARKS" | jq -r '.[] | "| \(.server_type) | \(.requests_per_sec | floor) | \(.latency_avg / 1000000 | . * 100 | floor / 100)ms | \(.latency_p99 / 1000000 | . * 100 | floor / 100)ms | \(.errors) |"')
+
+              COMMENT+="\n"
+            fi
+          done
+
+          # Delete previous benchmark comments (if any)
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Benchmark Results"))) | .id' \
+            | xargs -I {} gh api -X DELETE "repos/${{ github.repository }}/issues/comments/{}" 2>/dev/null || true
+
+          # Post new comment
+          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file -
+          echo "Posted results to PR #$PR_NUMBER"
+
+      - name: Get Results Summary (Fallback)
+        if: failure()
         run: |
           RUN_ID="${{ steps.start.outputs.run_id }}"
           if [[ -z "$RUN_ID" ]]; then
@@ -154,20 +344,9 @@ jobs:
             -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
             "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
 
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Benchmark Results (Partial)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** $RUN_ID" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $(echo "$RESPONSE" | jq -r '.status // "unknown"')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Results table
-          echo "### Results by Architecture" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Architecture | Status | Benchmarks |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------------|--------|------------|" >> $GITHUB_STEP_SUMMARY
-
-          for arch in arm64 x86; do
-            STATUS=$(echo "$RESPONSE" | jq -r ".results.$arch.status // \"pending\"")
-            COUNT=$(echo "$RESPONSE" | jq -r ".results.$arch.benchmarks | length // 0")
-            echo "| $arch | $STATUS | $COUNT |" >> $GITHUB_STEP_SUMMARY
-          done
+          echo "**Error:** $(echo "$RESPONSE" | jq -r '.error // "Benchmark did not complete successfully"')" >> $GITHUB_STEP_SUMMARY
