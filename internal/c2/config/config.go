@@ -26,10 +26,12 @@ type Config struct {
 
 	// Infrastructure (from C2 stack outputs)
 	SubnetID           string
+	SubnetsByAZ        map[string]string // AZ -> SubnetID mapping for all public subnets
 	SecurityGroupID    string
 	InstanceProfileArn string
 	C2Endpoint         string
 	VpcID              string
+	RouteTableID       string // Route table for creating new subnets
 }
 
 // Loader loads configuration from various sources.
@@ -109,6 +111,28 @@ func (l *Loader) Load(ctx context.Context) (*Config, error) {
 			log.Printf("Warning: Could not find public subnet: %v", err)
 		} else {
 			cfg.SubnetID = subnet
+		}
+	}
+
+	// Discover all public subnets in the VPC mapped by AZ
+	if cfg.VpcID != "" && cfg.SubnetsByAZ == nil {
+		subnets, err := l.discoverPublicSubnets(ctx, cfg.VpcID)
+		if err != nil {
+			log.Printf("Warning: Could not discover public subnets: %v", err)
+		} else {
+			cfg.SubnetsByAZ = subnets
+			log.Printf("Discovered %d public subnets: %v", len(subnets), subnets)
+		}
+	}
+
+	// Discover route table for creating new subnets
+	if cfg.VpcID != "" && cfg.RouteTableID == "" {
+		rtID, err := l.discoverPublicRouteTable(ctx, cfg.VpcID)
+		if err != nil {
+			log.Printf("Warning: Could not discover route table: %v", err)
+		} else {
+			cfg.RouteTableID = rtID
+			log.Printf("Discovered public route table: %s", rtID)
 		}
 	}
 
@@ -218,6 +242,68 @@ func (l *Loader) discoverC2Endpoint(ctx context.Context) (string, error) {
 	}
 
 	return "", fmt.Errorf("C2 instance not found")
+}
+
+// discoverPublicSubnets returns all public subnets in the VPC mapped by AZ.
+func (l *Loader) discoverPublicSubnets(ctx context.Context, vpcID string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	result, err := l.ec2.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   strPtr("vpc-id"),
+				Values: []string{vpcID},
+			},
+			{
+				Name:   strPtr("map-public-ip-on-launch"),
+				Values: []string{"true"},
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	subnets := make(map[string]string)
+	for _, subnet := range result.Subnets {
+		if subnet.AvailabilityZone != nil && subnet.SubnetId != nil {
+			subnets[*subnet.AvailabilityZone] = *subnet.SubnetId
+		}
+	}
+
+	return subnets, nil
+}
+
+// discoverPublicRouteTable returns the public route table (one with an IGW route) for the VPC.
+func (l *Loader) discoverPublicRouteTable(ctx context.Context, vpcID string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	result, err := l.ec2.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   strPtr("vpc-id"),
+				Values: []string{vpcID},
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Find a route table with an internet gateway route
+	for _, rt := range result.RouteTables {
+		for _, route := range rt.Routes {
+			if route.GatewayId != nil && len(*route.GatewayId) > 3 && (*route.GatewayId)[:4] == "igw-" {
+				if rt.RouteTableId != nil {
+					return *rt.RouteTableId, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no public route table found in VPC %s", vpcID)
 }
 
 // findPublicSubnet finds a public subnet in the VPC.

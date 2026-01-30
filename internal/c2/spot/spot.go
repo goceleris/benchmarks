@@ -230,6 +230,81 @@ func (c *Client) GetBestAZForPair(ctx context.Context, serverType, clientType st
 		}, nil
 }
 
+// GetPricesForAZ gets spot prices for a server+client pair in a specific AZ.
+// If spot capacity is unavailable, returns on-demand prices as fallback.
+func (c *Client) GetPricesForAZ(ctx context.Context, serverType, clientType, az string) (*BidResult, *BidResult, error) {
+	// Get spot prices for server in specific AZ
+	serverPrices, err := c.GetSpotPrices(ctx, serverType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get server prices: %w", err)
+	}
+
+	// Get spot prices for client in specific AZ
+	clientPrices, err := c.GetSpotPrices(ctx, clientType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get client prices: %w", err)
+	}
+
+	// Find prices for the specified AZ
+	var serverPrice, clientPrice float64
+	var serverFound, clientFound bool
+
+	for _, p := range serverPrices {
+		if p.AZ == az {
+			serverPrice = p.Price
+			serverFound = true
+			break
+		}
+	}
+
+	for _, p := range clientPrices {
+		if p.AZ == az {
+			clientPrice = p.Price
+			clientFound = true
+			break
+		}
+	}
+
+	// Get on-demand prices
+	serverOnDemand, _ := c.getOnDemandPrice(ctx, serverType)
+	clientOnDemand, _ := c.getOnDemandPrice(ctx, clientType)
+
+	// If spot not available, use on-demand price
+	if !serverFound {
+		log.Printf("Warning: No spot price for %s in %s, using on-demand: $%.4f", serverType, az, serverOnDemand)
+		serverPrice = serverOnDemand
+	}
+	if !clientFound {
+		log.Printf("Warning: No spot price for %s in %s, using on-demand: $%.4f", clientType, az, clientOnDemand)
+		clientPrice = clientOnDemand
+	}
+
+	// Calculate bids (20% above current, capped at on-demand)
+	serverBid := serverPrice * 1.20
+	if serverOnDemand > 0 && serverBid > serverOnDemand {
+		serverBid = serverOnDemand
+	}
+
+	clientBid := clientPrice * 1.20
+	if clientOnDemand > 0 && clientBid > clientOnDemand {
+		clientBid = clientOnDemand
+	}
+
+	return &BidResult{
+			InstanceType:  serverType,
+			AZ:            az,
+			CurrentPrice:  serverPrice,
+			BidPrice:      serverBid,
+			OnDemandPrice: serverOnDemand,
+		}, &BidResult{
+			InstanceType:  clientType,
+			AZ:            az,
+			CurrentPrice:  clientPrice,
+			BidPrice:      clientBid,
+			OnDemandPrice: clientOnDemand,
+		}, nil
+}
+
 // GetInstancesForMode returns the instance types for a benchmark mode and architecture.
 func GetInstancesForMode(mode, arch string) (serverType, clientType string, err error) {
 	modeTypes, ok := InstanceTypes[mode]

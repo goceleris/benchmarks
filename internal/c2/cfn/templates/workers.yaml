@@ -31,7 +31,7 @@ Parameters:
 
   SubnetId:
     Type: AWS::EC2::Subnet::Id
-    Description: Subnet for worker instances
+    Description: Subnet for worker instances (must be in the specified AZ)
 
   SecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id

@@ -49,7 +49,7 @@ type Config struct {
 	AWSRegion string
 
 	// Infrastructure config (from C2 stack outputs)
-	SubnetID           string
+	SubnetsByAZ        map[string]string // AZ -> SubnetID mapping for public subnets
 	SecurityGroupID    string
 	InstanceProfileArn string
 	C2Endpoint         string
@@ -74,8 +74,8 @@ func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode s
 	defer o.mu.Unlock()
 
 	// Validate infrastructure config
-	if o.config.SubnetID == "" {
-		return nil, fmt.Errorf("infrastructure not configured: SubnetID is missing")
+	if len(o.config.SubnetsByAZ) == 0 {
+		return nil, fmt.Errorf("infrastructure not configured: no subnets available")
 	}
 	if o.config.SecurityGroupID == "" {
 		return nil, fmt.Errorf("infrastructure not configured: SecurityGroupID is missing")
@@ -254,23 +254,49 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 		return err
 	}
 
-	// Find best AZ with pricing
+	// Find the best AZ for spot pricing
 	serverBid, clientBid, err := o.config.Spot.GetBestAZForPair(ctx, serverType, clientType)
 	if err != nil {
 		return fmt.Errorf("failed to get spot pricing: %w", err)
 	}
 
-	log.Printf("%s: Using AZ %s (server: $%.4f, client: $%.4f)",
-		arch, serverBid.AZ, serverBid.BidPrice, clientBid.BidPrice)
+	bestAZ := serverBid.AZ
+	subnetID := o.config.SubnetsByAZ[bestAZ]
+
+	// Check if we have a subnet in the best AZ, otherwise fall back
+	if subnetID == "" {
+		// Find the best AZ among available subnets
+		var fallbackAZ string
+		var fallbackSubnet string
+		for az, sid := range o.config.SubnetsByAZ {
+			fallbackAZ = az
+			fallbackSubnet = sid
+			break
+		}
+		if fallbackSubnet == "" {
+			return fmt.Errorf("no subnets available")
+		}
+		log.Printf("%s: Best AZ %s has no subnet, falling back to %s", arch, bestAZ, fallbackAZ)
+		bestAZ = fallbackAZ
+		subnetID = fallbackSubnet
+		// Re-get prices for the fallback AZ
+		serverBid, clientBid, err = o.config.Spot.GetPricesForAZ(ctx, serverType, clientType, bestAZ)
+		if err != nil {
+			return fmt.Errorf("failed to get spot pricing for fallback AZ: %w", err)
+		}
+	}
+
+	log.Printf("%s: Using subnet %s in AZ %s (server: $%.4f, client: $%.4f)",
+		arch, subnetID, bestAZ, serverBid.BidPrice, clientBid.BidPrice)
 
 	// Create worker stack
 	stackName, err := o.config.CFN.CreateWorkerStack(ctx, cfn.WorkerStackParams{
 		RunID:              run.ID,
 		Mode:               run.Mode,
 		Architecture:       arch,
-		AvailabilityZone:   serverBid.AZ,
+		AvailabilityZone:   bestAZ,
 		SpotPrice:          fmt.Sprintf("%.4f", serverBid.BidPrice),
-		SubnetID:           o.config.SubnetID,
+		SubnetID:           subnetID,
 		SecurityGroupID:    o.config.SecurityGroupID,
 		InstanceProfileArn: o.config.InstanceProfileArn,
 		C2Endpoint:         o.config.C2Endpoint,

@@ -29,7 +29,7 @@ type WorkerStackParams struct {
 	Architecture       string // arm64, x86
 	AvailabilityZone   string
 	SpotPrice          string
-	SubnetID           string
+	SubnetID           string // Subnet in the target AZ
 	SecurityGroupID    string
 	InstanceProfileArn string
 	C2Endpoint         string
@@ -91,7 +91,7 @@ func (c *Client) CreateWorkerStack(ctx context.Context, params WorkerStackParams
 			{Key: strPtr("RunId"), Value: &params.RunID},
 			{Key: strPtr("Architecture"), Value: &params.Architecture},
 		},
-		OnFailure: types.OnFailureDelete,
+		OnFailure: types.OnFailureDoNothing, // Keep failed stacks for debugging
 	}
 
 	result, err := c.cfn.CreateStack(ctx, input)
@@ -116,6 +116,8 @@ func (c *Client) WaitForStack(ctx context.Context, stackName string, timeout tim
 
 		status, err := c.GetStackStatus(ctx, stackName)
 		if err != nil {
+			// Stack might have been deleted - try to get events for debugging
+			log.Printf("Stack %s status check failed: %v", stackName, err)
 			return nil, err
 		}
 
@@ -123,6 +125,8 @@ func (c *Client) WaitForStack(ctx context.Context, stackName string, timeout tim
 		case "CREATE_COMPLETE", "UPDATE_COMPLETE":
 			return status, nil
 		case "CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED", "DELETE_COMPLETE", "DELETE_FAILED":
+			// Log stack events for debugging
+			c.logStackEvents(ctx, stackName)
 			return status, fmt.Errorf("stack %s failed: %s - %s", stackName, status.Status, status.Reason)
 		}
 
@@ -130,6 +134,33 @@ func (c *Client) WaitForStack(ctx context.Context, stackName string, timeout tim
 	}
 
 	return nil, fmt.Errorf("timeout waiting for stack %s", stackName)
+}
+
+// logStackEvents logs recent stack events for debugging.
+func (c *Client) logStackEvents(ctx context.Context, stackName string) {
+	result, err := c.cfn.DescribeStackEvents(ctx, &cloudformation.DescribeStackEventsInput{
+		StackName: &stackName,
+	})
+	if err != nil {
+		log.Printf("Could not get stack events for %s: %v", stackName, err)
+		return
+	}
+
+	log.Printf("Stack events for %s:", stackName)
+	for i, event := range result.StackEvents {
+		if i >= 10 { // Limit to 10 most recent events
+			break
+		}
+		reason := ""
+		if event.ResourceStatusReason != nil {
+			reason = *event.ResourceStatusReason
+		}
+		resourceType := ""
+		if event.ResourceType != nil {
+			resourceType = *event.ResourceType
+		}
+		log.Printf("  [%s] %s: %s - %s", event.Timestamp.Format("15:04:05"), resourceType, event.ResourceStatus, reason)
+	}
 }
 
 // GetStackStatus returns the current status of a stack.

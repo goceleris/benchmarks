@@ -77,8 +77,8 @@ func main() {
 	}
 	cfg.Region = awsRegion
 
-	log.Printf("Config loaded - SubnetID: %s, SecurityGroupID: %s, C2Endpoint: %s",
-		cfg.SubnetID, cfg.SecurityGroupID, cfg.C2Endpoint)
+	log.Printf("Config loaded - VpcID: %s, Subnets: %v, SecurityGroupID: %s, C2Endpoint: %s",
+		cfg.VpcID, cfg.SubnetsByAZ, cfg.SecurityGroupID, cfg.C2Endpoint)
 
 	// Initialize store
 	db, err := store.New(*dataDir)
@@ -121,7 +121,7 @@ func main() {
 		CFN:                cfnClient,
 		GitHub:             ghClient,
 		AWSRegion:          awsRegion,
-		SubnetID:           cfg.SubnetID,
+		SubnetsByAZ:        cfg.SubnetsByAZ,
 		SecurityGroupID:    cfg.SecurityGroupID,
 		InstanceProfileArn: cfg.InstanceProfileArn,
 		C2Endpoint:         cfg.C2Endpoint,
