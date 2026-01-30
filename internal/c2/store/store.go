@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -114,7 +114,7 @@ func (s *Store) RunGC(ctx context.Context) {
 		case <-ticker.C:
 			err := s.db.RunValueLogGC(0.5)
 			if err != nil && err != badger.ErrNoRewrite {
-				log.Printf("BadgerDB GC error: %v", err)
+				slog.Warn("BadgerDB GC error", "error", err)
 			}
 		}
 	}
