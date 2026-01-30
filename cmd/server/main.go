@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,10 +30,16 @@ func main() {
 	serverType := flag.String("server", "stdhttp-h1", "Server type to run (direct mode only)")
 	port := flag.String("port", "8080", "Port for benchmark server")
 	controlPort := flag.String("control-port", "9999", "Port for control daemon (control mode only)")
+
+	// C2 integration flags
+	c2Endpoint := flag.String("c2-endpoint", "", "C2 server endpoint for heartbeats (enables C2 mode)")
+	runID := flag.String("run-id", "", "Benchmark run ID (required in C2 mode)")
+	arch := flag.String("arch", "", "Architecture identifier (required in C2 mode)")
+
 	flag.Parse()
 
 	if *mode == "control" {
-		runControlDaemon(*port, *controlPort)
+		runControlDaemon(*port, *controlPort, *c2Endpoint, *runID, *arch)
 	} else {
 		runDirectServer(*serverType, *port)
 	}
@@ -138,12 +145,27 @@ type ControlStatus struct {
 }
 
 // runControlDaemon starts the control daemon
-func runControlDaemon(serverPort, controlPort string) {
+func runControlDaemon(serverPort, controlPort, c2Endpoint, runID, arch string) {
 	log.Printf("Starting control daemon on port %s (server port: %s)", controlPort, serverPort)
 
 	daemon := &ControlDaemon{
 		serverPort:   serverPort,
 		shutdownChan: make(chan struct{}),
+	}
+
+	// Start C2 heartbeat if configured
+	var c2Client *C2Client
+	var heartbeatCtx context.Context
+	var heartbeatCancel context.CancelFunc
+	if c2Endpoint != "" && runID != "" && arch != "" {
+		log.Printf("C2 integration enabled: endpoint=%s, runID=%s, arch=%s", c2Endpoint, runID, arch)
+		c2Client = &C2Client{
+			endpoint: c2Endpoint,
+			runID:    runID,
+			arch:     arch,
+		}
+		heartbeatCtx, heartbeatCancel = context.WithCancel(context.Background())
+		go c2Client.runHeartbeat(heartbeatCtx)
 	}
 
 	mux := http.NewServeMux()
@@ -169,6 +191,11 @@ func runControlDaemon(serverPort, controlPort string) {
 			log.Println("Received shutdown signal")
 		case <-daemon.shutdownChan:
 			log.Println("Shutdown requested via API")
+		}
+
+		// Stop heartbeat if running
+		if heartbeatCancel != nil {
+			heartbeatCancel()
 		}
 
 		daemon.stopCurrentServer()
@@ -386,4 +413,58 @@ func (d *ControlDaemon) jsonResponse(w http.ResponseWriter, status int, data int
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// C2Client handles communication with the C2 server
+type C2Client struct {
+	endpoint string
+	runID    string
+	arch     string
+}
+
+// runHeartbeat sends periodic heartbeats to C2
+func (c *C2Client) runHeartbeat(ctx context.Context) {
+	// Send initial heartbeat immediately
+	c.sendHeartbeat(ctx)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.sendHeartbeat(ctx)
+		}
+	}
+}
+
+func (c *C2Client) sendHeartbeat(ctx context.Context) {
+	url := fmt.Sprintf("%s/api/worker/heartbeat", c.endpoint)
+
+	payload := map[string]string{
+		"run_id": c.runID,
+		"arch":   c.arch,
+		"role":   "server",
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Heartbeat failed: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
 }
