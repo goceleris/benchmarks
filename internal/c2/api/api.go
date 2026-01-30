@@ -370,16 +370,27 @@ func (h *Handler) handleWorkerHeartbeat(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		RunID string `json:"run_id"`
-		Arch  string `json:"arch"`
-		Role  string `json:"role"`
+		RunID            string `json:"run_id"`
+		Arch             string `json:"arch"`
+		Role             string `json:"role"`
+		CurrentServer    string `json:"current_server"`
+		CurrentBenchmark string `json:"current_benchmark"`
+		CurrentCount     int    `json:"current_count"`
+		TotalCount       int    `json:"total_count"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
+	// Update worker status with progress info
 	_ = h.config.Store.UpdateWorkerStatus(req.RunID, req.Arch, req.Role, "running")
+
+	// Update progress info if provided
+	if req.CurrentServer != "" || req.CurrentBenchmark != "" {
+		_ = h.config.Store.UpdateWorkerProgress(req.RunID, req.Arch, req.Role,
+			req.CurrentServer, req.CurrentBenchmark, req.CurrentCount, req.TotalCount)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

@@ -49,14 +49,18 @@ type Run struct {
 
 // Worker represents a registered worker instance.
 type Worker struct {
-	RunID        string    `json:"run_id"`
-	Role         string    `json:"role"` // server, client
-	Arch         string    `json:"arch"` // arm64, x86
-	InstanceID   string    `json:"instance_id"`
-	PrivateIP    string    `json:"private_ip"`
-	Status       string    `json:"status"` // pending, running, completed, failed, terminated
-	RegisteredAt time.Time `json:"registered_at"`
-	LastSeen     time.Time `json:"last_seen"`
+	RunID            string    `json:"run_id"`
+	Role             string    `json:"role"` // server, client
+	Arch             string    `json:"arch"` // arm64, x86
+	InstanceID       string    `json:"instance_id"`
+	PrivateIP        string    `json:"private_ip"`
+	Status           string    `json:"status"` // pending, running, completed, failed, terminated
+	RegisteredAt     time.Time `json:"registered_at"`
+	LastSeen         time.Time `json:"last_seen"`
+	CurrentServer    string    `json:"current_server,omitempty"`    // Current server being tested (e.g., "gin-h1")
+	CurrentBenchmark string    `json:"current_benchmark,omitempty"` // Current benchmark type (e.g., "simple")
+	CurrentCount     int       `json:"current_count,omitempty"`     // Current benchmark number (1-based)
+	TotalCount       int       `json:"total_count,omitempty"`       // Total number of benchmarks
 }
 
 // ArchResult holds benchmark results for one architecture.
@@ -231,6 +235,25 @@ func (s *Store) UpdateWorkerStatus(runID, arch, role, status string) error {
 	key := fmt.Sprintf("%s-%s", arch, role)
 	if worker, ok := run.Workers[key]; ok {
 		worker.Status = status
+		worker.LastSeen = time.Now()
+	}
+
+	return s.saveRun(run)
+}
+
+// UpdateWorkerProgress updates a worker's current benchmark progress.
+func (s *Store) UpdateWorkerProgress(runID, arch, role, currentServer, currentBenchmark string, currentCount, totalCount int) error {
+	run, err := s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+
+	key := fmt.Sprintf("%s-%s", arch, role)
+	if worker, ok := run.Workers[key]; ok {
+		worker.CurrentServer = currentServer
+		worker.CurrentBenchmark = currentBenchmark
+		worker.CurrentCount = currentCount
+		worker.TotalCount = totalCount
 		worker.LastSeen = time.Now()
 	}
 

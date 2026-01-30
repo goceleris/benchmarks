@@ -138,7 +138,21 @@ jobs:
                 echo "[$((ELAPSED/60))m] Status: $STATUS"
                 WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                 if [[ "$WORKERS" != "{}" ]]; then
-                  echo "Workers: $WORKERS"
+                  # Extract and display progress from workers
+                  for arch in arm64 x86; do
+                    CLIENT_KEY="${arch}-client"
+                    CLIENT=$(echo "$RESPONSE" | jq -r ".workers[\"$CLIENT_KEY\"] // {}")
+                    if [[ "$CLIENT" != "{}" && "$CLIENT" != "null" ]]; then
+                      CURRENT_SERVER=$(echo "$CLIENT" | jq -r '.current_server // ""')
+                      CURRENT_BENCH=$(echo "$CLIENT" | jq -r '.current_benchmark // ""')
+                      CURRENT_COUNT=$(echo "$CLIENT" | jq -r '.current_count // 0')
+                      TOTAL_COUNT=$(echo "$CLIENT" | jq -r '.total_count // 0')
+
+                      if [[ -n "$CURRENT_SERVER" && -n "$CURRENT_BENCH" && "$TOTAL_COUNT" -gt 0 ]]; then
+                        echo "  $arch: Testing $CURRENT_SERVER/$CURRENT_BENCH ($CURRENT_COUNT/$TOTAL_COUNT)"
+                      fi
+                    fi
+                  done
                 fi
                 ;;
               *)
