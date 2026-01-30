@@ -156,9 +156,12 @@ Resources:
               -H "Content-Type: application/json" \
               -d "{\"run_id\":\"${RunId}\",\"role\":\"server\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"private_ip\":\"$PRIVATE_IP\"}"
 
-            # Start server (control daemon mode)
+            # Start server (control daemon mode with C2 heartbeat)
             echo "Starting server in control mode..."
-            /usr/local/bin/server -mode control -port 8080 -control-port 9999
+            /usr/local/bin/server -mode control -port 8080 -control-port 9999 \
+              -c2-endpoint "${C2Endpoint}" \
+              -run-id "${RunId}" \
+              -arch "${Architecture}"
 
             echo "=== Benchmark Server Exiting ==="
         TagSpecifications:
