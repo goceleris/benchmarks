@@ -1,340 +1,105 @@
 # Celeris Benchmarks
 
-Official reproducible benchmark suite for comparing Go HTTP server throughput and latency. Tests production frameworks against theoretical maximum implementations using raw syscalls.
+Reproducible HTTP server benchmarks on bare-metal AWS instances. Compare production Go frameworks against theoretical maximum performance using raw syscalls.
 
-## Purpose
+## Why This Exists
 
-This benchmark suite provides:
+Most benchmarks run on shared VMs with noisy neighbors, making results unreliable. This suite runs on dedicated bare-metal instances (c6g.metal, c5.metal) with automated CI/CD, so every release gets consistent, comparable numbers.
 
-- **Reproducible results** on bare-metal AWS instances (no noisy neighbors)
-- **Fair comparisons** with identical test conditions for all servers
-- **Theoretical baselines** using epoll/io_uring to show maximum achievable performance
-- **Automated CI/CD** with results committed to the repository
+We test two categories:
+- **Baseline**: Production frameworks (Gin, Fiber, Echo, Chi, Iris, stdlib)
+- **Theoretical**: Raw epoll/io_uring implementations showing the performance ceiling
 
-## Server Implementations
+## Latest Results
 
-### Baseline (Production Frameworks)
+Results are committed to [`results/`](results/) on each release. See benchmark charts and raw data for:
+- ARM64 (Graviton) on c6g.metal
+- x86-64 (Intel) on c5.metal
+
+## Servers Tested
+
+### Production Frameworks
 
 | Server | Protocol | Framework |
 |--------|----------|-----------|
-| stdhttp-h1 | HTTP/1.1 | Go standard library |
-| stdhttp-h2 | HTTP/1.1 + H2C | `golang.org/x/net/http2/h2c` |
-| stdhttp-hybrid | HTTP/1.1 + H2C | `golang.org/x/net/http2/h2c` |
-| fiber-h1 | HTTP/1.1 | [Fiber](https://github.com/gofiber/fiber) v2 |
-| gin-h1 | HTTP/1.1 | [Gin](https://github.com/gin-gonic/gin) |
-| gin-h2 | HTTP/1.1 + H2C | Gin + `h2c.NewHandler` |
-| gin-hybrid | HTTP/1.1 + H2C | Gin + `h2c.NewHandler` |
-| chi-h1 | HTTP/1.1 | [Chi](https://github.com/go-chi/chi) |
-| chi-h2 | HTTP/1.1 + H2C | Chi + `h2c.NewHandler` |
-| chi-hybrid | HTTP/1.1 + H2C | Chi + `h2c.NewHandler` |
-| echo-h1 | HTTP/1.1 | [Echo](https://github.com/labstack/echo) |
-| echo-h2 | HTTP/1.1 + H2C | Echo + `h2c.NewHandler` |
-| echo-hybrid | HTTP/1.1 + H2C | Echo + `h2c.NewHandler` |
-| iris-h1 | HTTP/1.1 | [Iris](https://github.com/kataras/iris) |
-| iris-h2 | HTTP/1.1 + H2C | Iris + `h2c.NewHandler` |
-| iris-hybrid | HTTP/1.1 + H2C | Iris + `h2c.NewHandler` |
+| stdhttp | HTTP/1.1, H2C | Go stdlib |
+| fiber | HTTP/1.1 | [Fiber](https://github.com/gofiber/fiber) |
+| gin | HTTP/1.1, H2C | [Gin](https://github.com/gin-gonic/gin) |
+| chi | HTTP/1.1, H2C | [Chi](https://github.com/go-chi/chi) |
+| echo | HTTP/1.1, H2C | [Echo](https://github.com/labstack/echo) |
+| iris | HTTP/1.1, H2C | [Iris](https://github.com/kataras/iris) |
 
-> **Note**: The `-h2` and `-hybrid` variants use `h2c.NewHandler` which supports both HTTP/1.1 and H2C (HTTP/2 cleartext). The naming reflects the primary benchmark focus: `-h2` for H2C testing, `-hybrid` for mixed protocol testing. Fiber does not support H2C.
-
-### Theoretical Maximum (Raw Syscalls)
+### Theoretical Maximum
 
 | Server | Protocol | Implementation |
 |--------|----------|----------------|
-| epoll-h1 | HTTP/1.1 | Raw `epoll` syscalls |
-| epoll-h2 | HTTP/2 (H2C) | Raw `epoll` + HPACK |
-| epoll-hybrid | HTTP/1.1 + H2C | Raw `epoll` with auto-detection |
-| iouring-h1 | HTTP/1.1 | `io_uring` with multishot |
-| iouring-h2 | HTTP/2 (H2C) | `io_uring` + HPACK |
-| iouring-hybrid | HTTP/1.1 + H2C | `io_uring` with auto-detection |
+| epoll | HTTP/1.1, H2C | Raw epoll syscalls |
+| iouring | HTTP/1.1, H2C | io_uring with multishot (kernel 6.15+) |
 
-> **Note**: io_uring servers require Linux kernel 6.15+ for multishot support.
-
-## Benchmark Types
-
-| Type | Method | Endpoint | Description |
-|------|--------|----------|-------------|
-| Simple | GET | `/` | Plain text "Hello, World!" response |
-| JSON | GET | `/json` | JSON object serialization |
-| Path | GET | `/users/:id` | Path parameter extraction |
-| Big Request | POST | `/upload` | 4KB request body handling |
-
-## Benchmark Modes
-
-The CI/CD system supports multiple benchmark modes with automatic fallback:
-
-| Mode | ARM64 Instance | x86 Instance | Trigger | Purpose |
-|------|----------------|--------------|---------|---------|
-| **Fast** | c6g.medium (1 vCPU) | c5.large (2 vCPU) | Pull Requests | Quick trend validation |
-| **Metal** | c6g.metal (64 vCPU) | c5.metal (96 vCPU) | Releases | Official results |
-| **Provisional** | c6g.2xlarge (8 vCPU) | c5.2xlarge (8 vCPU) | Fallback | When metal quota unavailable |
-
-### Instance Fallback Chain
-
-When running Metal benchmarks, each architecture independently attempts:
-
-1. **Metal Spot** - Cheapest option for bare-metal
-2. **Metal On-Demand** - Guaranteed availability at higher cost
-3. **Provisional Spot** - Best available within typical quotas
-4. **Provisional On-Demand** - Guaranteed fallback
-
-This allows ARM64 to run on metal while x86 falls back to provisional (or vice versa) based on available AWS quota.
-
-## Results Structure
-
-Results are stored with clear official/provisional distinction:
-
-```
-results/
-├── latest/                       # Most recent results
-│   ├── arm64/                    # Official ARM64 results (metal)
-│   ├── x86-provisional/          # Provisional x86 results (not metal)
-│   └── BENCHMARK_INFO.json       # Metadata about each architecture
-├── v0.1.0/                       # Results for specific release
-│   ├── arm64/
-│   ├── x86/                      # Both official
-│   └── BENCHMARK_INFO.json
-├── v0.2.0/
-│   ├── arm64/
-│   └── x86-provisional/          # x86 needs promotion
-└── PROVISIONAL_STATUS.json       # Tracks what needs promotion
-```
-
-### Promoting Provisional Results
-
-When metal quota becomes available, use the **Promote Provisional** workflow:
-
-1. Select version to promote (e.g., `v0.1.0`)
-2. Select architecture (`arm64`, `x86`, or `both`)
-3. Workflow checks out the specific tag and runs on metal
-4. Replaces `x86-provisional/` with `x86/`
-5. Only updates `results/latest/` if promoting the most recent version
-
-## GitHub Actions Workflows
-
-| Workflow | Trigger | Description |
-|----------|---------|-------------|
-| **Benchmark (Fast)** | PR with `run-benchmarks` label | Quick validation on virtualized instances |
-| **Benchmark (Metal)** | Release published, manual | Official results on bare-metal |
-| **Promote Provisional** | Manual | Re-run specific version/arch on metal |
-| **Lint** | Push, PR | Code quality checks with golangci-lint |
-
-### Security
-
-All benchmark workflows require authorization to protect AWS resources:
-
-- **Fast mode**: Requires `run-benchmarks` label (maintainers only can add)
-- **Metal mode**: Requires write/maintain/admin repository permissions
-- **Promote**: Requires write/maintain/admin repository permissions
-
-## Local Development
-
-### Prerequisites
-
-- Go 1.25+
-- Docker (for container validation)
-- Python 3.11+ with matplotlib, numpy (for chart generation)
-- Linux kernel 6.15+ (for io_uring servers)
-- Terraform 1.6+ (for infrastructure management)
-
-### Quick Start
+## Quick Start
 
 ```bash
-# Clone repository
+# Clone and build
 git clone https://github.com/goceleris/benchmarks
 cd benchmarks
-
-# Build binaries
 make build
 
-# Run quick benchmark validation
+# Run a quick local benchmark
 make benchmark-quick
 
-# Run full baseline benchmark
+# Run full benchmark (30s per server)
 make benchmark
 ```
 
-### Available Make Targets
+### Benchmark Tool
 
 ```bash
-make help              # Show all available targets
-
-# Building
-make build             # Build server and benchmark binaries
-make build-server      # Build server only
-make build-bench       # Build benchmark tool only
-make build-linux       # Cross-compile for Linux amd64
-make build-linux-arm   # Cross-compile for Linux arm64
-
-# Testing
-make lint              # Run golangci-lint
-make fmt               # Format Go code
-make vet               # Run go vet
-make test              # Run unit tests
-make check             # Run all checks
-
-# Benchmarking
-make benchmark         # Run baseline benchmarks (30s)
-make benchmark-quick   # Quick validation (5s)
-make bench-charts      # Test chart generation
-
-# Docker
-make docker-build           # Build all Docker images
-make docker-test-baseline   # Test baseline servers
-make docker-test-theoretical # Test theoretical servers (Linux)
-make docker-stop            # Stop all containers
-
-# Validation
-make validate          # Validate workflows and Terraform
-make validate-tf       # Validate Terraform only
-make validate-workflows # Validate GitHub Actions only
-
-# Cleanup
-make clean             # Remove build artifacts
-make deps              # Download/tidy dependencies
+./bin/bench -mode baseline -duration 30s -connections 256
+./bin/bench -mode theoretical -duration 30s -connections 256
+./bin/bench -mode all -duration 60s -connections 512
 ```
 
-### Running Benchmarks Manually
+## Benchmark Types
 
-```bash
-# Build everything
-make build
+| Type | Endpoint | Description |
+|------|----------|-------------|
+| Simple | `GET /` | Plain text response |
+| JSON | `GET /json` | JSON serialization |
+| Path | `GET /users/:id` | Path parameter extraction |
+| Upload | `POST /upload` | 4KB request body |
 
-# Run baseline servers only
-./bin/bench -mode baseline -duration 30s -connections 256 -workers 8
+## CI/CD
 
-# Run theoretical servers only (Linux)
-./bin/bench -mode theoretical -duration 30s -connections 256 -workers 8
+Benchmarks run automatically:
+- **On Release**: Full metal benchmark on bare-metal instances
+- **On PR** (with label): Quick validation on smaller instances
 
-# Run all servers
-./bin/bench -mode all -duration 60s -connections 512 -workers 16
-
-# Custom configuration
-./bin/bench \
-  -mode baseline \
-  -duration 60s \
-  -connections 1024 \
-  -workers 16 \
-  -warmup 5s
-```
-
-### Benchmark Tool Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-mode` | `all` | Servers to test: `baseline`, `theoretical`, `all` |
-| `-duration` | `30s` | Duration per benchmark |
-| `-connections` | `256` | Concurrent connections |
-| `-workers` | `8` | Worker goroutines |
-| `-warmup` | `3s` | Warmup duration before measurement |
-
-### Docker Validation
-
-```bash
-# Test baseline servers
-make docker-test-baseline
-
-# Test theoretical servers (requires Linux with kernel 6.15+)
-make docker-test-theoretical
-
-# Manual Docker testing
-docker compose -f docker/docker-compose.yml --profile baseline up -d
-curl http://localhost:8081/        # stdhttp-h1
-curl http://localhost:8084/        # fiber-h1
-curl http://localhost:8086/        # gin-h1
-docker compose -f docker/docker-compose.yml --profile baseline down
-```
+The C2 orchestration system manages AWS spot instances, handles capacity fallbacks, and commits results automatically.
 
 ## Infrastructure
 
-### AWS Resources
+Benchmarks run on AWS using a C2 (command and control) server that:
+- Provisions spot instances with on-demand fallback
+- Coordinates server/client workers across availability zones
+- Collects results and generates charts
+- Cleans up resources automatically
 
-The benchmark infrastructure uses Terraform to provision:
-
-- **EC2 Spot/On-Demand Instances** - Self-hosted GitHub Actions runners
-- **IAM Instance Profile** - Minimal permissions for runner registration
-- **Security Groups** - Outbound-only access
-
-### Terraform Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `benchmark_mode` | Instance type selection | `fast` |
-| `use_on_demand` | Use on-demand instead of spot | `false` |
-| `launch_arm64_only` | Only launch ARM64 | `false` |
-| `launch_x86_only` | Only launch x86 | `false` |
-| `aws_region` | AWS region | `us-east-1` |
-
-### Required AWS Quotas
-
-For metal benchmarks, ensure sufficient vCPU quota:
-
-| Quota | ARM64 | x86 |
-|-------|-------|-----|
-| Metal Spot | 64 vCPU (c6g.metal) | 96 vCPU (c5.metal) |
-| Metal On-Demand | 64 vCPU | 96 vCPU |
-| Provisional | 8 vCPU (c6g.2xlarge) | 8 vCPU (c5.2xlarge) |
-
-Request quota increases in AWS Service Quotas for:
-- "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances"
-- "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests"
-
-> **Note**: Both ARM64 (c6g) and x86 (c5) instances count towards Standard quotas. The "G" in c6g refers to Graviton processors, not GPU instances.
-
-## Project Structure
-
-```
-.
-├── cmd/
-│   ├── bench/           # Benchmark tool
-│   └── server/          # Multi-server binary
-├── docker/
-│   ├── Dockerfile.baseline
-│   ├── Dockerfile.theoretical
-│   └── docker-compose.yml
-├── internal/
-│   └── bench/           # Benchmark library
-├── results/             # Benchmark results (committed)
-├── scripts/
-│   └── generate_charts.py
-├── servers/
-│   ├── baseline/        # Production frameworks
-│   │   ├── chi/
-│   │   ├── echo/
-│   │   ├── fiber/
-│   │   ├── gin/
-│   │   ├── iris/
-│   │   └── stdhttp/
-│   ├── common/          # Shared utilities
-│   └── theoretical/     # Raw syscall implementations
-│       ├── epoll/
-│       └── iouring/
-├── terraform/           # AWS infrastructure
-├── .github/workflows/   # CI/CD pipelines
-├── Makefile
-└── go.mod
-```
+Required AWS quotas for metal benchmarks:
+- ARM64: 64 vCPU (c6g.metal)
+- x86: 96 vCPU (c5.metal)
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make changes and run `make check`
-4. Submit a pull request
-5. Add `run-benchmarks` label to trigger benchmark validation
+1. Fork and create a feature branch
+2. Run `make check` before submitting
+3. Add `run-benchmarks` label to PRs for benchmark validation
 
-### Adding a New Server
+### Adding a Server
 
-1. Create server package in `servers/baseline/` or `servers/theoretical/`
-2. Implement the server interface with all benchmark endpoints
+1. Create package in `servers/baseline/` or `servers/theoretical/`
+2. Implement all benchmark endpoints
 3. Register in `cmd/server/main.go`
-4. Update this README with the new server
-
-### Code Style
-
-- Run `make fmt` before committing
-- Run `make lint` to check for issues
-- Follow existing patterns in the codebase
 
 ## License
 
-Apache 2.0 - See [LICENSE](LICENSE) for details.
+Apache 2.0
