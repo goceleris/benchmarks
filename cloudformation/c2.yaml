@@ -4,8 +4,8 @@ Description: Celeris Benchmark C2 (Command & Control) Server - Always-on orchest
 Parameters:
   InstanceType:
     Type: String
-    Default: t4g.nano
-    Description: C2 server instance type (t4g.nano is ~$3/month)
+    Default: t4g.small
+    Description: C2 server instance type (t4g.small has 2GB RAM for Go builds)
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
