@@ -100,11 +100,21 @@ func main() {
 	ssmParamName := flag.String("ssm-param", "", "SSM parameter name for server IP (default: /celeris-benchmark/server-ip/<arch>)")
 	awsRegion := flag.String("aws-region", "us-east-1", "AWS region for SSM")
 
+	// C2 integration flags
+	c2Endpoint := flag.String("c2-endpoint", "", "C2 server endpoint for reporting results (enables C2 mode)")
+	runID := flag.String("run-id", "", "Benchmark run ID (required in C2 mode)")
+	archOverride := flag.String("arch", "", "Architecture override (default: auto-detect)")
+
 	flag.Parse()
 
 	arch := runtime.GOARCH
 	if arch == "amd64" {
 		arch = "x86"
+	}
+
+	// Override arch if specified
+	if *archOverride != "" {
+		arch = *archOverride
 	}
 
 	// Check for environment variable override
@@ -299,6 +309,23 @@ func main() {
 		}
 	}
 
+	// Create C2 client if endpoint is provided
+	var c2 *C2Client
+	if *c2Endpoint != "" {
+		if *runID == "" {
+			log.Fatal("C2 mode requires -run-id flag")
+		}
+		c2 = &C2Client{
+			endpoint: *c2Endpoint,
+			runID:    *runID,
+			arch:     arch,
+		}
+		log.Printf("C2 mode enabled: endpoint=%s, run_id=%s, arch=%s", *c2Endpoint, *runID, arch)
+
+		// Start heartbeat goroutine
+		go c2.runHeartbeat(ctx)
+	}
+
 	totalBenchmarks := len(servers) * len(benchmarkTypes)
 	completedBefore := len(checkpoint.Results)
 	skipped := 0
@@ -336,7 +363,9 @@ func main() {
 				log.Printf("WARN: Failed to start %s on remote: %v, skipping", serverType, err)
 				continue
 			}
-			serverHost = *serverIP
+			rc.mu.RLock()
+			serverHost = rc.serverIP
+			rc.mu.RUnlock()
 		} else {
 			// Local mode: start server locally
 			var err error
@@ -421,9 +450,15 @@ func main() {
 
 			log.Printf("Completed: %.2f req/s, avg latency: %s", result.RequestsPerSec, result.Latency.Avg)
 
-			checkpoint.AddResult(result.ToServerResult(
-				serverType, bt.Name, bt.Method, bt.Path,
-			))
+			serverResult := result.ToServerResult(serverType, bt.Name, bt.Method, bt.Path)
+			checkpoint.AddResult(serverResult)
+
+			// Send result to C2 if enabled
+			if c2 != nil {
+				if err := c2.sendResult(ctx, serverType, bt.Name, result); err != nil {
+					log.Printf("WARN: Failed to send result to C2: %v", err)
+				}
+			}
 
 			if err := checkpoint.Save(*checkpointFile); err != nil {
 				log.Printf("WARN: Failed to save checkpoint: %v", err)
@@ -475,6 +510,15 @@ saveAndExit:
 		log.Printf("NOTE: %d benchmarks remaining. Run with -resume to continue.", totalBenchmarks-len(checkpoint.Results))
 	} else {
 		log.Printf("Benchmarks complete!")
+
+		// Notify C2 of completion
+		if c2 != nil {
+			if err := c2.sendCompletion(context.Background()); err != nil {
+				log.Printf("WARN: Failed to send completion to C2: %v", err)
+			} else {
+				log.Printf("Completion notification sent to C2")
+			}
+		}
 	}
 
 	// Shutdown the control daemon if in remote mode and benchmarks completed successfully
@@ -986,4 +1030,145 @@ func monitorSpotInterruption(ctx context.Context, interruptChan chan<- struct{})
 			_ = resp.Body.Close()
 		}
 	}
+}
+
+// C2Client handles communication with the C2 orchestration server
+type C2Client struct {
+	endpoint string
+	runID    string
+	arch     string
+}
+
+// C2BenchResult is the result format expected by C2 (must match store.BenchResult)
+type C2BenchResult struct {
+	ServerType     string  `json:"server_type"`
+	BenchmarkType  string  `json:"benchmark_type"`
+	RequestsPerSec float64 `json:"requests_per_sec"`
+	LatencyAvg     int64   `json:"latency_avg"` // nanoseconds
+	LatencyP50     int64   `json:"latency_p50"` // nanoseconds
+	LatencyP99     int64   `json:"latency_p99"` // nanoseconds
+	LatencyMax     int64   `json:"latency_max"` // nanoseconds
+	TotalRequests  int64   `json:"total_requests"`
+	Errors         int64   `json:"errors"`
+}
+
+// runHeartbeat sends periodic heartbeats to C2
+func (c *C2Client) runHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.sendHeartbeat(ctx)
+		}
+	}
+}
+
+func (c *C2Client) sendHeartbeat(ctx context.Context) {
+	url := fmt.Sprintf("%s/api/worker/heartbeat", c.endpoint)
+
+	payload := map[string]string{
+		"run_id": c.runID,
+		"arch":   c.arch,
+		"role":   "client",
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Heartbeat failed: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+// sendResult sends a single benchmark result to C2
+func (c *C2Client) sendResult(ctx context.Context, serverType, benchmarkType string, result *bench.Result) error {
+	url := fmt.Sprintf("%s/api/worker/results", c.endpoint)
+
+	// Convert to C2 format with proper duration values
+	c2Result := C2BenchResult{
+		ServerType:     serverType,
+		BenchmarkType:  benchmarkType,
+		RequestsPerSec: result.RequestsPerSec,
+		LatencyAvg:     int64(result.Latency.Avg),
+		LatencyP50:     int64(result.Latency.P50),
+		LatencyP99:     int64(result.Latency.P99),
+		LatencyMax:     int64(result.Latency.Max),
+		TotalRequests:  result.Requests,
+		Errors:         result.Errors,
+	}
+
+	payload := map[string]interface{}{
+		"run_id":  c.runID,
+		"arch":    c.arch,
+		"results": []C2BenchResult{c2Result},
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal result: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send result: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("C2 returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// sendCompletion notifies C2 that benchmarks are complete
+func (c *C2Client) sendCompletion(ctx context.Context) error {
+	url := fmt.Sprintf("%s/api/worker/complete", c.endpoint)
+
+	payload := map[string]string{
+		"run_id": c.runID,
+		"arch":   c.arch,
+		"role":   "client",
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+
+	return nil
 }

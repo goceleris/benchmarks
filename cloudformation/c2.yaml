@@ -48,7 +48,13 @@ Resources:
       GroupDescription: Security group for C2 benchmark orchestrator
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # HTTPS API access
+        # C2 API access (primary endpoint)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref AllowedCIDR
+          Description: C2 API access
+        # HTTPS API access (future TLS)
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -88,10 +94,7 @@ Resources:
         - IpProtocol: -1
           SourceSecurityGroupId: !Ref C2SecurityGroup
           Description: All traffic from C2
-        # Allow traffic between workers (same SG)
-        - IpProtocol: -1
-          SourceSecurityGroupId: !Ref WorkerSecurityGroup
-          Description: All traffic between workers
+        # Note: Self-referencing rule is added via WorkerSecurityGroupSelfIngress resource
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -146,6 +149,23 @@ Resources:
                   - ec2:DescribeSubnets
                   - ec2:DescribeSecurityGroups
                   - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeVolumes
+                  - ec2:AttachVolume
+                  - ec2:AssociateAddress
+                  - ec2:DescribeAddresses
+                Resource: '*'
+              # Spot Fleet permissions
+              - Effect: Allow
+                Action:
+                  - ec2:RequestSpotFleet
+                  - ec2:ModifySpotFleetRequest
+                  - ec2:CancelSpotFleetRequests
+                  - ec2:DescribeSpotFleetRequests
+                  - ec2:DescribeSpotFleetInstances
+                  - ec2:CreateLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
                 Resource: '*'
               # CloudFormation for worker stacks
               - Effect: Allow
@@ -155,7 +175,8 @@ Resources:
                   - cloudformation:DescribeStacks
                   - cloudformation:DescribeStackEvents
                   - cloudformation:UpdateStack
-                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/celeris-workers-*/*'
+                  - cloudformation:ListStacks
+                Resource: '*'
               # SSM Parameter Store for secrets
               - Effect: Allow
                 Action:
@@ -163,11 +184,13 @@ Resources:
                   - ssm:GetParameters
                   - ssm:PutParameter
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/celeris/*'
-              # IAM PassRole for workers
+              # IAM PassRole for workers and spot fleet
               - Effect: Allow
                 Action:
                   - iam:PassRole
-                Resource: !GetAtt WorkerRole.Arn
+                Resource:
+                  - !GetAtt WorkerRole.Arn
+                  - !GetAtt SpotFleetRole.Arn
       Tags:
         - Key: Project
           Value: celeris-benchmarks
@@ -215,6 +238,24 @@ Resources:
       InstanceProfileName: celeris-worker-profile
       Roles:
         - !Ref WorkerRole
+
+  # Spot Fleet Service Role (required for Spot Fleet requests)
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-ec2-spot-fleet-tagging-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      Tags:
+        - Key: Project
+          Value: celeris-benchmarks
 
   # EBS Volume for persistent data (BadgerDB)
   DataVolume:
@@ -294,27 +335,82 @@ Resources:
             apt-get update -qq
             apt-get install -y -qq curl jq git awscli nvme-cli
 
-            # Wait for and mount data volume
-            echo "Waiting for data volume..."
-            while [ ! -e /dev/nvme1n1 ]; do sleep 1; done
+            # Get instance metadata
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            REGION=$(echo "$AZ" | sed 's/[a-z]$//')
 
-            # Format if new volume
-            if ! blkid /dev/nvme1n1; then
-              mkfs.ext4 /dev/nvme1n1
+            # Find and attach the data volume by tag
+            echo "Looking for data volume..."
+            VOLUME_ID=$(aws ec2 describe-volumes \
+              --filters "Name=tag:Name,Values=celeris-c2-data" "Name=availability-zone,Values=$AZ" \
+              --query 'Volumes[0].VolumeId' --output text --region $REGION 2>/dev/null || echo "")
+
+            DATA_DIR="/data"
+            mkdir -p $DATA_DIR
+
+            if [ -n "$VOLUME_ID" ] && [ "$VOLUME_ID" != "None" ]; then
+              echo "Found data volume: $VOLUME_ID"
+
+              # Check if volume is available (not attached)
+              VOLUME_STATE=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" \
+                --query 'Volumes[0].State' --output text --region $REGION)
+
+              if [ "$VOLUME_STATE" = "available" ]; then
+                echo "Attaching volume..."
+                aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" \
+                  --device /dev/xvdf --region $REGION
+
+                # Wait for attachment
+                echo "Waiting for volume to attach..."
+                for i in $(seq 1 60); do
+                  if [ -e /dev/nvme1n1 ] || [ -e /dev/xvdf ]; then
+                    break
+                  fi
+                  sleep 2
+                done
+              fi
+
+              # Find the device (could be nvme1n1 or xvdf depending on instance type)
+              DEVICE=""
+              for dev in /dev/nvme1n1 /dev/xvdf; do
+                if [ -e "$dev" ]; then
+                  DEVICE="$dev"
+                  break
+                fi
+              done
+
+              if [ -n "$DEVICE" ]; then
+                # Format if new volume
+                if ! blkid "$DEVICE"; then
+                  echo "Formatting new volume..."
+                  mkfs.ext4 "$DEVICE"
+                fi
+
+                mount "$DEVICE" $DATA_DIR
+                echo "$DEVICE $DATA_DIR ext4 defaults,nofail 0 2" >> /etc/fstab
+                echo "Data volume mounted successfully"
+              else
+                echo "Warning: Could not find attached device, using local storage"
+              fi
+            else
+              echo "No data volume found, using local storage"
             fi
 
-            mkdir -p /data
-            mount /dev/nvme1n1 /data
-            echo '/dev/nvme1n1 /data ext4 defaults,nofail 0 2' >> /etc/fstab
-
             # Create directories
-            mkdir -p /data/badger /data/logs /opt/celeris
+            mkdir -p $DATA_DIR/badger $DATA_DIR/logs /opt/celeris
 
             # Install Go
             curl -sLO https://go.dev/dl/go1.23.4.linux-arm64.tar.gz
             tar -C /usr/local -xzf go1.23.4.linux-arm64.tar.gz
             export PATH=$PATH:/usr/local/go/bin
+            export GOPATH=/root/go
+            export GOMODCACHE=/root/go/pkg/mod
+            mkdir -p $GOPATH $GOMODCACHE
             echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+            echo 'export GOPATH=/root/go' >> /etc/profile
+            echo 'export GOMODCACHE=/root/go/pkg/mod' >> /etc/profile
 
             # Clone and build C2
             cd /opt/celeris

@@ -154,6 +154,9 @@ Resources:
             curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
             tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
             export PATH=$PATH:/usr/local/go/bin
+            export GOPATH=/root/go
+            export GOMODCACHE=/root/go/pkg/mod
+            mkdir -p $GOPATH $GOMODCACHE
 
             # Clone and build
             cd /opt
@@ -253,6 +256,9 @@ Resources:
             curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
             tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
             export PATH=$PATH:/usr/local/go/bin
+            export GOPATH=/root/go
+            export GOMODCACHE=/root/go/pkg/mod
+            mkdir -p $GOPATH $GOMODCACHE
 
             # Clone and build
             cd /opt
