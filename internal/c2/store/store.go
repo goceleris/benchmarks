@@ -122,8 +122,13 @@ func (s *Store) RunGC(ctx context.Context) {
 
 // CreateRun creates a new benchmark run.
 func (s *Store) CreateRun(run *Run) error {
-	run.StartedAt = time.Now()
-	run.Status = "pending"
+	// Set defaults only if not already set
+	if run.Status == "" {
+		run.Status = "pending"
+	}
+	if run.QueuedAt.IsZero() {
+		run.QueuedAt = time.Now()
+	}
 	if run.Workers == nil {
 		run.Workers = make(map[string]*Worker)
 	}
