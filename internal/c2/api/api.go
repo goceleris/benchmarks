@@ -3,7 +3,7 @@ package api
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -41,7 +41,7 @@ func NewWithConfig(config Config) *Handler {
 	}
 
 	if h.apiKey == "" {
-		log.Println("Warning: C2_API_KEY not set, API authentication disabled")
+		slog.Warn("API authentication disabled, C2_API_KEY not set")
 	}
 
 	// Register routes
@@ -117,7 +117,7 @@ func (h *Handler) handleStartBenchmark(w http.ResponseWriter, r *http.Request) {
 
 	run, err := h.config.Orchestrator.StartRun(r.Context(), mode, duration, benchMode)
 	if err != nil {
-		log.Printf("Failed to queue benchmark: %v", err)
+		slog.Error("failed to queue benchmark", "error", err, "mode", mode)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -135,7 +135,10 @@ func (h *Handler) handleStartBenchmark(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("Benchmark %s queued (mode: %s, status: %s)", run.ID, mode, run.Status)
+	slog.Info("benchmark queued",
+		"run_id", run.ID,
+		"mode", mode,
+		"status", run.Status)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -329,12 +332,21 @@ func (h *Handler) handleWorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.config.Store.RegisterWorker(worker); err != nil {
-		log.Printf("Failed to register worker: %v", err)
+		slog.Error("failed to register worker",
+			"error", err,
+			"run_id", req.RunID,
+			"arch", req.Arch,
+			"role", req.Role)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Worker registered: %s %s-%s (%s)", req.RunID, req.Arch, req.Role, req.PrivateIP)
+	slog.Info("worker registered",
+		"run_id", req.RunID,
+		"arch", req.Arch,
+		"role", req.Role,
+		"instance_id", req.InstanceID,
+		"private_ip", req.PrivateIP)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
@@ -410,7 +422,10 @@ func (h *Handler) handleWorkerComplete(w http.ResponseWriter, r *http.Request) {
 		_ = h.config.Store.CompleteArch(req.RunID, req.Arch)
 	}
 
-	log.Printf("Worker completed: %s %s-%s", req.RunID, req.Arch, req.Role)
+	slog.Info("worker completed",
+		"run_id", req.RunID,
+		"arch", req.Arch,
+		"role", req.Role)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -438,7 +453,10 @@ func (h *Handler) handleWorkerResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received %d results for %s %s", len(req.Results), req.RunID, req.Arch)
+	slog.Info("benchmark results received",
+		"run_id", req.RunID,
+		"arch", req.Arch,
+		"result_count", len(req.Results))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
