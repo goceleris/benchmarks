@@ -38,6 +38,9 @@ jobs:
     name: Run Benchmark
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    permissions:
+      contents: write
+      pull-requests: write
     if: |
       github.event_name == 'release' ||
       github.event_name == 'workflow_dispatch' ||
