@@ -97,8 +97,8 @@ Mappings:
     metal:
       arm64Server: c7g.metal
       arm64Client: c7g.4xlarge
-      x86Server: c5a.metal
-      x86Client: c5a.9xlarge
+      x86Server: c5d.metal
+      x86Client: c5d.9xlarge
   # Second alternative for even more capacity options
   InstanceTypesAlt2:
     fast:
