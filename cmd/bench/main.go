@@ -330,6 +330,13 @@ func main() {
 	completedBefore := len(checkpoint.Results)
 	skipped := 0
 
+	// Initialize C2 client total count
+	if c2 != nil {
+		c2.progressMu.Lock()
+		c2.totalCount = totalBenchmarks
+		c2.progressMu.Unlock()
+	}
+
 	for _, serverType := range servers {
 		select {
 		case <-ctx.Done():
@@ -410,6 +417,16 @@ func main() {
 			}
 
 			log.Printf("Running benchmark: %s on %s", bt.Name, serverType)
+
+			// Update C2 client progress
+			if c2 != nil {
+				currentBenchNum := len(checkpoint.Results) + 1
+				c2.progressMu.Lock()
+				c2.currentServer = serverType
+				c2.currentBench = bt.Name
+				c2.currentCount = currentBenchNum
+				c2.progressMu.Unlock()
+			}
 
 			cfg := bench.Config{
 				URL:         fmt.Sprintf("http://%s:%s%s", serverHost, *port, bt.Path),
@@ -1034,9 +1051,14 @@ func monitorSpotInterruption(ctx context.Context, interruptChan chan<- struct{})
 
 // C2Client handles communication with the C2 orchestration server
 type C2Client struct {
-	endpoint string
-	runID    string
-	arch     string
+	endpoint        string
+	runID           string
+	arch            string
+	currentServer   string // Currently benchmarking server (e.g., "gin-h1")
+	currentBench    string // Currently benchmarking type (e.g., "simple")
+	currentCount    int    // Current benchmark number (1-based)
+	totalCount      int    // Total number of benchmarks
+	progressMu      sync.RWMutex
 }
 
 // C2BenchResult is the result format expected by C2 (must match store.BenchResult)
@@ -1070,10 +1092,25 @@ func (c *C2Client) runHeartbeat(ctx context.Context) {
 func (c *C2Client) sendHeartbeat(ctx context.Context) {
 	url := fmt.Sprintf("%s/api/worker/heartbeat", c.endpoint)
 
-	payload := map[string]string{
+	c.progressMu.RLock()
+	currentServer := c.currentServer
+	currentBench := c.currentBench
+	currentCount := c.currentCount
+	totalCount := c.totalCount
+	c.progressMu.RUnlock()
+
+	payload := map[string]interface{}{
 		"run_id": c.runID,
 		"arch":   c.arch,
 		"role":   "client",
+	}
+
+	// Include progress info if available
+	if currentServer != "" && currentBench != "" {
+		payload["current_server"] = currentServer
+		payload["current_benchmark"] = currentBench
+		payload["current_count"] = currentCount
+		payload["total_count"] = totalCount
 	}
 
 	data, err := json.Marshal(payload)
