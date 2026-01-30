@@ -127,11 +127,6 @@ Resources:
               VolumeSize: 20
               VolumeType: gp3
               DeleteOnTermination: true
-        InstanceMarketOptions:
-          MarketType: spot
-          SpotOptions:
-            SpotInstanceType: one-time
-            InstanceInterruptionBehavior: terminate
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
@@ -221,11 +216,6 @@ Resources:
               VolumeSize: 20
               VolumeType: gp3
               DeleteOnTermination: true
-        InstanceMarketOptions:
-          MarketType: spot
-          SpotOptions:
-            SpotInstanceType: one-time
-            InstanceInterruptionBehavior: terminate
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
