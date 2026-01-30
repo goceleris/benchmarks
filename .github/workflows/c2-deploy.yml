@@ -98,52 +98,63 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
           echo "Found C2 instance: $INSTANCE_ID ($PUBLIC_IP)"
 
-      - name: Update C2 Binary via Reboot
+      - name: Update C2 Binary via Instance Replacement
+        id: replace
         run: |
-          echo "Rebooting C2 instance to pick up latest binary from GitHub releases..."
-          echo "Instance: ${{ steps.instance.outputs.instance_id }}"
+          echo "Terminating C2 instance to force fresh deployment with latest binary..."
+          echo "Old instance: ${{ steps.instance.outputs.instance_id }}"
 
-          # Reboot the instance - it will download the latest binary on startup
-          aws ec2 reboot-instances --instance-ids "${{ steps.instance.outputs.instance_id }}"
+          # Terminate the instance - ASG will launch a new one with fresh UserData
+          aws ec2 terminate-instances --instance-ids "${{ steps.instance.outputs.instance_id }}"
 
-          echo "Reboot initiated, waiting for instance to come back..."
-          sleep 30
+          echo "Instance terminated. Waiting for ASG to launch replacement..."
+          sleep 45
 
-          # Wait for instance to be running again
-          for i in {1..12}; do
-            STATE=$(aws ec2 describe-instances \
-              --instance-ids "${{ steps.instance.outputs.instance_id }}" \
-              --query 'Reservations[0].Instances[0].State.Name' \
-              --output text)
-            echo "Instance state: $STATE"
-            if [[ "$STATE" == "running" ]]; then
-              break
+          # Wait for new instance to be running
+          for i in {1..24}; do
+            RESULT=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=celeris-c2" "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].[InstanceId,PublicIpAddress]' \
+              --output text 2>/dev/null || echo "")
+
+            if [[ -n "$RESULT" && "$RESULT" != "None"* ]]; then
+              NEW_ID=$(echo "$RESULT" | awk '{print $1}')
+              NEW_IP=$(echo "$RESULT" | awk '{print $2}')
+              if [[ "$NEW_ID" != "${{ steps.instance.outputs.instance_id }}" ]]; then
+                echo "New instance launched: $NEW_ID ($NEW_IP)"
+                echo "new_ip=$NEW_IP" >> $GITHUB_OUTPUT
+                break
+              fi
             fi
-            sleep 10
+            echo "Attempt $i/24: waiting for new instance..."
+            sleep 15
           done
 
       - name: Verify C2 Health
         run: |
-          C2_IP="${{ steps.instance.outputs.public_ip }}"
-          echo "Waiting for C2 to be healthy at $C2_IP..."
+          # Get the Elastic IP (should be associated with new instance)
+          C2_IP=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=celeris-c2-eip" \
+            --query 'Addresses[0].PublicIp' --output text)
 
-          # Wait for C2 to start (it downloads binary and starts service)
-          for i in {1..18}; do
+          echo "Waiting for C2 to be healthy at $C2_IP (Elastic IP)..."
+
+          # Wait for C2 to start (downloads binary, mounts volume, starts service)
+          for i in {1..30}; do
             if curl -sf "http://$C2_IP:8080/health" > /dev/null 2>&1; then
               echo "C2 is healthy!"
-
-              # Show current queue status
               echo ""
               echo "## C2 Update Complete" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "Instance rebooted and C2 service is healthy." >> $GITHUB_STEP_SUMMARY
+              echo "New instance deployed and C2 service is healthy." >> $GITHUB_STEP_SUMMARY
+              echo "Elastic IP: $C2_IP" >> $GITHUB_STEP_SUMMARY
               exit 0
             fi
-            echo "Attempt $i/18: C2 not ready yet, waiting..."
+            echo "Attempt $i/30: C2 not ready yet, waiting..."
             sleep 10
           done
 
-          echo "::error::C2 health check failed after reboot"
+          echo "::error::C2 health check failed after deployment"
           exit 1
 
   destroy:
