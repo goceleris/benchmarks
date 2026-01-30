@@ -359,3 +359,26 @@ jobs:
           echo "**Status:** $(echo "$RESPONSE" | jq -r '.status // "unknown"')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Error:** $(echo "$RESPONSE" | jq -r '.error // "Benchmark did not complete successfully"')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cancel Benchmark on Workflow Cancellation
+        if: cancelled()
+        run: |
+          RUN_ID="${{ steps.start.outputs.run_id }}"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No run ID to cancel"
+            exit 0
+          fi
+
+          echo "Workflow cancelled - sending cancel request to C2 for run $RUN_ID..."
+
+          RESPONSE=$(curl -sf -X POST \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/cancel" || echo '{"error":"failed to cancel"}')
+
+          echo "Cancel response: $RESPONSE"
+
+          # Also add to summary
+          echo "## Benchmark Cancelled" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** $RUN_ID" >> $GITHUB_STEP_SUMMARY
+          echo "Benchmark was cancelled. Workers are being terminated." >> $GITHUB_STEP_SUMMARY
