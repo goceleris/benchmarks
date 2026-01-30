@@ -405,12 +405,15 @@ Resources:
             curl -sLO https://go.dev/dl/go1.23.4.linux-arm64.tar.gz
             tar -C /usr/local -xzf go1.23.4.linux-arm64.tar.gz
             export PATH=$PATH:/usr/local/go/bin
+            export HOME=/root
             export GOPATH=/root/go
             export GOMODCACHE=/root/go/pkg/mod
-            mkdir -p $GOPATH $GOMODCACHE
+            export GOCACHE=/root/.cache/go-build
+            mkdir -p $GOPATH $GOMODCACHE $GOCACHE
             echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
             echo 'export GOPATH=/root/go' >> /etc/profile
             echo 'export GOMODCACHE=/root/go/pkg/mod' >> /etc/profile
+            echo 'export GOCACHE=/root/.cache/go-build' >> /etc/profile
 
             # Clone and build C2
             cd /opt/celeris
