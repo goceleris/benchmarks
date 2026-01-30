@@ -197,7 +197,7 @@ func (c *Client) GetBestAZ(ctx context.Context, instanceType string) (*BidResult
 // AZCapacity holds capacity scores for an AZ.
 type AZCapacity struct {
 	AZ          string
-	Score       int    // 1-10, higher is better capacity
+	Score       int // 1-10, higher is better capacity
 	ServerPrice float64
 	ClientPrice float64
 	TotalPrice  float64
@@ -505,23 +505,6 @@ func (c *Client) getSpotPlacementScores(ctx context.Context, instanceTypes []str
 	}
 
 	return scores, nil
-}
-
-// getAZNames looks up AZ names from AZ IDs.
-func (c *Client) getAZNames(ctx context.Context) (map[string]string, error) {
-	result, err := c.ec2.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
-	if err != nil {
-		return nil, err
-	}
-
-	azMap := make(map[string]string)
-	for _, az := range result.AvailabilityZones {
-		if az.ZoneId != nil && az.ZoneName != nil {
-			azMap[*az.ZoneId] = *az.ZoneName
-		}
-	}
-
-	return azMap, nil
 }
 
 // GetPricesForAZ gets spot prices for a server+client pair in a specific AZ.
