@@ -65,6 +65,7 @@ Parameters:
     Description: Which servers to benchmark
 
 Mappings:
+  # Primary instance types
   InstanceTypes:
     fast:
       arm64Server: c6g.medium
@@ -81,31 +82,86 @@ Mappings:
       arm64Client: c6g.4xlarge
       x86Server: c5.metal
       x86Client: c5.9xlarge
+  # Alternative instance types for capacity diversification
+  InstanceTypesAlt1:
+    fast:
+      arm64Server: c7g.medium
+      arm64Client: t4g.micro
+      x86Server: c5a.large
+      x86Client: t3a.small
+    med:
+      arm64Server: c7g.2xlarge
+      arm64Client: c7g.xlarge
+      x86Server: c5a.2xlarge
+      x86Client: c5a.xlarge
+    metal:
+      arm64Server: c7g.metal
+      arm64Client: c7g.4xlarge
+      x86Server: c5a.metal
+      x86Client: c5a.9xlarge
+  # Second alternative for even more capacity options
+  InstanceTypesAlt2:
+    fast:
+      arm64Server: c6g.large
+      arm64Client: t4g.small
+      x86Server: c6i.large
+      x86Client: t2.small
+    med:
+      arm64Server: c6g.4xlarge
+      arm64Client: c6g.2xlarge
+      x86Server: c6i.2xlarge
+      x86Client: c6i.xlarge
+    metal:
+      arm64Server: c6g.16xlarge
+      arm64Client: c6g.8xlarge
+      x86Server: c5n.metal
+      x86Client: c5n.9xlarge
 
 Conditions:
   IsArm64: !Equals [!Ref Architecture, arm64]
 
 Resources:
-  # Server Instance (Spot)
+  # Server Instance (Spot with instance type diversification for capacity)
   ServerSpotRequest:
     Type: AWS::EC2::SpotFleet
     Properties:
       SpotFleetRequestConfigData:
         IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
         TargetCapacity: 1
+        AllocationStrategy: capacityOptimized
+        InstanceInterruptionBehavior: terminate
         TerminateInstancesWithExpiration: true
-        Type: request
+        Type: maintain
+        ExcessCapacityTerminationPolicy: default
+        ReplaceUnhealthyInstances: false
         LaunchTemplateConfigs:
           - LaunchTemplateSpecification:
               LaunchTemplateId: !Ref ServerLaunchTemplate
               Version: !GetAtt ServerLaunchTemplate.LatestVersionNumber
             Overrides:
+              # Primary instance type
               - AvailabilityZone: !Ref AvailabilityZone
                 SubnetId: !Ref SubnetId
                 InstanceType: !If
                   - IsArm64
                   - !FindInMap [InstanceTypes, !Ref Mode, arm64Server]
                   - !FindInMap [InstanceTypes, !Ref Mode, x86Server]
+                SpotPrice: !Ref SpotPrice
+              # Alternative 1 - different instance family for capacity diversification
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypesAlt1, !Ref Mode, arm64Server]
+                  - !FindInMap [InstanceTypesAlt1, !Ref Mode, x86Server]
+                SpotPrice: !Ref SpotPrice
+              # Alternative 2 - yet another option for maximum capacity availability
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypesAlt2, !Ref Mode, arm64Server]
+                  - !FindInMap [InstanceTypesAlt2, !Ref Mode, x86Server]
                 SpotPrice: !Ref SpotPrice
 
   ServerLaunchTemplate:
@@ -178,26 +234,47 @@ Resources:
               - Key: Architecture
                 Value: !Ref Architecture
 
-  # Client Instance (Spot)
+  # Client Instance (Spot with instance type diversification for capacity)
   ClientSpotRequest:
     Type: AWS::EC2::SpotFleet
     Properties:
       SpotFleetRequestConfigData:
         IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
         TargetCapacity: 1
+        AllocationStrategy: capacityOptimized
+        InstanceInterruptionBehavior: terminate
         TerminateInstancesWithExpiration: true
-        Type: request
+        Type: maintain
+        ExcessCapacityTerminationPolicy: default
+        ReplaceUnhealthyInstances: false
         LaunchTemplateConfigs:
           - LaunchTemplateSpecification:
               LaunchTemplateId: !Ref ClientLaunchTemplate
               Version: !GetAtt ClientLaunchTemplate.LatestVersionNumber
             Overrides:
+              # Primary instance type
               - AvailabilityZone: !Ref AvailabilityZone
                 SubnetId: !Ref SubnetId
                 InstanceType: !If
                   - IsArm64
                   - !FindInMap [InstanceTypes, !Ref Mode, arm64Client]
                   - !FindInMap [InstanceTypes, !Ref Mode, x86Client]
+                SpotPrice: !Ref SpotPrice
+              # Alternative 1 - different instance family for capacity diversification
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypesAlt1, !Ref Mode, arm64Client]
+                  - !FindInMap [InstanceTypesAlt1, !Ref Mode, x86Client]
+                SpotPrice: !Ref SpotPrice
+              # Alternative 2 - yet another option for maximum capacity availability
+              - AvailabilityZone: !Ref AvailabilityZone
+                SubnetId: !Ref SubnetId
+                InstanceType: !If
+                  - IsArm64
+                  - !FindInMap [InstanceTypesAlt2, !Ref Mode, arm64Client]
+                  - !FindInMap [InstanceTypesAlt2, !Ref Mode, x86Client]
                 SpotPrice: !Ref SpotPrice
 
   ClientLaunchTemplate:
