@@ -4,8 +4,8 @@ Description: Celeris Benchmark C2 (Command & Control) Server - Always-on orchest
 Parameters:
   InstanceType:
     Type: String
-    Default: t4g.small
-    Description: C2 server instance type (t4g.small has 2GB RAM for Go builds)
+    Default: t4g.nano
+    Description: C2 server instance type (t4g.nano is ~$3/month)
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
@@ -401,24 +401,11 @@ Resources:
             # Create directories
             mkdir -p $DATA_DIR/badger $DATA_DIR/logs /opt/celeris
 
-            # Install Go
-            curl -sLO https://go.dev/dl/go1.23.4.linux-arm64.tar.gz
-            tar -C /usr/local -xzf go1.23.4.linux-arm64.tar.gz
-            export PATH=$PATH:/usr/local/go/bin
-            export HOME=/root
-            export GOPATH=/root/go
-            export GOMODCACHE=/root/go/pkg/mod
-            export GOCACHE=/root/.cache/go-build
-            mkdir -p $GOPATH $GOMODCACHE $GOCACHE
-            echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-            echo 'export GOPATH=/root/go' >> /etc/profile
-            echo 'export GOMODCACHE=/root/go/pkg/mod' >> /etc/profile
-            echo 'export GOCACHE=/root/.cache/go-build' >> /etc/profile
-
-            # Clone and build C2
-            cd /opt/celeris
-            git clone https://github.com/goceleris/benchmarks.git .
-            go build -o /usr/local/bin/c2 ./cmd/c2
+            # Download pre-built C2 binary from GitHub releases
+            echo "Downloading C2 binary from GitHub releases..."
+            curl -sL -o /usr/local/bin/c2 \
+              "https://github.com/goceleris/benchmarks/releases/download/latest/c2-linux-arm64"
+            chmod +x /usr/local/bin/c2
 
             # Get secrets from SSM
             GITHUB_TOKEN=$(aws ssm get-parameter --name /celeris/github-token --with-decryption --query 'Parameter.Value' --output text --region ${AWS::Region} || echo "")

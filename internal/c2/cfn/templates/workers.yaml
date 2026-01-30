@@ -146,25 +146,15 @@ Resources:
 
             # Install dependencies
             apt-get update -qq
-            apt-get install -y -qq curl jq git build-essential
+            apt-get install -y -qq curl jq
 
-            # Install Go
-            GO_ARCH="${Architecture}"
-            if [ "$GO_ARCH" = "x86" ]; then GO_ARCH="amd64"; fi
-            curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
-            tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
-            export PATH=$PATH:/usr/local/go/bin
-            export HOME=/root
-            export GOPATH=/root/go
-            export GOMODCACHE=/root/go/pkg/mod
-            export GOCACHE=/root/.cache/go-build
-            mkdir -p $GOPATH $GOMODCACHE $GOCACHE
-
-            # Clone and build
-            cd /opt
-            git clone https://github.com/${GitHubRepo}.git benchmarks
-            cd benchmarks
-            go build -o /usr/local/bin/server ./cmd/server
+            # Download pre-built server binary from GitHub releases
+            ARCH="${Architecture}"
+            if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
+            echo "Downloading server binary for $ARCH..."
+            curl -sL -o /usr/local/bin/server \
+              "https://github.com/${GitHubRepo}/releases/download/latest/server-linux-$ARCH"
+            chmod +x /usr/local/bin/server
 
             # Register with C2
             curl -sf -X POST "${C2Endpoint}/api/worker/register" \
@@ -250,25 +240,15 @@ Resources:
 
             # Install dependencies
             apt-get update -qq
-            apt-get install -y -qq curl jq git build-essential
+            apt-get install -y -qq curl jq
 
-            # Install Go
-            GO_ARCH="${Architecture}"
-            if [ "$GO_ARCH" = "x86" ]; then GO_ARCH="amd64"; fi
-            curl -sLO "https://go.dev/dl/go1.23.4.linux-$GO_ARCH.tar.gz"
-            tar -C /usr/local -xzf "go1.23.4.linux-$GO_ARCH.tar.gz"
-            export PATH=$PATH:/usr/local/go/bin
-            export HOME=/root
-            export GOPATH=/root/go
-            export GOMODCACHE=/root/go/pkg/mod
-            export GOCACHE=/root/.cache/go-build
-            mkdir -p $GOPATH $GOMODCACHE $GOCACHE
-
-            # Clone and build
-            cd /opt
-            git clone https://github.com/${GitHubRepo}.git benchmarks
-            cd benchmarks
-            go build -o /usr/local/bin/bench ./cmd/bench
+            # Download pre-built bench binary from GitHub releases
+            ARCH="${Architecture}"
+            if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
+            echo "Downloading bench binary for $ARCH..."
+            curl -sL -o /usr/local/bin/bench \
+              "https://github.com/${GitHubRepo}/releases/download/latest/bench-linux-$ARCH"
+            chmod +x /usr/local/bin/bench
 
             # Register with C2
             curl -sf -X POST "${C2Endpoint}/api/worker/register" \
