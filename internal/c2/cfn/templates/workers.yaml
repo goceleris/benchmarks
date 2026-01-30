@@ -103,7 +103,7 @@ Mappings:
   InstanceTypesAlt2:
     fast:
       arm64Server: c6g.large
-      arm64Client: t4g.small
+      arm64Client: t4g.medium
       x86Server: c6i.large
       x86Client: t2.small
     med:
@@ -112,7 +112,7 @@ Mappings:
       x86Server: c6i.2xlarge
       x86Client: c6i.xlarge
     metal:
-      arm64Server: c6g.16xlarge
+      arm64Server: m7g.metal
       arm64Client: c6g.8xlarge
       x86Server: c5n.metal
       x86Client: c5n.9xlarge
