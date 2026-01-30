@@ -94,6 +94,17 @@ func (l *Loader) Load(ctx context.Context) (*Config, error) {
 		}
 	}
 
+	// Get VPC ID from security group if not already set
+	if cfg.VpcID == "" && cfg.SecurityGroupID != "" {
+		sgResult, err := l.ec2.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
+			GroupIds: []string{cfg.SecurityGroupID},
+		})
+		if err == nil && len(sgResult.SecurityGroups) > 0 && sgResult.SecurityGroups[0].VpcId != nil {
+			cfg.VpcID = *sgResult.SecurityGroups[0].VpcId
+			log.Printf("Discovered VPC ID from security group: %s", cfg.VpcID)
+		}
+	}
+
 	// Discover C2 endpoint if not set
 	if cfg.C2Endpoint == "" {
 		endpoint, err := l.discoverC2Endpoint(ctx)
