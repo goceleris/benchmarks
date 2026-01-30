@@ -68,9 +68,6 @@ jobs:
     if: inputs.action == 'update'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -78,7 +75,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get C2 Instance ID
+      - name: Get C2 Instance
         id: instance
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
@@ -92,70 +89,62 @@ jobs:
             exit 1
           fi
 
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "Found C2 instance: $INSTANCE_ID"
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "Found C2 instance: $INSTANCE_ID ($PUBLIC_IP)"
 
-      - name: Update C2 Binary
+      - name: Update C2 Binary via Reboot
         run: |
-          echo "Updating C2 binary on ${{ steps.instance.outputs.instance_id }}..."
+          echo "Rebooting C2 instance to pick up latest binary from GitHub releases..."
+          echo "Instance: ${{ steps.instance.outputs.instance_id }}"
 
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "cd /opt/celeris",
-              "git fetch origin main",
-              "git reset --hard origin/main",
-              "export PATH=$PATH:/usr/local/go/bin",
-              "go build -o /usr/local/bin/c2 ./cmd/c2",
-              "systemctl restart c2",
-              "sleep 5",
-              "systemctl status c2"
-            ]' \
-            --output text --query 'Command.CommandId')
+          # Reboot the instance - it will download the latest binary on startup
+          aws ec2 reboot-instances --instance-ids "${{ steps.instance.outputs.instance_id }}"
 
-          echo "SSM Command ID: $COMMAND_ID"
+          echo "Reboot initiated, waiting for instance to come back..."
+          sleep 30
 
-          # Wait for command to complete
+          # Wait for instance to be running again
           for i in {1..12}; do
-            sleep 10
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "${{ steps.instance.outputs.instance_id }}" \
-              --query 'Status' --output text 2>/dev/null || echo "Pending")
-            echo "Command status: $STATUS"
-            if [[ "$STATUS" == "Success" ]]; then
-              echo "C2 update completed successfully"
+            STATE=$(aws ec2 describe-instances \
+              --instance-ids "${{ steps.instance.outputs.instance_id }}" \
+              --query 'Reservations[0].Instances[0].State.Name' \
+              --output text)
+            echo "Instance state: $STATE"
+            if [[ "$STATE" == "running" ]]; then
               break
-            elif [[ "$STATUS" == "Failed" ]]; then
-              echo "::error::C2 update failed"
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "${{ steps.instance.outputs.instance_id }}" \
-                --query 'StandardErrorContent' --output text
-              exit 1
             fi
+            sleep 10
           done
 
       - name: Verify C2 Health
         run: |
-          C2_IP=$(aws ec2 describe-instances \
-            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
+          C2_IP="${{ steps.instance.outputs.public_ip }}"
+          echo "Waiting for C2 to be healthy at $C2_IP..."
 
-          echo "Checking C2 health at $C2_IP..."
-
-          for i in {1..6}; do
-            if curl -sf "http://$C2_IP:8080/health" > /dev/null; then
+          # Wait for C2 to start (it downloads binary and starts service)
+          for i in {1..18}; do
+            if curl -sf "http://$C2_IP:8080/health" > /dev/null 2>&1; then
               echo "C2 is healthy!"
+
+              # Show current queue status
+              echo ""
+              echo "## C2 Update Complete" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Instance rebooted and C2 service is healthy." >> $GITHUB_STEP_SUMMARY
               exit 0
             fi
-            echo "Waiting for C2 to be ready..."
+            echo "Attempt $i/18: C2 not ready yet, waiting..."
             sleep 10
           done
 
-          echo "::warning::C2 health check failed (may still be starting)"
+          echo "::error::C2 health check failed after reboot"
+          exit 1
 
   destroy:
     name: Destroy C2 Infrastructure
