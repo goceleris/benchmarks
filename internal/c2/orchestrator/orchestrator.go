@@ -29,8 +29,8 @@ const (
 // Default durations per mode
 var DefaultDurations = map[string]string{
 	"fast":  "10s",
-	"med":   "30s",
-	"metal": "60s",
+	"med":   "20s",
+	"metal": "30s",
 }
 
 // Concurrent run limits per mode
