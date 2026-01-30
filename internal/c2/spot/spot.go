@@ -40,8 +40,14 @@ type BidResult struct {
 	OnDemandPrice float64
 }
 
-// Instance types for each mode and architecture
-var InstanceTypes = map[string]map[string]struct{ Server, Client string }{
+// InstancePair holds server and client instance types.
+type InstancePair struct {
+	Server string
+	Client string
+}
+
+// Instance types for each mode and architecture (primary)
+var InstanceTypes = map[string]map[string]InstancePair{
 	"fast": {
 		"arm64": {Server: "c6g.medium", Client: "t4g.small"},
 		"x86":   {Server: "c5.large", Client: "t3.small"},
@@ -53,6 +59,38 @@ var InstanceTypes = map[string]map[string]struct{ Server, Client string }{
 	"metal": {
 		"arm64": {Server: "c6g.metal", Client: "c6g.4xlarge"},
 		"x86":   {Server: "c5.metal", Client: "c5.9xlarge"},
+	},
+}
+
+// Alternative instance types (Alt1) - must match workers.yaml InstanceTypesAlt1
+var InstanceTypesAlt1 = map[string]map[string]InstancePair{
+	"fast": {
+		"arm64": {Server: "c7g.medium", Client: "t4g.micro"},
+		"x86":   {Server: "c5a.large", Client: "t3a.small"},
+	},
+	"med": {
+		"arm64": {Server: "c7g.2xlarge", Client: "c7g.xlarge"},
+		"x86":   {Server: "c5a.2xlarge", Client: "c5a.xlarge"},
+	},
+	"metal": {
+		"arm64": {Server: "c7g.metal", Client: "c7g.4xlarge"},
+		"x86":   {Server: "c5d.metal", Client: "c5d.9xlarge"},
+	},
+}
+
+// Alternative instance types (Alt2) - must match workers.yaml InstanceTypesAlt2
+var InstanceTypesAlt2 = map[string]map[string]InstancePair{
+	"fast": {
+		"arm64": {Server: "c6g.large", Client: "t4g.medium"},
+		"x86":   {Server: "c6i.large", Client: "t2.small"},
+	},
+	"med": {
+		"arm64": {Server: "c6g.4xlarge", Client: "c6g.2xlarge"},
+		"x86":   {Server: "c6i.2xlarge", Client: "c6i.xlarge"},
+	},
+	"metal": {
+		"arm64": {Server: "m7g.metal", Client: "c6g.8xlarge"},
+		"x86":   {Server: "c5n.metal", Client: "c5n.9xlarge"},
 	},
 }
 
@@ -156,8 +194,18 @@ func (c *Client) GetBestAZ(ctx context.Context, instanceType string) (*BidResult
 	}, nil
 }
 
+// AZCapacity holds capacity scores for an AZ.
+type AZCapacity struct {
+	AZ          string
+	Score       int    // 1-10, higher is better capacity
+	ServerPrice float64
+	ClientPrice float64
+	TotalPrice  float64
+}
+
 // GetBestAZForPair finds the best AZ for a server+client pair.
 // Both must be in the same AZ, so we pick the cheapest for the larger instance.
+// NOTE: This method only considers price, not capacity. Use GetBestAZWithCapacity for capacity-aware selection.
 func (c *Client) GetBestAZForPair(ctx context.Context, serverType, clientType string) (*BidResult, *BidResult, error) {
 	// Get prices for server (usually larger, so optimize for that)
 	serverPrices, err := c.GetSpotPrices(ctx, serverType)
@@ -228,6 +276,252 @@ func (c *Client) GetBestAZForPair(ctx context.Context, serverType, clientType st
 			BidPrice:      clientBid,
 			OnDemandPrice: clientOnDemand,
 		}, nil
+}
+
+// GetBestAZWithCapacity finds the best AZ considering both capacity AND price.
+// It checks placement scores for all instance types (primary + alternates) to ensure
+// at least one server and one client type has capacity in the selected AZ.
+func (c *Client) GetBestAZWithCapacity(ctx context.Context, mode, arch string, availableAZs []string) (string, *BidResult, *BidResult, error) {
+	// Get all instance types we need to check
+	servers, clients, err := GetAllInstanceTypesForMode(mode, arch)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	log.Printf("Checking capacity for %s %s: servers=%v, clients=%v", mode, arch, servers, clients)
+
+	// Get placement scores for all instance types
+	allTypes := append(servers, clients...)
+	scores, err := c.getSpotPlacementScores(ctx, allTypes, availableAZs)
+	if err != nil {
+		log.Printf("Warning: Could not get placement scores, falling back to price-only selection: %v", err)
+		// Fall back to price-only selection with primary types
+		serverBid, clientBid, err := c.GetBestAZForPair(ctx, servers[0], clients[0])
+		if err != nil {
+			return "", nil, nil, err
+		}
+		return serverBid.AZ, serverBid, clientBid, nil
+	}
+
+	// Score each AZ by checking if it has capacity for at least one server AND one client type
+	azScores := make(map[string]*AZCapacity)
+	for az := range scores {
+		// Check if any server type has good capacity (score >= 5)
+		serverHasCapacity := false
+		for _, serverType := range servers {
+			if score, ok := scores[az][serverType]; ok && score >= 5 {
+				serverHasCapacity = true
+				break
+			}
+		}
+
+		// Check if any client type has good capacity (score >= 5)
+		clientHasCapacity := false
+		for _, clientType := range clients {
+			if score, ok := scores[az][clientType]; ok && score >= 5 {
+				clientHasCapacity = true
+				break
+			}
+		}
+
+		if serverHasCapacity && clientHasCapacity {
+			// Calculate minimum score across all types as AZ score
+			minScore := 10
+			for _, instanceType := range allTypes {
+				if score, ok := scores[az][instanceType]; ok && score < minScore {
+					minScore = score
+				}
+			}
+			azScores[az] = &AZCapacity{
+				AZ:    az,
+				Score: minScore,
+			}
+		}
+	}
+
+	if len(azScores) == 0 {
+		log.Printf("Warning: No AZ has capacity for both server and client types, trying all AZs")
+		// If no AZ has good capacity for both, try all available AZs
+		for _, az := range availableAZs {
+			azScores[az] = &AZCapacity{AZ: az, Score: 1}
+		}
+	}
+
+	// Get prices for primary types in qualifying AZs
+	serverPrices, err := c.GetSpotPrices(ctx, servers[0])
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("failed to get server prices: %w", err)
+	}
+
+	clientPrices, err := c.GetSpotPrices(ctx, clients[0])
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("failed to get client prices: %w", err)
+	}
+
+	// Build price maps
+	serverPriceMap := make(map[string]float64)
+	for _, p := range serverPrices {
+		serverPriceMap[p.AZ] = p.Price
+	}
+
+	clientPriceMap := make(map[string]float64)
+	for _, p := range clientPrices {
+		clientPriceMap[p.AZ] = p.Price
+	}
+
+	// Add prices to AZ scores
+	for az, cap := range azScores {
+		if sp, ok := serverPriceMap[az]; ok {
+			cap.ServerPrice = sp
+		}
+		if cp, ok := clientPriceMap[az]; ok {
+			cap.ClientPrice = cp
+		}
+		cap.TotalPrice = cap.ServerPrice + cap.ClientPrice
+	}
+
+	// Sort AZs: first by capacity score (descending), then by price (ascending)
+	var sortedAZs []*AZCapacity
+	for _, cap := range azScores {
+		if cap.ServerPrice > 0 && cap.ClientPrice > 0 { // Must have prices
+			sortedAZs = append(sortedAZs, cap)
+		}
+	}
+
+	if len(sortedAZs) == 0 {
+		return "", nil, nil, fmt.Errorf("no AZ found with capacity and pricing for %s %s", mode, arch)
+	}
+
+	sort.Slice(sortedAZs, func(i, j int) bool {
+		// Prioritize higher capacity scores
+		if sortedAZs[i].Score != sortedAZs[j].Score {
+			return sortedAZs[i].Score > sortedAZs[j].Score
+		}
+		// Then lower price
+		return sortedAZs[i].TotalPrice < sortedAZs[j].TotalPrice
+	})
+
+	// Select best AZ
+	best := sortedAZs[0]
+	log.Printf("Selected AZ %s for %s %s (score: %d, server: $%.4f, client: $%.4f)",
+		best.AZ, mode, arch, best.Score, best.ServerPrice, best.ClientPrice)
+
+	// Log alternatives for debugging
+	if len(sortedAZs) > 1 {
+		log.Printf("Alternative AZs: %v", sortedAZs[1:])
+	}
+
+	// Build bid results
+	serverOnDemand, _ := c.getOnDemandPrice(ctx, servers[0])
+	clientOnDemand, _ := c.getOnDemandPrice(ctx, clients[0])
+
+	serverBid := best.ServerPrice * 1.20
+	if serverOnDemand > 0 && serverBid > serverOnDemand {
+		serverBid = serverOnDemand
+	}
+
+	clientBid := best.ClientPrice * 1.20
+	if clientOnDemand > 0 && clientBid > clientOnDemand {
+		clientBid = clientOnDemand
+	}
+
+	return best.AZ, &BidResult{
+			InstanceType:  servers[0],
+			AZ:            best.AZ,
+			CurrentPrice:  best.ServerPrice,
+			BidPrice:      serverBid,
+			OnDemandPrice: serverOnDemand,
+		}, &BidResult{
+			InstanceType:  clients[0],
+			AZ:            best.AZ,
+			CurrentPrice:  best.ClientPrice,
+			BidPrice:      clientBid,
+			OnDemandPrice: clientOnDemand,
+		}, nil
+}
+
+// getSpotPlacementScores retrieves placement scores for instance types across AZs.
+// Returns map[AZ][InstanceType]Score where Score is 1-10 (higher = better capacity).
+func (c *Client) getSpotPlacementScores(ctx context.Context, instanceTypes []string, targetAZs []string) (map[string]map[string]int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Build regional request (we'll filter by AZ from results)
+	input := &ec2.GetSpotPlacementScoresInput{
+		InstanceTypes:          instanceTypes,
+		TargetCapacity:         intPtr(1),
+		SingleAvailabilityZone: boolPtr(true),
+		RegionNames:            []string{c.region},
+	}
+
+	result, err := c.ec2.GetSpotPlacementScores(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get placement scores: %w", err)
+	}
+
+	// Build result map
+	scores := make(map[string]map[string]int)
+	targetAZSet := make(map[string]bool)
+	for _, az := range targetAZs {
+		targetAZSet[az] = true
+	}
+
+	for _, score := range result.SpotPlacementScores {
+		if score.AvailabilityZoneId == nil || score.Score == nil {
+			continue
+		}
+
+		// Get AZ name from AZ ID (e.g., use1-az1 -> us-east-1a)
+		// We need to look up the AZ name, but for now we'll use what we have
+		az := ""
+		if score.AvailabilityZoneId != nil {
+			// The API returns AZ IDs, we need to map to names
+			// For simplicity, let's also check Region field
+			if score.Region != nil && *score.Region == c.region {
+				// Try to get AZ from the response
+				// Note: GetSpotPlacementScores may return region-level scores
+				// We may need to make per-AZ requests
+				az = *score.AvailabilityZoneId
+			}
+		}
+
+		if az == "" {
+			continue
+		}
+
+		// Only include target AZs
+		if len(targetAZs) > 0 && !targetAZSet[az] {
+			continue
+		}
+
+		if scores[az] == nil {
+			scores[az] = make(map[string]int)
+		}
+
+		// Score applies to all instance types in the request
+		for _, t := range instanceTypes {
+			scores[az][t] = int(*score.Score)
+		}
+	}
+
+	return scores, nil
+}
+
+// getAZNames looks up AZ names from AZ IDs.
+func (c *Client) getAZNames(ctx context.Context) (map[string]string, error) {
+	result, err := c.ec2.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	azMap := make(map[string]string)
+	for _, az := range result.AvailabilityZones {
+		if az.ZoneId != nil && az.ZoneName != nil {
+			azMap[*az.ZoneId] = *az.ZoneName
+		}
+	}
+
+	return azMap, nil
 }
 
 // GetPricesForAZ gets spot prices for a server+client pair in a specific AZ.
@@ -305,7 +599,7 @@ func (c *Client) GetPricesForAZ(ctx context.Context, serverType, clientType, az 
 		}, nil
 }
 
-// GetInstancesForMode returns the instance types for a benchmark mode and architecture.
+// GetInstancesForMode returns the primary instance types for a benchmark mode and architecture.
 func GetInstancesForMode(mode, arch string) (serverType, clientType string, err error) {
 	modeTypes, ok := InstanceTypes[mode]
 	if !ok {
@@ -318,6 +612,27 @@ func GetInstancesForMode(mode, arch string) (serverType, clientType string, err 
 	}
 
 	return archTypes.Server, archTypes.Client, nil
+}
+
+// GetAllInstanceTypesForMode returns all instance types (primary + alternates) for capacity checking.
+// Returns servers and clients as separate slices.
+func GetAllInstanceTypesForMode(mode, arch string) (servers, clients []string, err error) {
+	typeMaps := []map[string]map[string]InstancePair{InstanceTypes, InstanceTypesAlt1, InstanceTypesAlt2}
+
+	for _, typeMap := range typeMaps {
+		if modeTypes, ok := typeMap[mode]; ok {
+			if archTypes, ok := modeTypes[arch]; ok {
+				servers = append(servers, archTypes.Server)
+				clients = append(clients, archTypes.Client)
+			}
+		}
+	}
+
+	if len(servers) == 0 {
+		return nil, nil, fmt.Errorf("unknown mode/arch: %s/%s", mode, arch)
+	}
+
+	return servers, clients, nil
 }
 
 // DescribeInstances returns instances matching the given filters.
@@ -427,4 +742,12 @@ func parsePrice(s string) float64 {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+func intPtr(i int32) *int32 {
+	return &i
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }

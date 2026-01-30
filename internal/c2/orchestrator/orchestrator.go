@@ -248,42 +248,25 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch, benchMode string) error {
 	log.Printf("Starting %s benchmarks for run %s", arch, run.ID)
 
-	// Get instance types for this mode and arch
-	serverType, clientType, err := spot.GetInstancesForMode(run.Mode, arch)
-	if err != nil {
-		return err
+	// Get available AZs from our subnet configuration
+	var availableAZs []string
+	for az := range o.config.SubnetsByAZ {
+		availableAZs = append(availableAZs, az)
 	}
 
-	// Find the best AZ for spot pricing
-	serverBid, clientBid, err := o.config.Spot.GetBestAZForPair(ctx, serverType, clientType)
-	if err != nil {
-		return fmt.Errorf("failed to get spot pricing: %w", err)
+	if len(availableAZs) == 0 {
+		return fmt.Errorf("no subnets available")
 	}
 
-	bestAZ := serverBid.AZ
+	// Find the best AZ considering both capacity AND price
+	bestAZ, serverBid, clientBid, err := o.config.Spot.GetBestAZWithCapacity(ctx, run.Mode, arch, availableAZs)
+	if err != nil {
+		return fmt.Errorf("failed to find AZ with capacity: %w", err)
+	}
+
 	subnetID := o.config.SubnetsByAZ[bestAZ]
-
-	// Check if we have a subnet in the best AZ, otherwise fall back
 	if subnetID == "" {
-		// Find the best AZ among available subnets
-		var fallbackAZ string
-		var fallbackSubnet string
-		for az, sid := range o.config.SubnetsByAZ {
-			fallbackAZ = az
-			fallbackSubnet = sid
-			break
-		}
-		if fallbackSubnet == "" {
-			return fmt.Errorf("no subnets available")
-		}
-		log.Printf("%s: Best AZ %s has no subnet, falling back to %s", arch, bestAZ, fallbackAZ)
-		bestAZ = fallbackAZ
-		subnetID = fallbackSubnet
-		// Re-get prices for the fallback AZ
-		serverBid, clientBid, err = o.config.Spot.GetPricesForAZ(ctx, serverType, clientType, bestAZ)
-		if err != nil {
-			return fmt.Errorf("failed to get spot pricing for fallback AZ: %w", err)
-		}
+		return fmt.Errorf("no subnet found for selected AZ %s", bestAZ)
 	}
 
 	log.Printf("%s: Using subnet %s in AZ %s (server: $%.4f, client: $%.4f)",
