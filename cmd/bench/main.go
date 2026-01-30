@@ -1051,14 +1051,14 @@ func monitorSpotInterruption(ctx context.Context, interruptChan chan<- struct{})
 
 // C2Client handles communication with the C2 orchestration server
 type C2Client struct {
-	endpoint        string
-	runID           string
-	arch            string
-	currentServer   string // Currently benchmarking server (e.g., "gin-h1")
-	currentBench    string // Currently benchmarking type (e.g., "simple")
-	currentCount    int    // Current benchmark number (1-based)
-	totalCount      int    // Total number of benchmarks
-	progressMu      sync.RWMutex
+	endpoint      string
+	runID         string
+	arch          string
+	currentServer string // Currently benchmarking server (e.g., "gin-h1")
+	currentBench  string // Currently benchmarking type (e.g., "simple")
+	currentCount  int    // Current benchmark number (1-based)
+	totalCount    int    // Total number of benchmarks
+	progressMu    sync.RWMutex
 }
 
 // C2BenchResult is the result format expected by C2 (must match store.BenchResult)
