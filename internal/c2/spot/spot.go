@@ -180,7 +180,7 @@ func (c *Client) GetBestAZ(ctx context.Context, instanceType string) (*BidResult
 
 	// Bid 20% above current spot price, capped at on-demand
 	bestPrice := prices[0]
-	bidPrice := bestPrice.Price * 1.20
+	bidPrice := bestPrice.Price * 1.50
 	if bidPrice > onDemandPrice {
 		bidPrice = onDemandPrice
 	}
@@ -253,12 +253,12 @@ func (c *Client) GetBestAZForPair(ctx context.Context, serverType, clientType st
 	serverOnDemand, _ := c.getOnDemandPrice(ctx, serverType)
 	clientOnDemand, _ := c.getOnDemandPrice(ctx, clientType)
 
-	serverBid := bestServerPrice * 1.20
+	serverBid := bestServerPrice * 1.50
 	if serverOnDemand > 0 && serverBid > serverOnDemand {
 		serverBid = serverOnDemand
 	}
 
-	clientBid := bestClientPrice * 1.20
+	clientBid := bestClientPrice * 1.50
 	if clientOnDemand > 0 && clientBid > clientOnDemand {
 		clientBid = clientOnDemand
 	}
@@ -415,12 +415,12 @@ func (c *Client) GetBestAZWithCapacity(ctx context.Context, mode, arch string, a
 	serverOnDemand, _ := c.getOnDemandPrice(ctx, servers[0])
 	clientOnDemand, _ := c.getOnDemandPrice(ctx, clients[0])
 
-	serverBid := best.ServerPrice * 1.20
+	serverBid := best.ServerPrice * 1.50
 	if serverOnDemand > 0 && serverBid > serverOnDemand {
 		serverBid = serverOnDemand
 	}
 
-	clientBid := best.ClientPrice * 1.20
+	clientBid := best.ClientPrice * 1.50
 	if clientOnDemand > 0 && clientBid > clientOnDemand {
 		clientBid = clientOnDemand
 	}
@@ -441,12 +441,18 @@ func (c *Client) GetBestAZWithCapacity(ctx context.Context, mode, arch string, a
 }
 
 // getSpotPlacementScores retrieves placement scores for instance types across AZs.
-// Returns map[AZ][InstanceType]Score where Score is 1-10 (higher = better capacity).
+// Returns map[AZName][InstanceType]Score where Score is 1-10 (higher = better capacity).
 func (c *Client) getSpotPlacementScores(ctx context.Context, instanceTypes []string, targetAZs []string) (map[string]map[string]int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Build regional request (we'll filter by AZ from results)
+	// First, get AZ ID to name mapping (API returns IDs like use1-az1, we need names like us-east-1a)
+	azIDToName, err := c.getAZIDToNameMap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get AZ mapping: %w", err)
+	}
+
+	// Build regional request
 	input := &ec2.GetSpotPlacementScoresInput{
 		InstanceTypes:          instanceTypes,
 		TargetCapacity:         intPtr(1),
@@ -459,52 +465,63 @@ func (c *Client) getSpotPlacementScores(ctx context.Context, instanceTypes []str
 		return nil, fmt.Errorf("failed to get placement scores: %w", err)
 	}
 
-	// Build result map
-	scores := make(map[string]map[string]int)
+	// Build target AZ set for filtering
 	targetAZSet := make(map[string]bool)
 	for _, az := range targetAZs {
 		targetAZSet[az] = true
 	}
+
+	// Build result map using AZ names (not IDs)
+	scores := make(map[string]map[string]int)
 
 	for _, score := range result.SpotPlacementScores {
 		if score.AvailabilityZoneId == nil || score.Score == nil {
 			continue
 		}
 
-		// Get AZ name from AZ ID (e.g., use1-az1 -> us-east-1a)
-		// We need to look up the AZ name, but for now we'll use what we have
-		az := ""
-		if score.AvailabilityZoneId != nil {
-			// The API returns AZ IDs, we need to map to names
-			// For simplicity, let's also check Region field
-			if score.Region != nil && *score.Region == c.region {
-				// Try to get AZ from the response
-				// Note: GetSpotPlacementScores may return region-level scores
-				// We may need to make per-AZ requests
-				az = *score.AvailabilityZoneId
-			}
-		}
-
-		if az == "" {
+		// Convert AZ ID to AZ name (e.g., use1-az1 -> us-east-1a)
+		azID := *score.AvailabilityZoneId
+		azName, ok := azIDToName[azID]
+		if !ok {
+			log.Printf("Warning: Unknown AZ ID %s, skipping", azID)
 			continue
 		}
 
 		// Only include target AZs
-		if len(targetAZs) > 0 && !targetAZSet[az] {
+		if len(targetAZs) > 0 && !targetAZSet[azName] {
 			continue
 		}
 
-		if scores[az] == nil {
-			scores[az] = make(map[string]int)
+		if scores[azName] == nil {
+			scores[azName] = make(map[string]int)
 		}
 
 		// Score applies to all instance types in the request
 		for _, t := range instanceTypes {
-			scores[az][t] = int(*score.Score)
+			scores[azName][t] = int(*score.Score)
 		}
+
+		log.Printf("Placement score for %s: %d (types: %v)", azName, *score.Score, instanceTypes)
 	}
 
 	return scores, nil
+}
+
+// getAZIDToNameMap returns a mapping of AZ IDs to AZ names.
+func (c *Client) getAZIDToNameMap(ctx context.Context) (map[string]string, error) {
+	result, err := c.ec2.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	azMap := make(map[string]string)
+	for _, az := range result.AvailabilityZones {
+		if az.ZoneId != nil && az.ZoneName != nil {
+			azMap[*az.ZoneId] = *az.ZoneName
+		}
+	}
+
+	return azMap, nil
 }
 
 // GetPricesForAZ gets spot prices for a server+client pair in a specific AZ.
@@ -557,12 +574,12 @@ func (c *Client) GetPricesForAZ(ctx context.Context, serverType, clientType, az 
 	}
 
 	// Calculate bids (20% above current, capped at on-demand)
-	serverBid := serverPrice * 1.20
+	serverBid := serverPrice * 1.50
 	if serverOnDemand > 0 && serverBid > serverOnDemand {
 		serverBid = serverOnDemand
 	}
 
-	clientBid := clientPrice * 1.20
+	clientBid := clientPrice * 1.50
 	if clientOnDemand > 0 && clientBid > clientOnDemand {
 		clientBid = clientOnDemand
 	}
