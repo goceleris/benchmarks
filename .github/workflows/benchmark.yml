@@ -103,6 +103,7 @@ jobs:
           POLL_INTERVAL=30
           MAX_WAIT=14400  # 4 hours
           ELAPSED=0
+          LAST_QUEUE_POS=0
 
           while [ $ELAPSED -lt $MAX_WAIT ]; do
             RESPONSE=$(curl -sf \
@@ -110,7 +111,6 @@ jobs:
               "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{"status":"unknown"}')
 
             STATUS=$(echo "$RESPONSE" | jq -r '.status')
-            echo "[$((ELAPSED/60))m] Status: $STATUS"
 
             case $STATUS in
               completed)
@@ -122,15 +122,24 @@ jobs:
                 echo "::error::Benchmark failed: $ERROR"
                 exit 1
                 ;;
+              queued)
+                # Show queue position
+                QUEUE_POS=$(echo "$RESPONSE" | jq -r '.queue_position // 0')
+                if [[ "$QUEUE_POS" != "$LAST_QUEUE_POS" ]]; then
+                  echo "[$((ELAPSED/60))m] Queued - position $QUEUE_POS (waiting for capacity)"
+                  LAST_QUEUE_POS=$QUEUE_POS
+                fi
+                ;;
               pending|running)
                 # Show progress
+                echo "[$((ELAPSED/60))m] Status: $STATUS"
                 WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                 if [[ "$WORKERS" != "{}" ]]; then
                   echo "Workers: $WORKERS"
                 fi
                 ;;
               *)
-                echo "Unknown status: $STATUS"
+                echo "[$((ELAPSED/60))m] Unknown status: $STATUS"
                 ;;
             esac
 

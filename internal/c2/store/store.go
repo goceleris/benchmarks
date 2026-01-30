@@ -32,10 +32,12 @@ type Store struct {
 type Run struct {
 	ID        string    `json:"id"`
 	Mode      string    `json:"mode"`   // fast, med, metal
-	Status    string    `json:"status"` // pending, running, completed, failed
+	Status    string    `json:"status"` // queued, pending, running, completed, failed, cancelled
+	QueuedAt  time.Time `json:"queued_at"`
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`
-	Duration  string    `json:"duration"` // benchmark duration per test
+	Duration  string    `json:"duration"`   // benchmark duration per test
+	BenchMode string    `json:"bench_mode"` // all, baseline, theoretical
 	Error     string    `json:"error,omitempty"`
 
 	// Worker tracking
@@ -326,4 +328,107 @@ func (s *Store) DeleteRun(id string) error {
 // GetRunningRuns returns all runs that are currently in progress.
 func (s *Store) GetRunningRuns() ([]*Run, error) {
 	return s.ListRuns("running", 0)
+}
+
+// GetQueuedRuns returns all queued runs sorted by priority (metal > med > fast) then by queue time.
+func (s *Store) GetQueuedRuns() ([]*Run, error) {
+	runs, err := s.ListRuns("queued", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort by priority then queue time
+	priorityOrder := map[string]int{"metal": 0, "med": 1, "fast": 2}
+
+	// Simple bubble sort (runs list is typically small)
+	for i := 0; i < len(runs); i++ {
+		for j := i + 1; j < len(runs); j++ {
+			pi := priorityOrder[runs[i].Mode]
+			pj := priorityOrder[runs[j].Mode]
+			// Lower priority number = higher priority
+			// If same priority, earlier queue time wins
+			if pi > pj || (pi == pj && runs[i].QueuedAt.After(runs[j].QueuedAt)) {
+				runs[i], runs[j] = runs[j], runs[i]
+			}
+		}
+	}
+
+	return runs, nil
+}
+
+// GetActiveRuns returns all runs that are queued, pending, or running.
+func (s *Store) GetActiveRuns() ([]*Run, error) {
+	var runs []*Run
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte(prefixRun)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			var run Run
+			err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &run)
+			})
+			if err != nil {
+				continue
+			}
+
+			if run.Status == "queued" || run.Status == "pending" || run.Status == "running" {
+				runs = append(runs, &run)
+			}
+		}
+		return nil
+	})
+
+	return runs, err
+}
+
+// CountRunningByMode returns the count of running/pending runs for each mode.
+func (s *Store) CountRunningByMode() (map[string]int, error) {
+	counts := map[string]int{"metal": 0, "med": 0, "fast": 0}
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte(prefixRun)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			var run Run
+			err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &run)
+			})
+			if err != nil {
+				continue
+			}
+
+			// Count pending and running (not queued)
+			if run.Status == "pending" || run.Status == "running" {
+				counts[run.Mode]++
+			}
+		}
+		return nil
+	})
+
+	return counts, err
+}
+
+// GetQueuePosition returns the position of a run in the queue (1-based), or 0 if not queued.
+func (s *Store) GetQueuePosition(runID string) (int, error) {
+	queued, err := s.GetQueuedRuns()
+	if err != nil {
+		return 0, err
+	}
+
+	for i, run := range queued {
+		if run.ID == runID {
+			return i + 1, nil
+		}
+	}
+
+	return 0, nil
 }

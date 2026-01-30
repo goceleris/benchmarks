@@ -132,10 +132,11 @@ func main() {
 	bgCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	go orch.RunQueueProcessor(bgCtx)
 	go orch.RunHealthChecker(bgCtx)
 	go orch.RunCleanupWorker(bgCtx)
 	go db.RunGC(bgCtx)
-	log.Println("Background workers started")
+	log.Println("Background workers started (queue processor, health checker, cleanup, GC)")
 
 	// Initialize API with config
 	apiHandler := api.NewWithConfig(api.Config{

@@ -46,6 +46,7 @@ func NewWithConfig(config Config) *Handler {
 
 	// Register routes
 	h.mux.HandleFunc("/api/benchmark/start", h.authMiddleware(h.handleStartBenchmark))
+	h.mux.HandleFunc("/api/benchmark/queue", h.authMiddleware(h.handleQueueStatus))
 	h.mux.HandleFunc("/api/benchmark/", h.authMiddleware(h.handleBenchmark))
 	h.mux.HandleFunc("/api/results", h.authMiddleware(h.handleListResults))
 	h.mux.HandleFunc("/api/results/", h.authMiddleware(h.handleGetResult))
@@ -95,7 +96,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleStartBenchmark starts a new benchmark run.
+// handleStartBenchmark queues a new benchmark run.
 func (h *Handler) handleStartBenchmark(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -116,15 +117,66 @@ func (h *Handler) handleStartBenchmark(w http.ResponseWriter, r *http.Request) {
 
 	run, err := h.config.Orchestrator.StartRun(r.Context(), mode, duration, benchMode)
 	if err != nil {
-		log.Printf("Failed to start benchmark: %v", err)
+		log.Printf("Failed to queue benchmark: %v", err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	response := map[string]interface{}{
 		"run_id": run.ID,
 		"status": run.Status,
+	}
+
+	// Include queue position if queued
+	if run.Status == "queued" {
+		position, err := h.config.Store.GetQueuePosition(run.ID)
+		if err == nil && position > 0 {
+			response["queue_position"] = position
+		}
+	}
+
+	log.Printf("Benchmark %s queued (mode: %s, status: %s)", run.ID, mode, run.Status)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleQueueStatus returns the current queue status.
+func (h *Handler) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
+	// Get queued runs
+	queued, err := h.config.Store.GetQueuedRuns()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Get running counts
+	counts, err := h.config.Store.CountRunningByMode()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build queue items
+	queueItems := make([]map[string]interface{}, 0, len(queued))
+	for i, run := range queued {
+		queueItems = append(queueItems, map[string]interface{}{
+			"position":  i + 1,
+			"run_id":    run.ID,
+			"mode":      run.Mode,
+			"queued_at": run.QueuedAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"queue":   queueItems,
+		"running": counts,
+		"limits": map[string]int{
+			"metal": 1,
+			"med":   2,
+			"fast":  5,
+		},
 	})
 }
 
@@ -163,17 +215,28 @@ func (h *Handler) handleBenchmarkStatus(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	response := map[string]interface{}{
 		"run_id":     run.ID,
 		"status":     run.Status,
 		"mode":       run.Mode,
+		"queued_at":  run.QueuedAt,
 		"started_at": run.StartedAt,
 		"ended_at":   run.EndedAt,
 		"error":      run.Error,
 		"workers":    run.Workers,
 		"results":    run.Results,
-	})
+	}
+
+	// Add queue position if queued
+	if run.Status == "queued" {
+		position, err := h.config.Store.GetQueuePosition(runID)
+		if err == nil && position > 0 {
+			response["queue_position"] = position
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // handleBenchmarkResults returns the results of a run.

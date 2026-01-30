@@ -18,11 +18,12 @@ import (
 
 // Default timeouts
 const (
-	WorkerStartTimeout  = 10 * time.Minute
-	BenchmarkTimeout    = 3 * time.Hour
-	HealthCheckInterval = 30 * time.Second
-	WorkerHealthTimeout = 5 * time.Minute
-	CleanupInterval     = 1 * time.Hour
+	WorkerStartTimeout   = 10 * time.Minute
+	BenchmarkTimeout     = 3 * time.Hour
+	HealthCheckInterval  = 30 * time.Second
+	WorkerHealthTimeout  = 5 * time.Minute
+	CleanupInterval      = 1 * time.Hour
+	QueueProcessInterval = 10 * time.Second
 )
 
 // Default durations per mode
@@ -30,6 +31,13 @@ var DefaultDurations = map[string]string{
 	"fast":  "10s",
 	"med":   "30s",
 	"metal": "60s",
+}
+
+// Concurrent run limits per mode
+var MaxConcurrentByMode = map[string]int{
+	"metal": 1, // Only 1 metal run at a time (instance limits)
+	"med":   2, // Up to 2 medium runs
+	"fast":  5, // Up to 5 fast runs
 }
 
 // Config holds orchestrator dependencies.
@@ -60,7 +68,7 @@ func New(config Config) *Orchestrator {
 	}
 }
 
-// StartRun initiates a new benchmark run.
+// StartRun queues a new benchmark run.
 func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode string) (*store.Run, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -79,15 +87,6 @@ func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode s
 		return nil, fmt.Errorf("infrastructure not configured: C2Endpoint is missing")
 	}
 
-	// Check for existing running runs
-	running, err := o.config.Store.GetRunningRuns()
-	if err != nil {
-		return nil, fmt.Errorf("failed to check running runs: %w", err)
-	}
-	if len(running) > 0 {
-		return nil, fmt.Errorf("benchmark already in progress: %s", running[0].ID)
-	}
-
 	// Generate run ID
 	runID := uuid.New().String()[:8]
 
@@ -99,38 +98,100 @@ func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode s
 		benchMode = "all"
 	}
 
-	// Create run
+	// Create run in queued state
 	run := &store.Run{
-		ID:       runID,
-		Mode:     mode,
-		Status:   "pending",
-		Duration: duration,
-		Workers:  make(map[string]*store.Worker),
-		Results:  make(map[string]*store.ArchResult),
+		ID:        runID,
+		Mode:      mode,
+		Status:    "queued",
+		QueuedAt:  time.Now(),
+		Duration:  duration,
+		BenchMode: benchMode,
+		Workers:   make(map[string]*store.Worker),
+		Results:   make(map[string]*store.ArchResult),
 	}
 
 	if err := o.config.Store.CreateRun(run); err != nil {
 		return nil, fmt.Errorf("failed to create run: %w", err)
 	}
 
-	log.Printf("Created benchmark run %s (mode: %s, duration: %s, benchMode: %s)",
+	log.Printf("Queued benchmark run %s (mode: %s, duration: %s, benchMode: %s)",
 		runID, mode, duration, benchMode)
 
-	// Start workers in background
-	go o.runBenchmarks(context.Background(), run, benchMode)
+	// Try to start immediately if capacity is available
+	go o.tryProcessQueue()
 
 	return run, nil
+}
+
+// tryProcessQueue attempts to start queued runs if capacity is available.
+func (o *Orchestrator) tryProcessQueue() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.processQueueLocked()
+}
+
+// processQueueLocked processes the queue (must hold mu lock).
+func (o *Orchestrator) processQueueLocked() {
+	// Get current running counts
+	counts, err := o.config.Store.CountRunningByMode()
+	if err != nil {
+		log.Printf("Failed to count running runs: %v", err)
+		return
+	}
+
+	// Get queued runs (sorted by priority)
+	queued, err := o.config.Store.GetQueuedRuns()
+	if err != nil {
+		log.Printf("Failed to get queued runs: %v", err)
+		return
+	}
+
+	for _, run := range queued {
+		// Check if we have capacity for this mode
+		maxConcurrent := MaxConcurrentByMode[run.Mode]
+		if counts[run.Mode] >= maxConcurrent {
+			log.Printf("Run %s waiting: %s mode at capacity (%d/%d)",
+				run.ID, run.Mode, counts[run.Mode], maxConcurrent)
+			continue
+		}
+
+		// Start this run
+		log.Printf("Starting queued run %s (mode: %s)", run.ID, run.Mode)
+		run.Status = "pending"
+		run.StartedAt = time.Now()
+		if err := o.config.Store.UpdateRun(run); err != nil {
+			log.Printf("Failed to update run status: %v", err)
+			continue
+		}
+
+		// Increment count for this mode
+		counts[run.Mode]++
+
+		// Start workers in background
+		go o.runBenchmarks(context.Background(), run, run.BenchMode)
+	}
 }
 
 // runBenchmarks executes the full benchmark flow.
 func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchMode string) {
 	log.Printf("Starting benchmark run %s (mode: %s, duration: %s)", run.ID, run.Mode, run.Duration)
 
-	// Update status
+	// Update status to running
 	run.Status = "running"
-	run.StartedAt = time.Now()
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now()
+	}
 	if err := o.config.Store.UpdateRun(run); err != nil {
 		log.Printf("Failed to update run status: %v", err)
+	}
+
+	// Use stored BenchMode if not provided
+	if benchMode == "" {
+		benchMode = run.BenchMode
+	}
+	if benchMode == "" {
+		benchMode = "all"
 	}
 
 	// Launch workers for each architecture
@@ -178,6 +239,9 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 	}
 
 	log.Printf("Benchmark run %s finished: %s", run.ID, run.Status)
+
+	// Process queue to start next waiting run
+	go o.tryProcessQueue()
 }
 
 // runArchitecture runs benchmarks for a single architecture.
@@ -368,24 +432,32 @@ func (o *Orchestrator) finalizeResults(ctx context.Context, run *store.Run) {
 	}
 }
 
-// CancelRun cancels a running benchmark.
+// CancelRun cancels a running or queued benchmark.
 func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 	run, err := o.config.Store.GetRun(runID)
 	if err != nil {
 		return err
 	}
 
-	if run.Status != "running" && run.Status != "pending" {
+	if run.Status != "running" && run.Status != "pending" && run.Status != "queued" {
 		return fmt.Errorf("run is not active: %s", run.Status)
 	}
+
+	wasRunning := run.Status == "running" || run.Status == "pending"
 
 	run.Status = "cancelled"
 	run.EndedAt = time.Now()
 	_ = o.config.Store.UpdateRun(run)
 
-	o.cleanupRun(ctx, runID)
+	if wasRunning {
+		o.cleanupRun(ctx, runID)
+	}
 
 	log.Printf("Cancelled run %s", runID)
+
+	// Process queue to start next waiting run
+	go o.tryProcessQueue()
+
 	return nil
 }
 
@@ -397,6 +469,21 @@ func (o *Orchestrator) GetRun(runID string) (*store.Run, error) {
 // ListRuns returns recent runs.
 func (o *Orchestrator) ListRuns(limit int) ([]*store.Run, error) {
 	return o.config.Store.ListRuns("", limit)
+}
+
+// RunQueueProcessor periodically processes the queue.
+func (o *Orchestrator) RunQueueProcessor(ctx context.Context) {
+	ticker := time.NewTicker(QueueProcessInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.tryProcessQueue()
+		}
+	}
 }
 
 // RunHealthChecker periodically checks worker health.
