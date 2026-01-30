@@ -11,6 +11,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,7 +38,7 @@ func main() {
 	region := flag.String("region", "", "AWS region (defaults to AWS_REGION env)")
 	flag.Parse()
 
-	// Setup logging
+	// Setup logging with slog
 	if err := os.MkdirAll(*logDir, 0755); err != nil {
 		log.Fatalf("Failed to create log directory: %v", err)
 	}
@@ -47,12 +48,18 @@ func main() {
 	}
 	defer func() { _ = logFile.Close() }()
 
-	// Log to both file and stdout
+	// Log to both file and stdout with JSON formatting
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger := slog.New(slog.NewJSONHandler(multiWriter, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	// Keep old log package for compatibility during transition
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	log.Println("=== C2 Server Starting ===")
+	slog.Info("C2 server starting")
 
 	// AWS Region
 	awsRegion := *region
@@ -62,56 +69,63 @@ func main() {
 	if awsRegion == "" {
 		awsRegion = "us-east-1"
 	}
-	log.Printf("Using AWS region: %s", awsRegion)
+	slog.Info("AWS region configured", "region", awsRegion)
 
 	// Load configuration from SSM and CloudFormation
 	ctx := context.Background()
 	configLoader, err := config.NewLoader(awsRegion)
 	if err != nil {
-		log.Fatalf("Failed to create config loader: %v", err)
+		slog.Error("failed to create config loader", "error", err)
+		os.Exit(1)
 	}
 
 	cfg, err := configLoader.Load(ctx)
 	if err != nil {
-		log.Printf("Warning: Config loading had errors: %v", err)
+		slog.Warn("config loading had errors", "error", err)
 	}
 	cfg.Region = awsRegion
 
-	log.Printf("Config loaded - VpcID: %s, Subnets: %v, SecurityGroupID: %s, C2Endpoint: %s",
-		cfg.VpcID, cfg.SubnetsByAZ, cfg.SecurityGroupID, cfg.C2Endpoint)
+	slog.Info("configuration loaded",
+		"vpc_id", cfg.VpcID,
+		"subnets", cfg.SubnetsByAZ,
+		"security_group_id", cfg.SecurityGroupID,
+		"c2_endpoint", cfg.C2Endpoint)
 
 	// Initialize store
 	db, err := store.New(*dataDir)
 	if err != nil {
-		log.Fatalf("Failed to initialize store: %v", err)
+		slog.Error("failed to initialize store", "error", err, "data_dir", *dataDir)
+		os.Exit(1)
 	}
 	defer func() { _ = db.Close() }()
-	log.Println("BadgerDB initialized")
+	slog.Info("BadgerDB initialized", "data_dir", *dataDir)
 
 	// Initialize AWS clients
 	spotClient, err := spot.NewClient(awsRegion)
 	if err != nil {
-		log.Fatalf("Failed to initialize spot client: %v", err)
+		slog.Error("failed to initialize spot client", "error", err, "region", awsRegion)
+		os.Exit(1)
 	}
-	log.Println("Spot client initialized")
+	slog.Info("spot client initialized", "region", awsRegion)
 
 	cfnClient, err := cfn.NewClient(awsRegion)
 	if err != nil {
-		log.Fatalf("Failed to initialize CloudFormation client: %v", err)
+		slog.Error("failed to initialize CloudFormation client", "error", err, "region", awsRegion)
+		os.Exit(1)
 	}
-	log.Println("CloudFormation client initialized")
+	slog.Info("CloudFormation client initialized", "region", awsRegion)
 
 	// Initialize GitHub client (optional - only needed for PR creation)
 	var ghClient *github.Client
 	if cfg.GitHubToken != "" {
 		ghClient, err = github.NewClientWithToken(cfg.GitHubToken)
 		if err != nil {
-			log.Printf("Warning: GitHub client not initialized: %v", err)
+			slog.Warn("GitHub client not initialized", "error", err)
 		} else {
-			log.Println("GitHub client initialized")
+			slog.Info("GitHub client initialized")
 		}
 	} else {
-		log.Println("Warning: GitHub token not set, PR creation disabled")
+		slog.Warn("GitHub token not set, PR creation disabled")
 	}
 
 	// Initialize orchestrator with full config
@@ -126,7 +140,7 @@ func main() {
 		InstanceProfileArn: cfg.InstanceProfileArn,
 		C2Endpoint:         cfg.C2Endpoint,
 	})
-	log.Println("Orchestrator initialized")
+	slog.Info("orchestrator initialized")
 
 	// Start background workers
 	bgCtx, cancel := context.WithCancel(context.Background())
@@ -136,7 +150,8 @@ func main() {
 	go orch.RunHealthChecker(bgCtx)
 	go orch.RunCleanupWorker(bgCtx)
 	go db.RunGC(bgCtx)
-	log.Println("Background workers started (queue processor, health checker, cleanup, GC)")
+	slog.Info("background workers started",
+		"workers", []string{"queue_processor", "health_checker", "cleanup", "gc"})
 
 	// Initialize API with config
 	apiHandler := api.NewWithConfig(api.Config{
@@ -144,7 +159,7 @@ func main() {
 		Orchestrator: orch,
 		APIKey:       cfg.APIKey,
 	})
-	log.Println("API handler initialized")
+	slog.Info("API handler initialized")
 
 	// HTTP server (health checks, ACME)
 	httpMux := http.NewServeMux()
@@ -174,27 +189,27 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("HTTP server listening on %s", *httpAddr)
+		slog.Info("HTTP server listening", "addr", *httpAddr)
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("HTTP server error: %v", err)
+			slog.Error("HTTP server error", "error", err)
 		}
 	}()
 
 	go func() {
 		if *certFile != "" && *keyFile != "" {
-			log.Printf("HTTPS server listening on %s", *addr)
+			slog.Info("HTTPS server listening", "addr", *addr)
 			if err := httpsServer.ListenAndServeTLS(*certFile, *keyFile); err != http.ErrServerClosed {
-				log.Printf("HTTPS server error: %v", err)
+				slog.Error("HTTPS server error", "error", err)
 			}
 		} else {
-			log.Printf("Warning: TLS not configured, HTTPS server disabled")
+			slog.Warn("TLS not configured, HTTPS server disabled")
 		}
 	}()
 
-	log.Println("=== C2 Server Ready ===")
+	slog.Info("C2 server ready")
 
 	<-sigChan
-	log.Println("Shutting down...")
+	slog.Info("shutting down server")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -202,11 +217,11 @@ func main() {
 	cancel() // Stop background workers
 
 	if err := httpsServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTPS server shutdown error: %v", err)
+		slog.Error("HTTPS server shutdown error", "error", err)
 	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+		slog.Error("HTTP server shutdown error", "error", err)
 	}
 
-	log.Println("=== C2 Server Stopped ===")
+	slog.Info("C2 server stopped")
 }

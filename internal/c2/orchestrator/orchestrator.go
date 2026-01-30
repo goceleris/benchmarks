@@ -4,7 +4,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -114,8 +114,11 @@ func (o *Orchestrator) StartRun(ctx context.Context, mode, duration, benchMode s
 		return nil, fmt.Errorf("failed to create run: %w", err)
 	}
 
-	log.Printf("Queued benchmark run %s (mode: %s, duration: %s, benchMode: %s)",
-		runID, mode, duration, benchMode)
+	slog.Info("benchmark run queued",
+		"run_id", runID,
+		"mode", mode,
+		"duration", duration,
+		"bench_mode", benchMode)
 
 	// Try to start immediately if capacity is available
 	go o.tryProcessQueue()
@@ -136,14 +139,14 @@ func (o *Orchestrator) processQueueLocked() {
 	// Get current running counts
 	counts, err := o.config.Store.CountRunningByMode()
 	if err != nil {
-		log.Printf("Failed to count running runs: %v", err)
+		slog.Error("failed to count running runs", "error", err)
 		return
 	}
 
 	// Get queued runs (sorted by priority)
 	queued, err := o.config.Store.GetQueuedRuns()
 	if err != nil {
-		log.Printf("Failed to get queued runs: %v", err)
+		slog.Error("failed to get queued runs", "error", err)
 		return
 	}
 
@@ -151,17 +154,24 @@ func (o *Orchestrator) processQueueLocked() {
 		// Check if we have capacity for this mode
 		maxConcurrent := MaxConcurrentByMode[run.Mode]
 		if counts[run.Mode] >= maxConcurrent {
-			log.Printf("Run %s waiting: %s mode at capacity (%d/%d)",
-				run.ID, run.Mode, counts[run.Mode], maxConcurrent)
+			slog.Info("run waiting for capacity",
+				"run_id", run.ID,
+				"mode", run.Mode,
+				"current", counts[run.Mode],
+				"max", maxConcurrent)
 			continue
 		}
 
 		// Start this run
-		log.Printf("Starting queued run %s (mode: %s)", run.ID, run.Mode)
+		slog.Info("starting queued run",
+			"run_id", run.ID,
+			"mode", run.Mode)
 		run.Status = "pending"
 		run.StartedAt = time.Now()
 		if err := o.config.Store.UpdateRun(run); err != nil {
-			log.Printf("Failed to update run status: %v", err)
+			slog.Error("failed to update run status",
+				"error", err,
+				"run_id", run.ID)
 			continue
 		}
 
@@ -175,7 +185,11 @@ func (o *Orchestrator) processQueueLocked() {
 
 // runBenchmarks executes the full benchmark flow.
 func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchMode string) {
-	log.Printf("Starting benchmark run %s (mode: %s, duration: %s)", run.ID, run.Mode, run.Duration)
+	start := time.Now()
+	slog.Info("benchmark run starting",
+		"run_id", run.ID,
+		"mode", run.Mode,
+		"duration", run.Duration)
 
 	// Update status to running
 	run.Status = "running"
@@ -183,7 +197,9 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		run.StartedAt = time.Now()
 	}
 	if err := o.config.Store.UpdateRun(run); err != nil {
-		log.Printf("Failed to update run status: %v", err)
+		slog.Error("failed to update run status",
+			"error", err,
+			"run_id", run.ID)
 	}
 
 	// Use stored BenchMode if not provided
@@ -204,7 +220,10 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		go func(arch string) {
 			defer wg.Done()
 			if err := o.runArchitecture(ctx, run, arch, benchMode); err != nil {
-				log.Printf("Architecture %s failed: %v", arch, err)
+				slog.Error("architecture benchmarks failed",
+					"error", err,
+					"run_id", run.ID,
+					"arch", arch)
 				errors <- fmt.Errorf("%s: %w", arch, err)
 			}
 		}(arch)
@@ -238,7 +257,11 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		o.finalizeResults(ctx, run)
 	}
 
-	log.Printf("Benchmark run %s finished: %s", run.ID, run.Status)
+	duration := time.Since(start)
+	slog.Info("benchmark run finished",
+		"run_id", run.ID,
+		"status", run.Status,
+		"duration_seconds", duration.Seconds())
 
 	// Process queue to start next waiting run
 	go o.tryProcessQueue()
@@ -246,7 +269,10 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 
 // runArchitecture runs benchmarks for a single architecture.
 func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch, benchMode string) error {
-	log.Printf("Starting %s benchmarks for run %s", arch, run.ID)
+	slog.Info("architecture benchmarks starting",
+		"run_id", run.ID,
+		"arch", arch,
+		"mode", run.Mode)
 
 	// Get available AZs from our subnet configuration
 	var availableAZs []string
@@ -269,8 +295,13 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 		return fmt.Errorf("no subnet found for selected AZ %s", bestAZ)
 	}
 
-	log.Printf("%s: Using subnet %s in AZ %s (server: $%.4f, client: $%.4f)",
-		arch, subnetID, bestAZ, serverBid.BidPrice, clientBid.BidPrice)
+	slog.Info("worker placement determined",
+		"run_id", run.ID,
+		"arch", arch,
+		"subnet_id", subnetID,
+		"availability_zone", bestAZ,
+		"server_bid_price", serverBid.BidPrice,
+		"client_bid_price", clientBid.BidPrice)
 
 	// Create worker stack
 	stackName, err := o.config.CFN.CreateWorkerStack(ctx, cfn.WorkerStackParams{
@@ -311,7 +342,9 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 	// Mark architecture as complete
 	_ = o.config.Store.CompleteArch(run.ID, arch)
 
-	log.Printf("%s benchmarks completed for run %s", arch, run.ID)
+	slog.Info("architecture benchmarks completed",
+		"run_id", run.ID,
+		"arch", arch)
 	return nil
 }
 
@@ -338,7 +371,9 @@ func (o *Orchestrator) waitForWorkers(ctx context.Context, runID, arch string, t
 		clientOK := run.Workers[clientKey] != nil && run.Workers[clientKey].Status == "running"
 
 		if serverOK && clientOK {
-			log.Printf("Both workers registered for %s %s", runID, arch)
+			slog.Info("workers registered",
+				"run_id", runID,
+				"arch", arch)
 			return nil
 		}
 
@@ -396,17 +431,21 @@ func (o *Orchestrator) waitForCompletion(ctx context.Context, runID, arch string
 
 // cleanupRun terminates all workers for a run.
 func (o *Orchestrator) cleanupRun(ctx context.Context, runID string) {
-	log.Printf("Cleaning up workers for run %s", runID)
+	slog.Info("cleaning up workers", "run_id", runID)
 
 	// Delete CloudFormation stacks
 	if err := o.config.CFN.DeleteWorkerStacks(ctx, runID); err != nil {
-		log.Printf("Warning: Failed to delete worker stacks: %v", err)
+		slog.Warn("failed to delete worker stacks",
+			"error", err,
+			"run_id", runID)
 	}
 
 	// Terminate any remaining instances
 	instances, err := o.config.Spot.DescribeInstances(ctx, runID)
 	if err != nil {
-		log.Printf("Warning: Failed to describe instances: %v", err)
+		slog.Warn("failed to describe instances",
+			"error", err,
+			"run_id", runID)
 		return
 	}
 
@@ -418,26 +457,34 @@ func (o *Orchestrator) cleanupRun(ctx context.Context, runID string) {
 	}
 
 	if len(instanceIDs) > 0 {
-		log.Printf("Terminating %d orphaned instances for run %s", len(instanceIDs), runID)
+		slog.Info("terminating orphaned instances",
+			"run_id", runID,
+			"instance_count", len(instanceIDs))
 		if err := o.config.Spot.TerminateInstances(ctx, instanceIDs); err != nil {
-			log.Printf("Warning: Failed to terminate instances: %v", err)
+			slog.Warn("failed to terminate instances",
+				"error", err,
+				"run_id", runID)
 		}
 	}
 }
 
 // finalizeResults creates a PR with benchmark results.
 func (o *Orchestrator) finalizeResults(ctx context.Context, run *store.Run) {
-	log.Printf("Finalizing results for run %s", run.ID)
+	slog.Info("finalizing results", "run_id", run.ID)
 
 	// Create PR with results
 	if o.config.GitHub != nil {
 		if err := o.config.GitHub.CreateResultsPR(ctx, run); err != nil {
-			log.Printf("Warning: Failed to create PR: %v", err)
+			slog.Warn("failed to create PR",
+				"error", err,
+				"run_id", run.ID)
 		} else {
-			log.Printf("Successfully created results PR for run %s", run.ID)
+			slog.Info("results PR created",
+				"run_id", run.ID)
 		}
 	} else {
-		log.Printf("GitHub client not configured, skipping PR creation")
+		slog.Info("GitHub client not configured, skipping PR creation",
+			"run_id", run.ID)
 	}
 }
 
@@ -462,7 +509,7 @@ func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 		o.cleanupRun(ctx, runID)
 	}
 
-	log.Printf("Cancelled run %s", runID)
+	slog.Info("run cancelled", "run_id", runID)
 
 	// Process queue to start next waiting run
 	go o.tryProcessQueue()
@@ -514,7 +561,7 @@ func (o *Orchestrator) RunHealthChecker(ctx context.Context) {
 func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 	runs, err := o.config.Store.GetRunningRuns()
 	if err != nil {
-		log.Printf("Failed to get running runs: %v", err)
+		slog.Error("failed to get running runs", "error", err)
 		return
 	}
 
@@ -522,14 +569,19 @@ func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 		// Check for stale workers
 		for key, worker := range run.Workers {
 			if worker.Status == "running" && time.Since(worker.LastSeen) > WorkerHealthTimeout {
-				log.Printf("Worker %s for run %s appears unhealthy (last seen: %s)",
-					key, run.ID, worker.LastSeen)
+				slog.Warn("worker unhealthy",
+					"run_id", run.ID,
+					"worker_id", key,
+					"last_seen", worker.LastSeen,
+					"timeout_seconds", WorkerHealthTimeout.Seconds())
 			}
 		}
 
 		// Check for timeout
 		if time.Since(run.StartedAt) > BenchmarkTimeout {
-			log.Printf("Run %s exceeded timeout, cancelling", run.ID)
+			slog.Warn("run exceeded timeout, cancelling",
+				"run_id", run.ID,
+				"duration_seconds", time.Since(run.StartedAt).Seconds())
 			_ = o.CancelRun(ctx, run.ID)
 		}
 	}
@@ -560,7 +612,9 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 	for _, run := range runs {
 		// Clean up stale running runs (shouldn't happen normally)
 		if run.Status == "running" && time.Since(run.StartedAt) > 24*time.Hour {
-			log.Printf("Cleaning up stale run %s", run.ID)
+			slog.Warn("cleaning up stale run",
+				"run_id", run.ID,
+				"age_hours", time.Since(run.StartedAt).Hours())
 			_ = o.CancelRun(ctx, run.ID)
 		}
 	}
@@ -568,12 +622,12 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 
 // CleanupOrphaned cleans up orphaned resources (instances, stacks).
 func (o *Orchestrator) CleanupOrphaned(ctx context.Context) {
-	log.Println("Starting orphaned resource cleanup")
+	slog.Info("starting orphaned resource cleanup")
 
 	// Find all instances tagged with celeris-benchmarks
 	instances, err := o.config.Spot.DescribeAllWorkerInstances(ctx)
 	if err != nil {
-		log.Printf("Warning: Failed to describe instances: %v", err)
+		slog.Warn("failed to describe instances", "error", err)
 		return
 	}
 
@@ -608,11 +662,12 @@ func (o *Orchestrator) CleanupOrphaned(ctx context.Context) {
 	}
 
 	if len(orphanedIDs) > 0 {
-		log.Printf("Terminating %d orphaned instances", len(orphanedIDs))
+		slog.Info("terminating orphaned instances",
+			"instance_count", len(orphanedIDs))
 		if err := o.config.Spot.TerminateInstances(ctx, orphanedIDs); err != nil {
-			log.Printf("Warning: Failed to terminate orphaned instances: %v", err)
+			slog.Warn("failed to terminate orphaned instances", "error", err)
 		}
 	}
 
-	log.Println("Orphaned resource cleanup complete")
+	slog.Info("orphaned resource cleanup complete")
 }
