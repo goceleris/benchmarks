@@ -135,14 +135,19 @@ func (o *Orchestrator) tryProcessQueue() {
 }
 
 // processQueueLocked processes the queue (must hold mu lock).
+//
+// LOCKING STRATEGY: This function must be called while holding the orchestrator's mu lock
+// to prevent race conditions when multiple goroutines try to process the queue concurrently.
+// The critical section is the check-update-start cycle:
+//  1. Check current running counts from database
+//  2. Update run status to "pending" in database (reserves capacity)
+//  3. Re-read counts to ensure consistency for next iteration
+//  4. Start the run in a background goroutine
+//
+// By holding the lock during the entire operation and updating the database BEFORE starting
+// the run, we ensure that concurrent calls cannot both see the same old count and exceed
+// the MaxConcurrentByMode limits (especially critical for metal=1).
 func (o *Orchestrator) processQueueLocked() {
-	// Get current running counts
-	counts, err := o.config.Store.CountRunningByMode()
-	if err != nil {
-		slog.Error("failed to count running runs", "error", err)
-		return
-	}
-
 	// Get queued runs (sorted by priority)
 	queued, err := o.config.Store.GetQueuedRuns()
 	if err != nil {
@@ -151,6 +156,15 @@ func (o *Orchestrator) processQueueLocked() {
 	}
 
 	for _, run := range queued {
+		// Re-read counts from database for each run to ensure we have the latest state.
+		// This is necessary because we update the database status below, and we need to
+		// see those changes reflected in the count for subsequent runs in this loop.
+		counts, err := o.config.Store.CountRunningByMode()
+		if err != nil {
+			slog.Error("failed to count running runs", "error", err)
+			return
+		}
+
 		// Check if we have capacity for this mode
 		maxConcurrent := MaxConcurrentByMode[run.Mode]
 		if counts[run.Mode] >= maxConcurrent {
@@ -162,7 +176,11 @@ func (o *Orchestrator) processQueueLocked() {
 			continue
 		}
 
-		// Start this run
+		// CRITICAL: Update run status to "pending" in the database BEFORE starting the run.
+		// This reserves capacity and prevents other concurrent processQueueLocked calls
+		// from also starting this run or exceeding the concurrent limit.
+		// The CountRunningByMode() function counts both "pending" and "running" statuses,
+		// so this update will be reflected in subsequent capacity checks.
 		slog.Info("starting queued run",
 			"run_id", run.ID,
 			"mode", run.Mode)
@@ -175,10 +193,9 @@ func (o *Orchestrator) processQueueLocked() {
 			continue
 		}
 
-		// Increment count for this mode
-		counts[run.Mode]++
-
 		// Start workers in background
+		// Note: Once we release the lock, the run is in "pending" state and will be
+		// counted by CountRunningByMode() in subsequent calls to processQueueLocked.
 		go o.runBenchmarks(context.Background(), run, run.BenchMode)
 	}
 }
@@ -239,7 +256,14 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 	}
 
 	// Update final status
-	run, _ = o.config.Store.GetRun(run.ID)
+	run, err := o.config.Store.GetRun(run.ID)
+	if err != nil {
+		slog.Error("failed to get run for final status update",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "GetRun")
+		return
+	}
 	if len(errMsgs) > 0 {
 		run.Status = "failed"
 		run.Error = fmt.Sprintf("errors: %v", errMsgs)
@@ -247,7 +271,13 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		run.Status = "completed"
 	}
 	run.EndedAt = time.Now()
-	_ = o.config.Store.UpdateRun(run)
+	if err := o.config.Store.UpdateRun(run); err != nil {
+		slog.Error("failed to update run with final status",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "UpdateRun",
+			"status", run.Status)
+	}
 
 	// Cleanup workers
 	o.cleanupRun(ctx, run.ID)
@@ -340,7 +370,13 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 	}
 
 	// Mark architecture as complete
-	_ = o.config.Store.CompleteArch(run.ID, arch)
+	if err := o.config.Store.CompleteArch(run.ID, arch); err != nil {
+		slog.Error("failed to mark architecture as complete",
+			"error", err,
+			"run_id", run.ID,
+			"arch", arch,
+			"operation", "CompleteArch")
+	}
 
 	slog.Info("architecture benchmarks completed",
 		"run_id", run.ID,
@@ -503,7 +539,12 @@ func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 
 	run.Status = "cancelled"
 	run.EndedAt = time.Now()
-	_ = o.config.Store.UpdateRun(run)
+	if err := o.config.Store.UpdateRun(run); err != nil {
+		slog.Error("failed to update run status to cancelled",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "UpdateRun")
+	}
 
 	if wasRunning {
 		o.cleanupRun(ctx, runID)
@@ -582,7 +623,12 @@ func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 			slog.Warn("run exceeded timeout, cancelling",
 				"run_id", run.ID,
 				"duration_seconds", time.Since(run.StartedAt).Seconds())
-			_ = o.CancelRun(ctx, run.ID)
+			if err := o.CancelRun(ctx, run.ID); err != nil {
+				slog.Error("failed to cancel timed out run",
+					"error", err,
+					"run_id", run.ID,
+					"operation", "CancelRun")
+			}
 		}
 	}
 }
@@ -615,7 +661,12 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 			slog.Warn("cleaning up stale run",
 				"run_id", run.ID,
 				"age_hours", time.Since(run.StartedAt).Hours())
-			_ = o.CancelRun(ctx, run.ID)
+			if err := o.CancelRun(ctx, run.ID); err != nil {
+				slog.Error("failed to cancel stale run",
+					"error", err,
+					"run_id", run.ID,
+					"operation", "CancelRun")
+			}
 		}
 	}
 }
