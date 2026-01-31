@@ -11,6 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+
+	"github.com/goceleris/benchmarks/internal/c2/awsutil"
 )
 
 //go:embed templates/*.yaml
@@ -94,7 +96,9 @@ func (c *Client) CreateWorkerStack(ctx context.Context, params WorkerStackParams
 		OnFailure: types.OnFailureDoNothing, // Keep failed stacks for debugging
 	}
 
-	result, err := c.cfn.CreateStack(ctx, input)
+	result, err := awsutil.WithRetry(ctx, "CreateStack", awsutil.DefaultMaxRetries, func() (*cloudformation.CreateStackOutput, error) {
+		return c.cfn.CreateStack(ctx, input)
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create stack: %w", err)
 	}
@@ -190,8 +194,10 @@ func (c *Client) GetStackStatus(ctx context.Context, stackName string) (*StackSt
 
 // DeleteStack deletes a CloudFormation stack.
 func (c *Client) DeleteStack(ctx context.Context, stackName string) error {
-	_, err := c.cfn.DeleteStack(ctx, &cloudformation.DeleteStackInput{
-		StackName: &stackName,
+	_, err := awsutil.WithRetry(ctx, "DeleteStack", awsutil.DefaultMaxRetries, func() (*cloudformation.DeleteStackOutput, error) {
+		return c.cfn.DeleteStack(ctx, &cloudformation.DeleteStackInput{
+			StackName: &stackName,
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete stack %s: %w", stackName, err)

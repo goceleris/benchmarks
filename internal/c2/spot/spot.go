@@ -14,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
+
+	"github.com/goceleris/benchmarks/internal/c2/awsutil"
 )
 
 // Client wraps AWS EC2 client with spot-specific operations.
@@ -125,7 +127,9 @@ func (c *Client) GetSpotPrices(ctx context.Context, instanceType string) ([]Spot
 		StartTime:           &startTime,
 	}
 
-	result, err := c.ec2.DescribeSpotPriceHistory(ctx, input)
+	result, err := awsutil.WithRetry(ctx, "DescribeSpotPriceHistory", awsutil.DefaultMaxRetries, func() (*ec2.DescribeSpotPriceHistoryOutput, error) {
+		return c.ec2.DescribeSpotPriceHistory(ctx, input)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get spot prices: %w", err)
 	}
@@ -460,7 +464,9 @@ func (c *Client) getSpotPlacementScores(ctx context.Context, instanceTypes []str
 		RegionNames:            []string{c.region},
 	}
 
-	result, err := c.ec2.GetSpotPlacementScores(ctx, input)
+	result, err := awsutil.WithRetry(ctx, "GetSpotPlacementScores", awsutil.DefaultMaxRetries, func() (*ec2.GetSpotPlacementScoresOutput, error) {
+		return c.ec2.GetSpotPlacementScores(ctx, input)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get placement scores: %w", err)
 	}
@@ -650,7 +656,9 @@ func (c *Client) DescribeInstances(ctx context.Context, runID string) ([]types.I
 		},
 	}
 
-	result, err := c.ec2.DescribeInstances(ctx, input)
+	result, err := awsutil.WithRetry(ctx, "DescribeInstances", awsutil.DefaultMaxRetries, func() (*ec2.DescribeInstancesOutput, error) {
+		return c.ec2.DescribeInstances(ctx, input)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -690,7 +698,9 @@ func (c *Client) DescribeAllWorkerInstances(ctx context.Context) ([]types.Instan
 		},
 	}
 
-	result, err := c.ec2.DescribeInstances(ctx, input)
+	result, err := awsutil.WithRetry(ctx, "DescribeInstances", awsutil.DefaultMaxRetries, func() (*ec2.DescribeInstancesOutput, error) {
+		return c.ec2.DescribeInstances(ctx, input)
+	})
 	if err != nil {
 		return nil, err
 	}
