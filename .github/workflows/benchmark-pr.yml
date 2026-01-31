@@ -94,6 +94,20 @@ jobs:
           PR_NUMBER="${{ github.event.pull_request.number }}"
           STACK_NAME="celeris-c2-pr-${PR_NUMBER}"
 
+          # Check if stack exists and wait for any pending deletion
+          STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [[ "$STACK_STATUS" == "DELETE_IN_PROGRESS" ]]; then
+            echo "Stack is being deleted, waiting for deletion to complete..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "Stack deletion complete"
+          elif [[ "$STACK_STATUS" != "DOES_NOT_EXIST" && "$STACK_STATUS" != "DELETE_COMPLETE" ]]; then
+            echo "Stack exists in state: $STACK_STATUS, deleting first..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "Stack deletion complete"
+          fi
+
           echo "Deploying PR C2 stack: $STACK_NAME"
 
           aws cloudformation deploy \
