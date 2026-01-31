@@ -49,6 +49,14 @@ Parameters:
     Type: String
     Description: Worker role ARN (for PassRole permission)
 
+  BinaryS3Bucket:
+    Type: String
+    Description: S3 bucket containing PR-specific binaries
+
+  BinaryS3Prefix:
+    Type: String
+    Description: S3 prefix for PR-specific binaries
+
 Resources:
   # Security Group for PR C2 Server
   PRC2SecurityGroup:
@@ -166,6 +174,12 @@ Resources:
                 Resource:
                   - !Ref WorkerRoleArn
                   - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+              # S3 permissions for PR-specific binaries
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BinaryS3Bucket}/${BinaryS3Prefix}/*'
       Tags:
         - Key: Project
           Value: celeris-benchmarks
@@ -239,6 +253,8 @@ Resources:
           Environment=INSTANCE_PROFILE_ARN=${WorkerInstanceProfileArn}
           Environment=SUBNET_ID=${SubnetId}
           Environment=C2_ENDPOINT=http://$PUBLIC_IP:8080
+          Environment=BINARY_S3_BUCKET=${BinaryS3Bucket}
+          Environment=BINARY_S3_PREFIX=${BinaryS3Prefix}
 
           [Install]
           WantedBy=multi-user.target

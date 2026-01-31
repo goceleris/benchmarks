@@ -64,6 +64,16 @@ Parameters:
       - all
     Description: Which servers to benchmark
 
+  ServerBinaryUrl:
+    Type: String
+    Default: ''
+    Description: Optional custom URL for server binary (for PR testing)
+
+  BenchBinaryUrl:
+    Type: String
+    Default: ''
+    Description: Optional custom URL for bench binary (for PR testing)
+
 Mappings:
   # Primary instance types
   InstanceTypes:
@@ -238,12 +248,18 @@ Resources:
             echo "* soft nofile 1000000" >> /etc/security/limits.conf
             echo "* hard nofile 1000000" >> /etc/security/limits.conf
 
-            # Download pre-built server binary from GitHub releases
+            # Download server binary (use custom URL if provided, else GitHub releases)
             ARCH="${Architecture}"
             if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
-            echo "Downloading server binary for $ARCH..."
-            curl -sL -o /usr/local/bin/server \
-              "https://github.com/${GitHubRepo}/releases/download/latest/server-linux-$ARCH"
+            CUSTOM_URL="${ServerBinaryUrl}"
+            if [ -n "$CUSTOM_URL" ]; then
+              echo "Downloading server binary from custom URL..."
+              curl -sL -o /usr/local/bin/server "$CUSTOM_URL"
+            else
+              echo "Downloading server binary from GitHub releases..."
+              curl -sL -o /usr/local/bin/server \
+                "https://github.com/${GitHubRepo}/releases/download/latest/server-linux-$ARCH"
+            fi
             chmod +x /usr/local/bin/server
 
             # Register with C2
@@ -390,12 +406,18 @@ Resources:
             echo "* soft nofile 1000000" >> /etc/security/limits.conf
             echo "* hard nofile 1000000" >> /etc/security/limits.conf
 
-            # Download pre-built bench binary from GitHub releases
+            # Download bench binary (use custom URL if provided, else GitHub releases)
             ARCH="${Architecture}"
             if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
-            echo "Downloading bench binary for $ARCH..."
-            curl -sL -o /usr/local/bin/bench \
-              "https://github.com/${GitHubRepo}/releases/download/latest/bench-linux-$ARCH"
+            CUSTOM_URL="${BenchBinaryUrl}"
+            if [ -n "$CUSTOM_URL" ]; then
+              echo "Downloading bench binary from custom URL..."
+              curl -sL -o /usr/local/bin/bench "$CUSTOM_URL"
+            else
+              echo "Downloading bench binary from GitHub releases..."
+              curl -sL -o /usr/local/bin/bench \
+                "https://github.com/${GitHubRepo}/releases/download/latest/bench-linux-$ARCH"
+            fi
             chmod +x /usr/local/bin/bench
 
             # Register with C2

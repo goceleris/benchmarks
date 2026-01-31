@@ -37,6 +37,8 @@ type WorkerStackParams struct {
 	C2Endpoint         string
 	BenchmarkDuration  string
 	BenchmarkMode      string // baseline, theoretical, all
+	ServerBinaryUrl    string // Optional custom URL for server binary (PR testing)
+	BenchBinaryUrl     string // Optional custom URL for bench binary (PR testing)
 }
 
 // StackStatus represents the status of a CloudFormation stack.
@@ -84,6 +86,8 @@ func (c *Client) CreateWorkerStack(ctx context.Context, params WorkerStackParams
 			{ParameterKey: strPtr("C2Endpoint"), ParameterValue: &params.C2Endpoint},
 			{ParameterKey: strPtr("BenchmarkDuration"), ParameterValue: &params.BenchmarkDuration},
 			{ParameterKey: strPtr("BenchmarkMode"), ParameterValue: &params.BenchmarkMode},
+			{ParameterKey: strPtr("ServerBinaryUrl"), ParameterValue: &params.ServerBinaryUrl},
+			{ParameterKey: strPtr("BenchBinaryUrl"), ParameterValue: &params.BenchBinaryUrl},
 		},
 		Capabilities: []types.Capability{
 			types.CapabilityCapabilityIam,

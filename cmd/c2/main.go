@@ -128,6 +128,15 @@ func main() {
 		slog.Warn("GitHub token not set, PR creation disabled")
 	}
 
+	// Optional S3 config for custom binaries (PR testing)
+	binaryS3Bucket := os.Getenv("BINARY_S3_BUCKET")
+	binaryS3Prefix := os.Getenv("BINARY_S3_PREFIX")
+	if binaryS3Bucket != "" && binaryS3Prefix != "" {
+		slog.Info("custom binary S3 config set",
+			"bucket", binaryS3Bucket,
+			"prefix", binaryS3Prefix)
+	}
+
 	// Initialize orchestrator with full config
 	orch := orchestrator.New(orchestrator.Config{
 		Store:              db,
@@ -139,6 +148,8 @@ func main() {
 		SecurityGroupID:    cfg.SecurityGroupID,
 		InstanceProfileArn: cfg.InstanceProfileArn,
 		C2Endpoint:         cfg.C2Endpoint,
+		BinaryS3Bucket:     binaryS3Bucket,
+		BinaryS3Prefix:     binaryS3Prefix,
 	})
 	slog.Info("orchestrator initialized")
 
