@@ -1,0 +1,82 @@
+name: PR C2 Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  cleanup:
+    name: Cleanup PR C2 Resources
+    runs-on: ubuntu-latest
+    # Only run if this PR might have had a C2 deployed
+    # (any PR could have been labeled at some point)
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check for PR C2 Stack
+        id: check
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          STACK_NAME="celeris-c2-pr-${PR_NUMBER}"
+
+          # Check if stack exists
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" > /dev/null 2>&1; then
+            echo "Found PR C2 stack: $STACK_NAME"
+            echo "stack_exists=true" >> $GITHUB_OUTPUT
+            echo "stack_name=$STACK_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "No PR C2 stack found for PR #$PR_NUMBER"
+            echo "stack_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete PR C2 Stack
+        if: steps.check.outputs.stack_exists == 'true'
+        run: |
+          STACK_NAME="${{ steps.check.outputs.stack_name }}"
+          echo "Deleting PR C2 stack: $STACK_NAME"
+
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+          echo "PR C2 stack deleted"
+
+      - name: Cleanup S3 Artifacts
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+
+          echo "Cleaning up S3 artifacts for PR #$PR_NUMBER..."
+          aws s3 rm "s3://${BUCKET}/pr-c2/pr-${PR_NUMBER}/" --recursive 2>/dev/null || true
+          echo "S3 cleanup complete"
+
+      - name: Summary
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          MERGED="${{ github.event.pull_request.merged }}"
+
+          echo "## PR C2 Cleanup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+          if [[ "$MERGED" == "true" ]]; then
+            echo "**Status:** Merged" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** Closed without merge" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ steps.check.outputs.stack_exists }}" == "true" ]]; then
+            echo "PR C2 stack was deleted." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No PR C2 stack found (may not have been deployed)." >> $GITHUB_STEP_SUMMARY
+          fi

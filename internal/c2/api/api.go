@@ -303,11 +303,14 @@ func (h *Handler) handleGetResult(w http.ResponseWriter, r *http.Request) {
 // Worker API endpoints (called by worker instances)
 
 type workerRegisterRequest struct {
-	RunID      string `json:"run_id"`
-	Role       string `json:"role"`
-	Arch       string `json:"arch"`
-	InstanceID string `json:"instance_id"`
-	PrivateIP  string `json:"private_ip"`
+	RunID        string `json:"run_id"`
+	Role         string `json:"role"`
+	Arch         string `json:"arch"`
+	InstanceID   string `json:"instance_id"`
+	InstanceType string `json:"instance_type"`
+	PrivateIP    string `json:"private_ip"`
+	Region       string `json:"region"`
+	AZ           string `json:"az"`
 }
 
 // handleWorkerRegister registers a worker with the C2.
@@ -324,11 +327,14 @@ func (h *Handler) handleWorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	worker := &store.Worker{
-		RunID:      req.RunID,
-		Role:       req.Role,
-		Arch:       req.Arch,
-		InstanceID: req.InstanceID,
-		PrivateIP:  req.PrivateIP,
+		RunID:        req.RunID,
+		Role:         req.Role,
+		Arch:         req.Arch,
+		InstanceID:   req.InstanceID,
+		InstanceType: req.InstanceType,
+		PrivateIP:    req.PrivateIP,
+		Region:       req.Region,
+		AZ:           req.AZ,
 	}
 
 	if err := h.config.Store.RegisterWorker(worker); err != nil {
@@ -345,7 +351,10 @@ func (h *Handler) handleWorkerRegister(w http.ResponseWriter, r *http.Request) {
 		"run_id", req.RunID,
 		"arch", req.Arch,
 		"role", req.Role,
+		"instance_type", req.InstanceType,
 		"instance_id", req.InstanceID,
+		"region", req.Region,
+		"az", req.AZ,
 		"private_ip", req.PrivateIP)
 
 	w.Header().Set("Content-Type", "application/json")
