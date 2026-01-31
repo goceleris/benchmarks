@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Benchmark mode
+        description: 'Benchmark mode'
         required: false
         type: choice
         options:
@@ -15,11 +15,11 @@ on:
           - metal
         default: fast
       duration:
-        description: Benchmark duration (e.g., 10s, 30s, 60s)
+        description: 'Benchmark duration (e.g., 10s, 30s, 60s)'
         required: false
         default: ''
       bench_mode:
-        description: Servers to benchmark
+        description: 'Servers to benchmark'
         required: false
         type: choice
         options:
