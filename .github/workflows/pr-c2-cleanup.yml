@@ -54,7 +54,8 @@ jobs:
       - name: Cleanup S3 Artifacts
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="celeris-artifacts-${AWS_ACCOUNT_ID}"
 
           echo "Cleaning up S3 artifacts for PR #$PR_NUMBER..."
           aws s3 rm "s3://${BUCKET}/pr-c2/pr-${PR_NUMBER}/" --recursive 2>/dev/null || true

@@ -49,12 +49,17 @@ jobs:
         id: upload
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="celeris-artifacts-${AWS_ACCOUNT_ID}"
           KEY="pr-c2/pr-${PR_NUMBER}/c2-linux-amd64"
 
+          echo "Using bucket: $BUCKET"
+
           # Create bucket if it doesn't exist
-          aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || \
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating bucket $BUCKET..."
             aws s3api create-bucket --bucket "$BUCKET" --region ${{ env.AWS_REGION }}
+          fi
 
           # Upload binary
           aws s3 cp c2-linux-amd64 "s3://${BUCKET}/${KEY}"
@@ -62,21 +67,25 @@ jobs:
           # Generate presigned URL (valid for 4 hours)
           URL=$(aws s3 presign "s3://${BUCKET}/${KEY}" --expires-in 14400)
           echo "binary_url=$URL" >> $GITHUB_OUTPUT
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
           echo "Uploaded C2 binary to S3"
 
       - name: Get Main C2 Stack Outputs
         id: main-c2
         run: |
-          # Get security group and instance profile from main C2 stack
+          # Get security group, instance profile, and role from main C2 stack
           WORKER_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`WorkerSecurityGroupId`].OutputValue' --output text)
           WORKER_PROFILE=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`WorkerInstanceProfileArn`].OutputValue' --output text)
+          WORKER_ROLE=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`WorkerRoleArn`].OutputValue' --output text)
           C2_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`C2SecurityGroupId`].OutputValue' --output text)
 
           echo "worker_sg=$WORKER_SG" >> $GITHUB_OUTPUT
           echo "worker_profile=$WORKER_PROFILE" >> $GITHUB_OUTPUT
+          echo "worker_role=$WORKER_ROLE" >> $GITHUB_OUTPUT
           echo "c2_sg=$C2_SG" >> $GITHUB_OUTPUT
 
       - name: Deploy PR C2 Stack
@@ -84,6 +93,20 @@ jobs:
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           STACK_NAME="celeris-c2-pr-${PR_NUMBER}"
+
+          # Check if stack exists and wait for any pending deletion
+          STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [[ "$STACK_STATUS" == "DELETE_IN_PROGRESS" ]]; then
+            echo "Stack is being deleted, waiting for deletion to complete..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "Stack deletion complete"
+          elif [[ "$STACK_STATUS" != "DOES_NOT_EXIST" && "$STACK_STATUS" != "DELETE_COMPLETE" ]]; then
+            echo "Stack exists in state: $STACK_STATUS, deleting first..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "Stack deletion complete"
+          fi
 
           echo "Deploying PR C2 stack: $STACK_NAME"
 
@@ -101,6 +124,7 @@ jobs:
               MainC2SecurityGroupId="${{ steps.main-c2.outputs.c2_sg }}" \
               WorkerSecurityGroupId="${{ steps.main-c2.outputs.worker_sg }}" \
               WorkerInstanceProfileArn="${{ steps.main-c2.outputs.worker_profile }}" \
+              WorkerRoleArn="${{ steps.main-c2.outputs.worker_role }}" \
             --tags \
               Project=celeris-benchmarks \
               PRNumber="$PR_NUMBER" \
@@ -216,24 +240,33 @@ jobs:
                 fi
                 ;;
               pending|running)
-                # Show worker placement info once when workers register
+                # Show worker placement info once when ALL 4 workers register
                 if [[ "$PLACEMENT_SHOWN" == "false" ]]; then
                   WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                   if [[ "$WORKERS" != "{}" ]]; then
-                    WORKER_COUNT=$(echo "$WORKERS" | jq 'keys | length')
-                    if [[ "$WORKER_COUNT" -gt 0 ]]; then
+                    # Check if all 4 workers are registered
+                    HAS_ALL_WORKERS=true
+                    for arch in arm64 x86; do
+                      for role in server client; do
+                        KEY="${arch}-${role}"
+                        WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"] // empty")
+                        if [[ -z "$WORKER" ]]; then
+                          HAS_ALL_WORKERS=false
+                        fi
+                      done
+                    done
+
+                    if [[ "$HAS_ALL_WORKERS" == "true" ]]; then
                       echo ""
                       echo "=== Worker Placement ==="
                       for arch in arm64 x86; do
                         for role in server client; do
                           KEY="${arch}-${role}"
-                          WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
-                          if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
-                            W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "unknown"')
-                            W_REGION=$(echo "$WORKER" | jq -r '.region // "unknown"')
-                            W_AZ=$(echo "$WORKER" | jq -r '.az // "unknown"')
-                            echo "  $arch $role: $W_TYPE in $W_REGION ($W_AZ)"
-                          fi
+                          WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"]")
+                          W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "unknown"')
+                          W_REGION=$(echo "$WORKER" | jq -r '.region // "unknown"')
+                          W_AZ=$(echo "$WORKER" | jq -r '.az // "unknown"')
+                          echo "  $arch $role: $W_TYPE in $W_REGION ($W_AZ)"
                         done
                       done
                       echo "========================="
@@ -425,7 +458,7 @@ jobs:
             | xargs -I {} gh api -X DELETE "repos/${{ github.repository }}/issues/comments/{}" 2>/dev/null || true
 
           # Post new comment
-          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file -
+          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file -
           echo "Posted results to PR #$PR_NUMBER"
 
       - name: Get Results Summary (Fallback)
@@ -510,7 +543,8 @@ jobs:
       - name: Cleanup S3 Artifacts
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="celeris-artifacts-${AWS_ACCOUNT_ID}"
 
           echo "Cleaning up S3 artifacts for PR #$PR_NUMBER..."
           aws s3 rm "s3://${BUCKET}/pr-c2/pr-${PR_NUMBER}/" --recursive || true
