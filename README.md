@@ -96,35 +96,15 @@ Required AWS quotas for metal benchmarks:
 
 ### Requirements
 
-- **Go 1.21+**: [Download](https://go.dev/dl/)
+- **Go 1.25.5+**: [Download](https://go.dev/dl/)
 - **Mage**: Build tool (Go-based Make alternative)
   ```bash
   go install github.com/magefile/mage@latest
+  # or on macOS
+  brew install mage
   ```
-- **golangci-lint** (optional): Auto-installed by `mage lint` if missing
 
-### Available Commands
-
-| Command | Description |
-|---------|-------------|
-| `mage build` | Build all binaries (server, bench, c2) |
-| `mage buildServer` | Build server binary only |
-| `mage buildBench` | Build benchmark tool only |
-| `mage buildC2` | Build C2 server only |
-| `mage buildLinux` | Cross-compile for Linux amd64 |
-| `mage buildLinuxArm` | Cross-compile for Linux arm64 |
-| `mage buildAll` | Cross-compile for all platforms |
-| `mage lint` | Run golangci-lint |
-| `mage fmt` | Format Go code |
-| `mage vet` | Run go vet |
-| `mage test` | Run unit tests |
-| `mage benchmark` | Run benchmarks (30s per server) |
-| `mage benchmarkQuick` | Quick benchmark validation (5s) |
-| `mage deps` | Download Go dependencies |
-| `mage check` | Run all checks (lint, vet, build) |
-| `mage clean` | Clean build artifacts |
-
-Run `mage -l` to see all available targets with descriptions.
+Run `mage -l` to see all available commands with descriptions.
 
 ### Development Workflow
 
