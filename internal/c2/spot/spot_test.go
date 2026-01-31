@@ -80,6 +80,25 @@ func TestRegionLocations(t *testing.T) {
 	}
 }
 
+func TestSupportedRegionsHaveLocations(t *testing.T) {
+	// Verify all supported regions have corresponding location mappings
+	for _, region := range SupportedRegions {
+		t.Run(region, func(t *testing.T) {
+			if _, ok := regionLocations[region]; !ok {
+				t.Errorf("supported region %s has no location mapping", region)
+			}
+		})
+	}
+}
+
+func TestSupportedRegionsCount(t *testing.T) {
+	// Ensure we have exactly 9 supported regions
+	expected := 9
+	if len(SupportedRegions) != expected {
+		t.Errorf("expected %d supported regions, got %d", expected, len(SupportedRegions))
+	}
+}
+
 func TestFallbackPrices(t *testing.T) {
 	// Verify all instance types used in InstanceTypes have fallback prices
 	allTypes := []map[string]map[string]InstancePair{InstanceTypes, InstanceTypesAlt1, InstanceTypesAlt2}

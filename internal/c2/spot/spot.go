@@ -42,36 +42,35 @@ type Client struct {
 	priceCache map[string]*cachedPrice // key: "region:instanceType"
 }
 
+// SupportedRegions lists the AWS regions we support for benchmarks.
+// These regions were selected for:
+// - Lower spot prices for compute-optimized instances
+// - Good availability of metal instances (c5.metal, c6g.metal)
+// - Geographic distribution for global coverage
+var SupportedRegions = []string{
+	"us-east-1",      // N. Virginia - Largest, lowest prices
+	"us-east-2",      // Ohio - Large capacity, competitive
+	"us-west-2",      // Oregon - Second largest US
+	"eu-west-1",      // Ireland - Largest EU
+	"eu-central-1",   // Frankfurt - Good EU alternative
+	"ap-northeast-1", // Tokyo - Largest APAC
+	"ap-southeast-1", // Singapore - Good APAC pricing
+	"ap-south-1",     // Mumbai - Large capacity
+	"ca-central-1",   // Canada - Often good prices
+}
+
 // regionLocations maps AWS region codes to Pricing API location names.
+// Only includes supported regions for benchmarks.
 var regionLocations = map[string]string{
 	"us-east-1":      "US East (N. Virginia)",
 	"us-east-2":      "US East (Ohio)",
-	"us-west-1":      "US West (N. California)",
 	"us-west-2":      "US West (Oregon)",
-	"af-south-1":     "Africa (Cape Town)",
-	"ap-east-1":      "Asia Pacific (Hong Kong)",
-	"ap-south-1":     "Asia Pacific (Mumbai)",
-	"ap-south-2":     "Asia Pacific (Hyderabad)",
-	"ap-southeast-1": "Asia Pacific (Singapore)",
-	"ap-southeast-2": "Asia Pacific (Sydney)",
-	"ap-southeast-3": "Asia Pacific (Jakarta)",
-	"ap-southeast-4": "Asia Pacific (Melbourne)",
-	"ap-northeast-1": "Asia Pacific (Tokyo)",
-	"ap-northeast-2": "Asia Pacific (Seoul)",
-	"ap-northeast-3": "Asia Pacific (Osaka)",
-	"ca-central-1":   "Canada (Central)",
-	"eu-central-1":   "EU (Frankfurt)",
-	"eu-central-2":   "EU (Zurich)",
 	"eu-west-1":      "EU (Ireland)",
-	"eu-west-2":      "EU (London)",
-	"eu-west-3":      "EU (Paris)",
-	"eu-south-1":     "EU (Milan)",
-	"eu-south-2":     "EU (Spain)",
-	"eu-north-1":     "EU (Stockholm)",
-	"me-south-1":     "Middle East (Bahrain)",
-	"me-central-1":   "Middle East (UAE)",
-	"sa-east-1":      "South America (Sao Paulo)",
-	"il-central-1":   "Israel (Tel Aviv)",
+	"eu-central-1":   "EU (Frankfurt)",
+	"ap-northeast-1": "Asia Pacific (Tokyo)",
+	"ap-southeast-1": "Asia Pacific (Singapore)",
+	"ap-south-1":     "Asia Pacific (Mumbai)",
+	"ca-central-1":   "Canada (Central)",
 }
 
 // SpotPrice represents spot pricing for an instance type in an AZ.
@@ -164,6 +163,208 @@ func NewClient(region string) (*Client, error) {
 		region:     region,
 		priceCache: make(map[string]*cachedPrice),
 	}, nil
+}
+
+// RegionResult holds the best pricing result for a region.
+type RegionResult struct {
+	Region      string
+	AZ          string
+	ServerPrice float64
+	ClientPrice float64
+	TotalPrice  float64
+	Score       int // Placement score (1-10, higher is better)
+	Available   bool
+}
+
+// FindBestRegionForPair queries all supported regions in parallel to find the
+// cheapest region with availability for both server and client instance types.
+// Returns the best region, AZ, and bid results for both instances.
+func FindBestRegionForPair(ctx context.Context, serverType, clientType string) (string, string, *BidResult, *BidResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var (
+		results []RegionResult
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+	)
+
+	// Query all supported regions in parallel
+	for _, region := range SupportedRegions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+
+			result := queryRegionPrices(ctx, region, serverType, clientType)
+			if result.Available {
+				mu.Lock()
+				results = append(results, result)
+				mu.Unlock()
+			}
+		}(region)
+	}
+
+	wg.Wait()
+
+	if len(results) == 0 {
+		return "", "", nil, nil, fmt.Errorf("no region found with availability for %s and %s", serverType, clientType)
+	}
+
+	// Sort by: availability score (desc), then total price (asc)
+	sort.Slice(results, func(i, j int) bool {
+		// First prioritize higher availability scores
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		// Then lower price
+		return results[i].TotalPrice < results[j].TotalPrice
+	})
+
+	best := results[0]
+	slog.Info("selected best region for benchmark",
+		"region", best.Region,
+		"az", best.AZ,
+		"server_price", best.ServerPrice,
+		"client_price", best.ClientPrice,
+		"total_price", best.TotalPrice,
+		"score", best.Score,
+		"alternatives", len(results)-1)
+
+	// Log alternatives for debugging
+	if len(results) > 1 {
+		for i, r := range results[1:] {
+			if i >= 3 { // Only log top 3 alternatives
+				break
+			}
+			slog.Debug("alternative region",
+				"region", r.Region,
+				"az", r.AZ,
+				"total_price", r.TotalPrice,
+				"score", r.Score)
+		}
+	}
+
+	// Create a client for the best region to get on-demand prices
+	client, err := NewClient(best.Region)
+	if err != nil {
+		return "", "", nil, nil, fmt.Errorf("failed to create client for %s: %w", best.Region, err)
+	}
+
+	serverOnDemand, _ := client.getOnDemandPrice(ctx, serverType)
+	clientOnDemand, _ := client.getOnDemandPrice(ctx, clientType)
+
+	// Calculate bids (50% above spot, capped at on-demand)
+	serverBid := best.ServerPrice * 1.50
+	if serverOnDemand > 0 && serverBid > serverOnDemand {
+		serverBid = serverOnDemand
+	}
+
+	clientBid := best.ClientPrice * 1.50
+	if clientOnDemand > 0 && clientBid > clientOnDemand {
+		clientBid = clientOnDemand
+	}
+
+	return best.Region, best.AZ, &BidResult{
+			InstanceType:  serverType,
+			AZ:            best.AZ,
+			CurrentPrice:  best.ServerPrice,
+			BidPrice:      serverBid,
+			OnDemandPrice: serverOnDemand,
+		}, &BidResult{
+			InstanceType:  clientType,
+			AZ:            best.AZ,
+			CurrentPrice:  best.ClientPrice,
+			BidPrice:      clientBid,
+			OnDemandPrice: clientOnDemand,
+		}, nil
+}
+
+// queryRegionPrices queries spot prices and availability for a single region.
+func queryRegionPrices(ctx context.Context, region, serverType, clientType string) RegionResult {
+	result := RegionResult{
+		Region:    region,
+		Available: false,
+		Score:     0,
+	}
+
+	// Create a client for this region
+	client, err := NewClient(region)
+	if err != nil {
+		slog.Debug("failed to create client for region", "region", region, "error", err)
+		return result
+	}
+
+	// Get spot prices for both instance types
+	serverPrices, err := client.GetSpotPrices(ctx, serverType)
+	if err != nil || len(serverPrices) == 0 {
+		slog.Debug("no server prices in region", "region", region, "server_type", serverType)
+		return result
+	}
+
+	clientPrices, err := client.GetSpotPrices(ctx, clientType)
+	if err != nil || len(clientPrices) == 0 {
+		slog.Debug("no client prices in region", "region", region, "client_type", clientType)
+		return result
+	}
+
+	// Build client price map by AZ
+	clientPriceMap := make(map[string]float64)
+	for _, p := range clientPrices {
+		clientPriceMap[p.AZ] = p.Price
+	}
+
+	// Find best AZ where both are available
+	var bestAZ string
+	var bestServerPrice, bestClientPrice float64
+	bestTotal := math.MaxFloat64
+
+	for _, sp := range serverPrices {
+		if cp, ok := clientPriceMap[sp.AZ]; ok {
+			total := sp.Price + cp
+			if total < bestTotal {
+				bestTotal = total
+				bestAZ = sp.AZ
+				bestServerPrice = sp.Price
+				bestClientPrice = cp
+			}
+		}
+	}
+
+	if bestAZ == "" {
+		slog.Debug("no common AZ in region", "region", region)
+		return result
+	}
+
+	// Try to get placement scores for availability
+	score := 5 // Default score if we can't get placement scores
+	scores, err := client.getSpotPlacementScores(ctx, []string{serverType, clientType}, []string{bestAZ})
+	if err == nil && len(scores) > 0 {
+		if azScores, ok := scores[bestAZ]; ok {
+			// Use minimum score across both instance types
+			minScore := 10
+			for _, s := range azScores {
+				if s < minScore {
+					minScore = s
+				}
+			}
+			score = minScore
+		}
+	}
+
+	result.AZ = bestAZ
+	result.ServerPrice = bestServerPrice
+	result.ClientPrice = bestClientPrice
+	result.TotalPrice = bestTotal
+	result.Score = score
+	result.Available = true
+
+	slog.Debug("region query complete",
+		"region", region,
+		"az", bestAZ,
+		"total_price", bestTotal,
+		"score", score)
+
+	return result
 }
 
 // GetSpotPrices retrieves current spot prices for an instance type across all AZs.
