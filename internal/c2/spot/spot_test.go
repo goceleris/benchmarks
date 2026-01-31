@@ -118,3 +118,45 @@ func TestFallbackPrices(t *testing.T) {
 		}
 	}
 }
+
+func TestInstanceVCPUs(t *testing.T) {
+	// Verify all instance types used in InstanceTypes have vCPU mappings
+	allTypes := []map[string]map[string]InstancePair{InstanceTypes, InstanceTypesAlt1, InstanceTypesAlt2}
+
+	for _, typeMap := range allTypes {
+		for mode, archMap := range typeMap {
+			for arch, pair := range archMap {
+				t.Run(mode+"/"+arch, func(t *testing.T) {
+					if _, ok := instanceVCPUs[pair.Server]; !ok {
+						t.Errorf("missing vCPU count for server %s", pair.Server)
+					}
+					if _, ok := instanceVCPUs[pair.Client]; !ok {
+						t.Errorf("missing vCPU count for client %s", pair.Client)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGetVCPUsForPair(t *testing.T) {
+	testCases := []struct {
+		server   string
+		client   string
+		expected int
+	}{
+		{"c6g.medium", "t4g.small", 3},   // fast arm64: 1 + 2
+		{"c5.large", "t3.small", 4},      // fast x86: 2 + 2
+		{"c6g.metal", "c6g.4xlarge", 80}, // metal arm64: 64 + 16
+		{"c5.metal", "c5.9xlarge", 132},  // metal x86: 96 + 36
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.server+"+"+tc.client, func(t *testing.T) {
+			vcpus := GetVCPUsForPair(tc.server, tc.client)
+			if vcpus != tc.expected {
+				t.Errorf("expected %d vCPUs, got %d", tc.expected, vcpus)
+			}
+		})
+	}
+}

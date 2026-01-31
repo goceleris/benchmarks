@@ -18,9 +18,64 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 	pricingtypes "github.com/aws/aws-sdk-go-v2/service/pricing/types"
+	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 
 	"github.com/goceleris/benchmarks/internal/c2/awsutil"
 )
+
+// SpotQuotaCode is the AWS Service Quotas code for "All Standard Spot Instance Requests"
+const SpotQuotaCode = "L-34B43A08"
+
+// instanceVCPUs maps instance types to their vCPU counts.
+// Used for quota calculations.
+var instanceVCPUs = map[string]int{
+	// ARM64 - C6g family
+	"c6g.medium":  1,
+	"c6g.large":   2,
+	"c6g.xlarge":  4,
+	"c6g.2xlarge": 8,
+	"c6g.4xlarge": 16,
+	"c6g.8xlarge": 32,
+	"c6g.metal":   64,
+	// ARM64 - C7g family
+	"c7g.medium":  1,
+	"c7g.large":   2,
+	"c7g.xlarge":  4,
+	"c7g.2xlarge": 8,
+	"c7g.4xlarge": 16,
+	"c7g.metal":   64,
+	// ARM64 - T4g family
+	"t4g.micro":  2,
+	"t4g.small":  2,
+	"t4g.medium": 2,
+	// ARM64 - M7g family
+	"m7g.metal": 64,
+
+	// x86 - C5 family
+	"c5.large":   2,
+	"c5.xlarge":  4,
+	"c5.2xlarge": 8,
+	"c5.9xlarge": 36,
+	"c5.metal":   96,
+	// x86 - C5a family
+	"c5a.large":   2,
+	"c5a.xlarge":  4,
+	"c5a.2xlarge": 8,
+	// x86 - C5d family
+	"c5d.9xlarge": 36,
+	"c5d.metal":   96,
+	// x86 - C5n family
+	"c5n.9xlarge": 36,
+	"c5n.metal":   72,
+	// x86 - C6i family
+	"c6i.large":   2,
+	"c6i.xlarge":  4,
+	"c6i.2xlarge": 8,
+	// x86 - T2/T3 family
+	"t2.small":  1,
+	"t3.small":  2,
+	"t3a.small": 2,
+}
 
 // PriceCacheTTL is how long cached on-demand prices are valid.
 const PriceCacheTTL = 1 * time.Hour
@@ -165,6 +220,16 @@ func NewClient(region string) (*Client, error) {
 	}, nil
 }
 
+// RegionQuota holds quota information for a region.
+type RegionQuota struct {
+	Region        string
+	QuotaLimit    int // Total vCPU quota for spot instances
+	QuotaUsed     int // Currently used vCPUs (estimated from running instances)
+	QuotaAvail    int // Available quota (limit - used)
+	HasSufficent  bool
+	VCPUsRequired int
+}
+
 // RegionResult holds the best pricing result for a region.
 type RegionResult struct {
 	Region      string
@@ -174,11 +239,387 @@ type RegionResult struct {
 	TotalPrice  float64
 	Score       int // Placement score (1-10, higher is better)
 	Available   bool
+	Quota       *RegionQuota
+}
+
+// ArchitectureSelection holds the selected region/AZ for one architecture.
+type ArchitectureSelection struct {
+	Arch       string
+	Region     string
+	AZ         string
+	ServerType string
+	ClientType string
+	ServerBid  *BidResult
+	ClientBid  *BidResult
+	VCPUs      int
+}
+
+// GetVCPUsForPair returns the total vCPUs needed for a server+client pair.
+func GetVCPUsForPair(serverType, clientType string) int {
+	serverVCPUs := instanceVCPUs[serverType]
+	clientVCPUs := instanceVCPUs[clientType]
+	if serverVCPUs == 0 {
+		slog.Warn("unknown vCPU count for instance type, assuming 64", "type", serverType)
+		serverVCPUs = 64 // Conservative default for unknown types
+	}
+	if clientVCPUs == 0 {
+		slog.Warn("unknown vCPU count for instance type, assuming 64", "type", clientType)
+		clientVCPUs = 64
+	}
+	return serverVCPUs + clientVCPUs
+}
+
+// getRegionQuota checks the spot instance quota for a region.
+func getRegionQuota(ctx context.Context, region string, vcpusRequired int) *RegionQuota {
+	quota := &RegionQuota{
+		Region:        region,
+		VCPUsRequired: vcpusRequired,
+		HasSufficent:  false,
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		slog.Debug("failed to load config for quota check", "region", region, "error", err)
+		return quota
+	}
+
+	sqClient := servicequotas.NewFromConfig(cfg)
+
+	// Get the quota limit
+	result, err := awsutil.WithRetry(ctx, "GetServiceQuota", awsutil.DefaultMaxRetries, func() (*servicequotas.GetServiceQuotaOutput, error) {
+		return sqClient.GetServiceQuota(ctx, &servicequotas.GetServiceQuotaInput{
+			ServiceCode: strPtr("ec2"),
+			QuotaCode:   strPtr(SpotQuotaCode),
+		})
+	})
+	if err != nil {
+		slog.Debug("failed to get quota", "region", region, "error", err)
+		// If we can't check quota, assume it's not available
+		return quota
+	}
+
+	if result.Quota != nil && result.Quota.Value != nil {
+		quota.QuotaLimit = int(*result.Quota.Value)
+	}
+
+	// Estimate used quota by counting running spot instances
+	// This is an approximation - actual usage tracking would require CloudWatch
+	ec2Client := ec2.NewFromConfig(cfg)
+	instances, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{Name: strPtr("instance-lifecycle"), Values: []string{"spot"}},
+			{Name: strPtr("instance-state-name"), Values: []string{"pending", "running"}},
+			{Name: strPtr("tag:Project"), Values: []string{"celeris-benchmarks"}},
+		},
+	})
+	if err == nil {
+		for _, res := range instances.Reservations {
+			for _, inst := range res.Instances {
+				if vcpus, ok := instanceVCPUs[string(inst.InstanceType)]; ok {
+					quota.QuotaUsed += vcpus
+				}
+			}
+		}
+	}
+
+	quota.QuotaAvail = quota.QuotaLimit - quota.QuotaUsed
+	quota.HasSufficent = quota.QuotaAvail >= vcpusRequired
+
+	slog.Debug("region quota check",
+		"region", region,
+		"limit", quota.QuotaLimit,
+		"used", quota.QuotaUsed,
+		"available", quota.QuotaAvail,
+		"required", vcpusRequired,
+		"sufficient", quota.HasSufficent)
+
+	return quota
+}
+
+// FindBestRegionsForBenchmark finds the best regions for both architectures,
+// ensuring quota is properly allocated between them.
+// Returns selections for arm64 and x86, which may be in the same or different regions.
+func FindBestRegionsForBenchmark(ctx context.Context, mode string) (arm64 *ArchitectureSelection, x86 *ArchitectureSelection, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	// Get instance types for both architectures
+	arm64Server, arm64Client, err := GetInstancesForMode(mode, "arm64")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get arm64 instances: %w", err)
+	}
+	x86Server, x86Client, err := GetInstancesForMode(mode, "x86")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get x86 instances: %w", err)
+	}
+
+	arm64VCPUs := GetVCPUsForPair(arm64Server, arm64Client)
+	x86VCPUs := GetVCPUsForPair(x86Server, x86Client)
+	totalVCPUs := arm64VCPUs + x86VCPUs
+
+	slog.Info("calculating vCPU requirements",
+		"mode", mode,
+		"arm64_vcpus", arm64VCPUs,
+		"x86_vcpus", x86VCPUs,
+		"total_vcpus", totalVCPUs)
+
+	// Step 1: Check quotas in all regions in parallel
+	type regionQuotaResult struct {
+		region string
+		quota  *RegionQuota
+	}
+	var (
+		quotaResults []regionQuotaResult
+		quotaMu      sync.Mutex
+		quotaWg      sync.WaitGroup
+	)
+
+	for _, region := range SupportedRegions {
+		quotaWg.Add(1)
+		go func(region string) {
+			defer quotaWg.Done()
+			// Check if region has enough for BOTH architectures
+			quota := getRegionQuota(ctx, region, totalVCPUs)
+			quotaMu.Lock()
+			quotaResults = append(quotaResults, regionQuotaResult{region, quota})
+			quotaMu.Unlock()
+		}(region)
+	}
+	quotaWg.Wait()
+
+	// Separate regions into those that can handle both vs. single architecture
+	var regionsBoth, regionsSingle []string
+	for _, r := range quotaResults {
+		if r.quota.QuotaAvail >= totalVCPUs {
+			regionsBoth = append(regionsBoth, r.region)
+			slog.Debug("region can handle both architectures",
+				"region", r.region,
+				"available", r.quota.QuotaAvail,
+				"required", totalVCPUs)
+		} else if r.quota.QuotaAvail >= arm64VCPUs || r.quota.QuotaAvail >= x86VCPUs {
+			regionsSingle = append(regionsSingle, r.region)
+			slog.Debug("region can handle single architecture",
+				"region", r.region,
+				"available", r.quota.QuotaAvail)
+		}
+	}
+
+	slog.Info("quota check complete",
+		"regions_both", len(regionsBoth),
+		"regions_single", len(regionsSingle))
+
+	// Step 2: Try to find a single region for both (preferred)
+	if len(regionsBoth) > 0 {
+		arm64Sel, x86Sel, err := findBestRegionForBoth(ctx, regionsBoth, mode, arm64Server, arm64Client, x86Server, x86Client)
+		if err == nil {
+			return arm64Sel, x86Sel, nil
+		}
+		slog.Warn("failed to find single region for both, trying split", "error", err)
+	}
+
+	// Step 3: Fall back to separate regions for each architecture
+	allRegions := append(regionsBoth, regionsSingle...)
+	if len(allRegions) == 0 {
+		return nil, nil, fmt.Errorf("no regions have sufficient quota for benchmarks (need %d vCPUs)", totalVCPUs)
+	}
+
+	// Find best region for arm64
+	arm64Sel, err := findBestRegionForArch(ctx, allRegions, "arm64", arm64Server, arm64Client, arm64VCPUs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to find region for arm64: %w", err)
+	}
+
+	// Find best region for x86 (excluding arm64's region if quota is tight)
+	x86Regions := allRegions
+	// Check if arm64's region can also fit x86
+	for _, r := range quotaResults {
+		if r.region == arm64Sel.Region && r.quota.QuotaAvail < totalVCPUs {
+			// Need to use a different region for x86
+			x86Regions = make([]string, 0, len(allRegions)-1)
+			for _, reg := range allRegions {
+				if reg != arm64Sel.Region {
+					x86Regions = append(x86Regions, reg)
+				}
+			}
+			break
+		}
+	}
+
+	x86Sel, err := findBestRegionForArch(ctx, x86Regions, "x86", x86Server, x86Client, x86VCPUs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to find region for x86: %w", err)
+	}
+
+	return arm64Sel, x86Sel, nil
+}
+
+// findBestRegionForBoth finds the best single region that can run both architectures.
+func findBestRegionForBoth(ctx context.Context, regions []string, mode, arm64Server, arm64Client, x86Server, x86Client string) (*ArchitectureSelection, *ArchitectureSelection, error) {
+	type combinedResult struct {
+		region      string
+		arm64Result RegionResult
+		x86Result   RegionResult
+		totalPrice  float64
+		minScore    int
+	}
+
+	var (
+		results []combinedResult
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+	)
+
+	for _, region := range regions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+
+			arm64Res := queryRegionPrices(ctx, region, arm64Server, arm64Client)
+			x86Res := queryRegionPrices(ctx, region, x86Server, x86Client)
+
+			if arm64Res.Available && x86Res.Available {
+				minScore := arm64Res.Score
+				if x86Res.Score < minScore {
+					minScore = x86Res.Score
+				}
+
+				mu.Lock()
+				results = append(results, combinedResult{
+					region:      region,
+					arm64Result: arm64Res,
+					x86Result:   x86Res,
+					totalPrice:  arm64Res.TotalPrice + x86Res.TotalPrice,
+					minScore:    minScore,
+				})
+				mu.Unlock()
+			}
+		}(region)
+	}
+	wg.Wait()
+
+	if len(results) == 0 {
+		return nil, nil, fmt.Errorf("no region found with availability for both architectures")
+	}
+
+	// Sort by score (desc) then total price (asc)
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].minScore != results[j].minScore {
+			return results[i].minScore > results[j].minScore
+		}
+		return results[i].totalPrice < results[j].totalPrice
+	})
+
+	best := results[0]
+	slog.Info("selected single region for both architectures",
+		"region", best.region,
+		"arm64_az", best.arm64Result.AZ,
+		"x86_az", best.x86Result.AZ,
+		"total_price", best.totalPrice,
+		"score", best.minScore)
+
+	// Create client for bid calculations
+	client, err := NewClient(best.region)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	arm64Sel := createArchSelection(ctx, client, "arm64", best.region, best.arm64Result, arm64Server, arm64Client)
+	x86Sel := createArchSelection(ctx, client, "x86", best.region, best.x86Result, x86Server, x86Client)
+
+	return arm64Sel, x86Sel, nil
+}
+
+// findBestRegionForArch finds the best region for a single architecture.
+func findBestRegionForArch(ctx context.Context, regions []string, arch, serverType, clientType string, vcpusRequired int) (*ArchitectureSelection, error) {
+	var (
+		results []RegionResult
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+	)
+
+	for _, region := range regions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+			result := queryRegionPrices(ctx, region, serverType, clientType)
+			if result.Available {
+				// Also verify quota for this specific architecture
+				quota := getRegionQuota(ctx, region, vcpusRequired)
+				if quota.HasSufficent {
+					result.Quota = quota
+					mu.Lock()
+					results = append(results, result)
+					mu.Unlock()
+				}
+			}
+		}(region)
+	}
+	wg.Wait()
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no region found with availability and quota for %s", arch)
+	}
+
+	// Sort by score (desc) then price (asc)
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		return results[i].TotalPrice < results[j].TotalPrice
+	})
+
+	best := results[0]
+	client, err := NewClient(best.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	return createArchSelection(ctx, client, arch, best.Region, best, serverType, clientType), nil
+}
+
+// createArchSelection creates an ArchitectureSelection from a RegionResult.
+func createArchSelection(ctx context.Context, client *Client, arch, region string, result RegionResult, serverType, clientType string) *ArchitectureSelection {
+	serverOnDemand, _ := client.getOnDemandPrice(ctx, serverType)
+	clientOnDemand, _ := client.getOnDemandPrice(ctx, clientType)
+
+	serverBid := result.ServerPrice * 1.50
+	if serverOnDemand > 0 && serverBid > serverOnDemand {
+		serverBid = serverOnDemand
+	}
+
+	clientBid := result.ClientPrice * 1.50
+	if clientOnDemand > 0 && clientBid > clientOnDemand {
+		clientBid = clientOnDemand
+	}
+
+	return &ArchitectureSelection{
+		Arch:       arch,
+		Region:     region,
+		AZ:         result.AZ,
+		ServerType: serverType,
+		ClientType: clientType,
+		VCPUs:      GetVCPUsForPair(serverType, clientType),
+		ServerBid: &BidResult{
+			InstanceType:  serverType,
+			AZ:            result.AZ,
+			CurrentPrice:  result.ServerPrice,
+			BidPrice:      serverBid,
+			OnDemandPrice: serverOnDemand,
+		},
+		ClientBid: &BidResult{
+			InstanceType:  clientType,
+			AZ:            result.AZ,
+			CurrentPrice:  result.ClientPrice,
+			BidPrice:      clientBid,
+			OnDemandPrice: clientOnDemand,
+		},
+	}
 }
 
 // FindBestRegionForPair queries all supported regions in parallel to find the
 // cheapest region with availability for both server and client instance types.
 // Returns the best region, AZ, and bid results for both instances.
+// NOTE: This function does not check quotas. Use FindBestRegionsForBenchmark for quota-aware selection.
 func FindBestRegionForPair(ctx context.Context, serverType, clientType string) (string, string, *BidResult, *BidResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
