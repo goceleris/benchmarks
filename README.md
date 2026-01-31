@@ -79,10 +79,14 @@ The C2 orchestration system manages AWS spot instances, handles capacity fallbac
 ## Infrastructure
 
 Benchmarks run on AWS using a C2 (command and control) server that:
-- Provisions spot instances with on-demand fallback
+- Provisions spot instances with on-demand fallback across multiple regions
+- Selects regions dynamically based on spot pricing and vCPU quota availability
 - Coordinates server/client workers across availability zones
+- Logs region/AZ placement for each worker in workflow output
 - Collects results and generates charts
 - Cleans up resources automatically
+
+PRs can deploy their own C2 server by adding the `deploy-c2` label, enabling testing of C2 code changes in isolation.
 
 Required AWS quotas for metal benchmarks:
 - ARM64: 64 vCPU (c6g.metal)
