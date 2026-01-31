@@ -334,18 +334,10 @@ jobs:
             git commit -m "$COMMIT_MSG"
             git push -u origin "$BRANCH"
 
-            PR_BODY="Automated benchmark results from run \`$RUN_ID\`.
-
-## Results
-- ARM64: $ARM64_COUNT benchmarks
-- x86: $X86_COUNT benchmarks
-
-**Please review the results before merging.**"
-
             PR_TITLE="$COMMIT_MSG"
             PR_URL=$(gh pr create \
               --title "$PR_TITLE" \
-              --body "$PR_BODY" \
+              --body "Automated benchmark results from run \`$RUN_ID\`.\n\n## Results\n- ARM64: $ARM64_COUNT benchmarks\n- x86: $X86_COUNT benchmarks\n\n**Please review the results before merging.**" \
               --base main)
 
             echo "::notice::Results PR created: $PR_URL"
