@@ -86,7 +86,7 @@ Benchmarks run on AWS using a C2 (command and control) server that:
 - Collects results and generates charts
 - Cleans up resources automatically
 
-PRs can deploy their own C2 server by adding the `deploy-c2` label, enabling testing of C2 code changes in isolation.
+PRs can deploy their own C2 server by adding a benchmark label (`bench-fast`, `bench-med`, or `bench-metal`), enabling testing of C2 code changes in isolation.
 
 Required AWS quotas for metal benchmarks:
 - ARM64: 64 vCPU (c6g.metal)
