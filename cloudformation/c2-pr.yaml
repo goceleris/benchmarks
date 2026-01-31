@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ephemeral C2 server for PR testing - on-demand instance in us-east-1
+
+Parameters:
+  PRNumber:
+    Type: String
+    Description: Pull request number for identification
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: C2 server instance type (x86 for simplicity)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for C2 server
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for C2 server
+
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key for authenticating requests to C2
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub PAT for operations
+
+  C2BinaryUrl:
+    Type: String
+    Description: URL to download PR-specific C2 binary
+
+  MainC2SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Main C2 security group ID (for worker SG reference)
+
+  WorkerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Worker security group ID
+
+  WorkerInstanceProfileArn:
+    Type: String
+    Description: Worker instance profile ARN
+
+Resources:
+  # Security Group for PR C2 Server
+  PRC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'celeris-c2-pr-${PRNumber}-sg'
+      GroupDescription: !Sub 'Security group for PR ${PRNumber} C2 server'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: C2 API access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub 'celeris-c2-pr-${PRNumber}-sg'
+        - Key: Project
+          Value: celeris-benchmarks
+        - Key: PRNumber
+          Value: !Ref PRNumber
+
+  # Allow workers to communicate with PR C2
+  WorkerToPRC2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PRC2SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref WorkerSecurityGroupId
+      Description: Allow traffic from workers
+
+  # IAM Role for PR C2 Server
+  PRC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'celeris-c2-pr-${PRNumber}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: PRC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 permissions for managing workers
+              - Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSpotPriceHistory
+                  - ec2:RequestSpotInstances
+                  - ec2:CancelSpotInstanceRequests
+                  - ec2:DescribeSpotInstanceRequests
+                  - ec2:CreateTags
+                  - ec2:DescribeImages
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:GetSpotPlacementScores
+                Resource: '*'
+              # Spot Fleet permissions
+              - Effect: Allow
+                Action:
+                  - ec2:RequestSpotFleet
+                  - ec2:ModifySpotFleetRequest
+                  - ec2:CancelSpotFleetRequests
+                  - ec2:DescribeSpotFleetRequests
+                  - ec2:DescribeSpotFleetInstances
+                  - ec2:CreateLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
+                Resource: '*'
+              # CloudFormation for worker stacks
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:UpdateStack
+                  - cloudformation:ListStacks
+                Resource: '*'
+              # Pricing API for multi-region selection
+              - Effect: Allow
+                Action:
+                  - pricing:GetProducts
+                Resource: '*'
+              # Service Quotas for quota-aware selection
+              - Effect: Allow
+                Action:
+                  - servicequotas:GetServiceQuota
+                Resource: '*'
+              # IAM PassRole for workers and spot fleet
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Ref WorkerInstanceProfileArn
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+      Tags:
+        - Key: Project
+          Value: celeris-benchmarks
+        - Key: PRNumber
+          Value: !Ref PRNumber
+
+  # IAM Instance Profile for PR C2
+  PRC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'celeris-c2-pr-${PRNumber}-profile'
+      Roles:
+        - !Ref PRC2Role
+
+  # PR C2 Instance (on-demand, no ASG needed for ephemeral use)
+  PRC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref PRC2SecurityGroup
+      IamInstanceProfile: !Ref PRC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          exec > >(tee /var/log/c2-init.log) 2>&1
+          echo "=== PR C2 Server Bootstrap Started (PR #${PRNumber}) ==="
+
+          # Install dependencies
+          apt-get update -qq
+          apt-get install -y -qq curl jq awscli
+
+          # Create directories
+          mkdir -p /data/badger /data/logs /opt/celeris
+
+          # Download PR-specific C2 binary
+          echo "Downloading C2 binary for PR #${PRNumber}..."
+          curl -sL -o /usr/local/bin/c2 "${C2BinaryUrl}"
+          chmod +x /usr/local/bin/c2
+
+          # Get public IP for endpoint
+          PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+          # Create systemd service
+          cat > /etc/systemd/system/c2.service << SERVICEEOF
+          [Unit]
+          Description=Celeris C2 Benchmark Orchestrator (PR #${PRNumber})
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/celeris
+          ExecStart=/usr/local/bin/c2 -data-dir /data/badger -log-dir /data/logs -http-addr :8080
+          Restart=always
+          RestartSec=5
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=GITHUB_TOKEN=${GitHubToken}
+          Environment=C2_API_KEY=${ApiKey}
+          Environment=SECURITY_GROUP_ID=${WorkerSecurityGroupId}
+          Environment=INSTANCE_PROFILE_ARN=${WorkerInstanceProfileArn}
+          Environment=SUBNET_ID=${SubnetId}
+          Environment=C2_ENDPOINT=http://$PUBLIC_IP:8080
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICEEOF
+
+          systemctl daemon-reload
+          systemctl enable c2
+          systemctl start c2
+
+          echo "=== PR C2 Server Bootstrap Complete ==="
+          echo "C2 Endpoint: http://$PUBLIC_IP:8080"
+      Tags:
+        - Key: Name
+          Value: !Sub 'celeris-c2-pr-${PRNumber}'
+        - Key: Project
+          Value: celeris-benchmarks
+        - Key: PRNumber
+          Value: !Ref PRNumber
+
+Outputs:
+  PRC2InstanceId:
+    Description: PR C2 Instance ID
+    Value: !Ref PRC2Instance
+
+  PRC2PublicIP:
+    Description: PR C2 Public IP
+    Value: !GetAtt PRC2Instance.PublicIp
+
+  PRC2Endpoint:
+    Description: PR C2 API Endpoint
+    Value: !Sub 'http://${PRC2Instance.PublicIp}:8080'
+
+  PRC2SecurityGroupId:
+    Description: PR C2 Security Group ID
+    Value: !Ref PRC2SecurityGroup

@@ -144,6 +144,7 @@ Resources:
                   - ec2:RequestSpotInstances
                   - ec2:CancelSpotInstanceRequests
                   - ec2:DescribeSpotInstanceRequests
+                  - ec2:GetSpotPlacementScores
                   - ec2:CreateTags
                   - ec2:DescribeImages
                   - ec2:DescribeSubnets
@@ -176,6 +177,16 @@ Resources:
                   - cloudformation:DescribeStackEvents
                   - cloudformation:UpdateStack
                   - cloudformation:ListStacks
+                Resource: '*'
+              # Pricing API for multi-region selection
+              - Effect: Allow
+                Action:
+                  - pricing:GetProducts
+                Resource: '*'
+              # Service Quotas for quota-aware selection
+              - Effect: Allow
+                Action:
+                  - servicequotas:GetServiceQuota
                 Resource: '*'
               # SSM Parameter Store for secrets
               - Effect: Allow
