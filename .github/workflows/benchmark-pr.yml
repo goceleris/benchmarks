@@ -458,7 +458,7 @@ jobs:
             | xargs -I {} gh api -X DELETE "repos/${{ github.repository }}/issues/comments/{}" 2>/dev/null || true
 
           # Post new comment
-          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file -
+          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file -
           echo "Posted results to PR #$PR_NUMBER"
 
       - name: Get Results Summary (Fallback)
