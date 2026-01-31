@@ -243,7 +243,7 @@ jobs:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Commit Metal Results to Repository
+      - name: Create PR with Benchmark Results
         if: |
           success() &&
           steps.mode.outputs.mode == 'metal' &&
@@ -252,7 +252,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ steps.start.outputs.run_id }}"
-          echo "Committing metal results to repository..."
+          echo "Creating PR with metal results..."
 
           # Restore results from temp location
           cp /tmp/benchmark_results.json results.json
@@ -260,18 +260,31 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Create branch name with tag and timestamp
+          TAG="${{ github.event.release.tag_name }}"
+          BRANCH="results/${TAG:-manual}-$(date +%Y%m%d%H%M%S)"
+
+          git checkout -b "$BRANCH"
+
           # Determine result paths
           PATHS=("results/latest")
           if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
             PATHS+=("results/$TAG")
           fi
 
           # Process each architecture
+          ARM64_COUNT=0
+          X86_COUNT=0
           for arch in arm64 x86; do
             ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
             BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
             COUNT=$(echo "$BENCHMARKS" | jq 'length')
+
+            if [[ "$arch" == "arm64" ]]; then
+              ARM64_COUNT=$COUNT
+            else
+              X86_COUNT=$COUNT
+            fi
 
             if [[ "$COUNT" -gt 0 ]]; then
               for path in "${PATHS[@]}"; do
@@ -301,17 +314,35 @@ jobs:
             fi
           done
 
-          # Commit if there are changes
+          # Commit and push if there are changes
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
             COMMIT_MSG="chore: update benchmark results"
             if [[ "${{ github.event_name }}" == "release" ]]; then
-              COMMIT_MSG="chore: add benchmark results for ${{ github.event.release.tag_name }}"
+              COMMIT_MSG="chore: add benchmark results for $TAG"
             fi
             git commit -m "$COMMIT_MSG"
-            git push
-            echo "Results committed successfully"
+            git push -u origin "$BRANCH"
+
+            # Create PR body with results summary
+            PR_BODY="Automated benchmark results from run \`$RUN_ID\`.
+
+## Results
+- ARM64: $ARM64_COUNT benchmarks
+- x86: $X86_COUNT benchmarks
+
+**Please review the results before merging.**"
+
+            # Create PR (no auto-merge)
+            PR_TITLE="$COMMIT_MSG"
+            PR_URL=$(gh pr create \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY" \
+              --base main)
+
+            echo "::notice::Results PR created: $PR_URL"
+            echo "Results PR created successfully: $PR_URL"
           fi
 
       - name: Post PR Comment with Results
