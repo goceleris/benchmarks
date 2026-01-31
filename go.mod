@@ -16,6 +16,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/kataras/iris/v12 v12.2.11
 	github.com/labstack/echo/v4 v4.15.0
+	github.com/magefile/mage v1.15.0
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0
 )

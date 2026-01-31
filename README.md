@@ -42,13 +42,13 @@ Results are committed to [`results/`](results/) on each release. See benchmark c
 # Clone and build
 git clone https://github.com/goceleris/benchmarks
 cd benchmarks
-make build
+mage build
 
 # Run a quick local benchmark
-make benchmark-quick
+mage benchmarkQuick
 
 # Run full benchmark (30s per server)
-make benchmark
+mage benchmark
 ```
 
 ### Benchmark Tool
@@ -94,9 +94,45 @@ Required AWS quotas for metal benchmarks:
 
 ## Contributing
 
+### Requirements
+
+- **Go 1.21+**: [Download](https://go.dev/dl/)
+- **Mage**: Build tool (Go-based Make alternative)
+  ```bash
+  go install github.com/magefile/mage@latest
+  ```
+- **golangci-lint** (optional): Auto-installed by `mage lint` if missing
+
+### Available Commands
+
+| Command | Description |
+|---------|-------------|
+| `mage build` | Build all binaries (server, bench, c2) |
+| `mage buildServer` | Build server binary only |
+| `mage buildBench` | Build benchmark tool only |
+| `mage buildC2` | Build C2 server only |
+| `mage buildLinux` | Cross-compile for Linux amd64 |
+| `mage buildLinuxArm` | Cross-compile for Linux arm64 |
+| `mage buildAll` | Cross-compile for all platforms |
+| `mage lint` | Run golangci-lint |
+| `mage fmt` | Format Go code |
+| `mage vet` | Run go vet |
+| `mage test` | Run unit tests |
+| `mage benchmark` | Run benchmarks (30s per server) |
+| `mage benchmarkQuick` | Quick benchmark validation (5s) |
+| `mage deps` | Download Go dependencies |
+| `mage check` | Run all checks (lint, vet, build) |
+| `mage clean` | Clean build artifacts |
+
+Run `mage -l` to see all available targets with descriptions.
+
+### Development Workflow
+
 1. Fork and create a feature branch
-2. Run `make check` before submitting
-3. Add `run-benchmarks` label to PRs for benchmark validation
+2. Make your changes
+3. Run `mage check` to verify everything passes
+4. Submit a pull request
+5. Add `bench-fast` label to PRs for benchmark validation
 
 ### Adding a Server
 
