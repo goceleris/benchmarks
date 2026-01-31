@@ -269,7 +269,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ secrets.GH_PAT_RUNNER_TOKEN }}
 
       - name: Commit Benchmark Results
         if: success() && steps.mode.outputs.mode == 'metal' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
