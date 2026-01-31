@@ -1,5 +1,4 @@
 name: Benchmark
-# Triggers: release, manual dispatch
 
 on:
   release:
@@ -7,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Benchmark mode'
+        description: Benchmark mode
         required: false
         type: choice
         options:
@@ -16,11 +15,11 @@ on:
           - metal
         default: fast
       duration:
-        description: 'Benchmark duration (e.g., 10s, 30s, 60s)'
+        description: Benchmark duration (e.g., 10s, 30s, 60s)
         required: false
         default: ''
       bench_mode:
-        description: 'Servers to benchmark'
+        description: Servers to benchmark
         required: false
         type: choice
         options:
@@ -87,7 +86,7 @@ jobs:
           echo "Waiting for benchmark $RUN_ID to complete..."
 
           POLL_INTERVAL=30
-          MAX_WAIT=14400  # 4 hours
+          MAX_WAIT=14400
           ELAPSED=0
           LAST_QUEUE_POS=0
           PLACEMENT_SHOWN=false
@@ -110,7 +109,6 @@ jobs:
                 exit 1
                 ;;
               queued)
-                # Show queue position
                 QUEUE_POS=$(echo "$RESPONSE" | jq -r '.queue_position // 0')
                 if [[ "$QUEUE_POS" != "$LAST_QUEUE_POS" ]]; then
                   echo "[$((ELAPSED/60))m] Queued - position $QUEUE_POS (waiting for capacity)"
@@ -118,7 +116,6 @@ jobs:
                 fi
                 ;;
               pending|running)
-                # Show worker placement info once when workers register
                 if [[ "$PLACEMENT_SHOWN" == "false" ]]; then
                   WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                   if [[ "$WORKERS" != "{}" ]]; then
@@ -144,12 +141,9 @@ jobs:
                     fi
                   fi
                 fi
-
-                # Show progress
                 echo "[$((ELAPSED/60))m] Status: $STATUS"
                 WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                 if [[ "$WORKERS" != "{}" ]]; then
-                  # Extract and display progress from workers
                   for arch in arm64 x86; do
                     CLIENT_KEY="${arch}-client"
                     CLIENT=$(echo "$RESPONSE" | jq -r ".workers[\"$CLIENT_KEY\"] // {}")
@@ -158,7 +152,6 @@ jobs:
                       CURRENT_BENCH=$(echo "$CLIENT" | jq -r '.current_benchmark // ""')
                       CURRENT_COUNT=$(echo "$CLIENT" | jq -r '.current_count // 0')
                       TOTAL_COUNT=$(echo "$CLIENT" | jq -r '.total_count // 0')
-
                       if [[ -n "$CURRENT_SERVER" && -n "$CURRENT_BENCH" && "$TOTAL_COUNT" -gt 0 ]]; then
                         echo "  $arch: Testing $CURRENT_SERVER/$CURRENT_BENCH ($CURRENT_COUNT/$TOTAL_COUNT)"
                       fi
@@ -189,16 +182,13 @@ jobs:
             exit 0
           fi
 
-          # Fetch full results
           RESULTS=$(curl -sf \
             -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
             "$C2_URL/api/benchmark/$RUN_ID/results" || echo '{}')
 
-          # Store results for later steps
           echo "$RESULTS" > results.json
           echo "results_file=results.json" >> $GITHUB_OUTPUT
 
-          # Get status
           STATUS_RESPONSE=$(curl -sf \
             -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
             "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
@@ -213,7 +203,6 @@ jobs:
           RUN_ID="${{ steps.start.outputs.run_id }}"
           MODE="${{ steps.mode.outputs.mode }}"
 
-          # Generate markdown summary
           echo "## Benchmark Results - ${MODE^^} Mode" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** \`$RUN_ID\`" >> $GITHUB_STEP_SUMMARY
@@ -221,13 +210,11 @@ jobs:
           echo "**C2:** Main" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Show worker placement info
           echo "### Worker Placement" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Architecture | Role | Instance Type | Region | AZ |" >> $GITHUB_STEP_SUMMARY
           echo "|--------------|------|---------------|--------|-----|" >> $GITHUB_STEP_SUMMARY
 
-          # Fetch status to get worker info
           STATUS_RESPONSE=$(curl -sf \
             -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
             "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
@@ -248,7 +235,6 @@ jobs:
 
           for arch in arm64 x86; do
             ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
-            ARCH_STATUS=$(echo "$ARCH_RESULTS" | jq -r '.status // "pending"')
             BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
             COUNT=$(echo "$BENCHMARKS" | jq 'length')
 
@@ -264,54 +250,40 @@ jobs:
           done
 
       - name: Save Results for Commit
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        if: success() && steps.mode.outputs.mode == 'metal' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
         run: |
-          # Save results to temp location before checkout overwrites workspace
           cp results.json /tmp/benchmark_results.json
 
       - name: Checkout Repository
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        if: success() && steps.mode.outputs.mode == 'metal' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
         uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create PR with Benchmark Results
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        if: success() && steps.mode.outputs.mode == 'metal' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ steps.start.outputs.run_id }}"
           echo "Creating PR with metal results..."
 
-          # Restore results from temp location
           cp /tmp/benchmark_results.json results.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Create branch name with tag and timestamp
           TAG="${{ github.event.release.tag_name }}"
           BRANCH="results/${TAG:-manual}-$(date +%Y%m%d%H%M%S)"
 
           git checkout -b "$BRANCH"
 
-          # Determine result paths
           PATHS=("results/latest")
           if [[ "${{ github.event_name }}" == "release" ]]; then
             PATHS+=("results/$TAG")
           fi
 
-          # Process each architecture
           ARM64_COUNT=0
           X86_COUNT=0
           for arch in arm64 x86; do
@@ -329,7 +301,6 @@ jobs:
               for path in "${PATHS[@]}"; do
                 mkdir -p "$path/$arch"
 
-                # Create results JSON with metadata
                 jq -n \
                   --arg run_id "$RUN_ID" \
                   --arg arch "$arch" \
@@ -353,7 +324,6 @@ jobs:
             fi
           done
 
-          # Commit and push if there are changes
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
@@ -364,7 +334,6 @@ jobs:
             git commit -m "$COMMIT_MSG"
             git push -u origin "$BRANCH"
 
-            # Create PR body with results summary
             PR_BODY="Automated benchmark results from run \`$RUN_ID\`.
 
 ## Results
@@ -373,7 +342,6 @@ jobs:
 
 **Please review the results before merging.**"
 
-            # Create PR (no auto-merge)
             PR_TITLE="$COMMIT_MSG"
             PR_URL=$(gh pr create \
               --title "$PR_TITLE" \
@@ -423,7 +391,6 @@ jobs:
 
           echo "Cancel response: $RESPONSE"
 
-          # Also add to summary
           echo "## Benchmark Cancelled" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** $RUN_ID" >> $GITHUB_STEP_SUMMARY
