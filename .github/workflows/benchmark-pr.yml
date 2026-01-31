@@ -226,24 +226,33 @@ jobs:
                 fi
                 ;;
               pending|running)
-                # Show worker placement info once when workers register
+                # Show worker placement info once when ALL 4 workers register
                 if [[ "$PLACEMENT_SHOWN" == "false" ]]; then
                   WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
                   if [[ "$WORKERS" != "{}" ]]; then
-                    WORKER_COUNT=$(echo "$WORKERS" | jq 'keys | length')
-                    if [[ "$WORKER_COUNT" -gt 0 ]]; then
+                    # Check if all 4 workers are registered
+                    HAS_ALL_WORKERS=true
+                    for arch in arm64 x86; do
+                      for role in server client; do
+                        KEY="${arch}-${role}"
+                        WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"] // empty")
+                        if [[ -z "$WORKER" ]]; then
+                          HAS_ALL_WORKERS=false
+                        fi
+                      done
+                    done
+
+                    if [[ "$HAS_ALL_WORKERS" == "true" ]]; then
                       echo ""
                       echo "=== Worker Placement ==="
                       for arch in arm64 x86; do
                         for role in server client; do
                           KEY="${arch}-${role}"
-                          WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
-                          if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
-                            W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "unknown"')
-                            W_REGION=$(echo "$WORKER" | jq -r '.region // "unknown"')
-                            W_AZ=$(echo "$WORKER" | jq -r '.az // "unknown"')
-                            echo "  $arch $role: $W_TYPE in $W_REGION ($W_AZ)"
-                          fi
+                          WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"]")
+                          W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "unknown"')
+                          W_REGION=$(echo "$WORKER" | jq -r '.region // "unknown"')
+                          W_AZ=$(echo "$WORKER" | jq -r '.az // "unknown"')
+                          echo "  $arch $role: $W_TYPE in $W_REGION ($W_AZ)"
                         done
                       done
                       echo "========================="
