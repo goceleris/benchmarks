@@ -442,6 +442,7 @@ Resources:
             /usr/local/bin/bench \
               -mode "${BenchmarkMode}" \
               -duration "${BenchmarkDuration}" \
+              -infra-mode "${Mode}" \
               -server-ip "$SERVER_IP" \
               -control-port 9999 \
               -c2-endpoint "${C2Endpoint}" \
