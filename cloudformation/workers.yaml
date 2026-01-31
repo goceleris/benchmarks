@@ -143,6 +143,9 @@ Resources:
             # Metadata
             INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
             PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            REGION="${AWS::Region}"
 
             # Install dependencies
             apt-get update -qq
@@ -170,7 +173,7 @@ Resources:
             # Register with C2
             curl -sf -X POST "${C2Endpoint}/api/worker/register" \
               -H "Content-Type: application/json" \
-              -d "{\"run_id\":\"${RunId}\",\"role\":\"server\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"private_ip\":\"$PRIVATE_IP\"}"
+              -d "{\"run_id\":\"${RunId}\",\"role\":\"server\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"instance_type\":\"$INSTANCE_TYPE\",\"private_ip\":\"$PRIVATE_IP\",\"region\":\"$REGION\",\"az\":\"$AZ\"}"
 
             # Start server (control daemon mode)
             echo "Starting server in control mode..."
@@ -248,6 +251,9 @@ Resources:
             # Metadata
             INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
             PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            REGION="${AWS::Region}"
 
             # Install dependencies
             apt-get update -qq
@@ -275,7 +281,7 @@ Resources:
             # Register with C2
             curl -sf -X POST "${C2Endpoint}/api/worker/register" \
               -H "Content-Type: application/json" \
-              -d "{\"run_id\":\"${RunId}\",\"role\":\"client\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"private_ip\":\"$PRIVATE_IP\"}"
+              -d "{\"run_id\":\"${RunId}\",\"role\":\"client\",\"arch\":\"${Architecture}\",\"instance_id\":\"$INSTANCE_ID\",\"instance_type\":\"$INSTANCE_TYPE\",\"private_ip\":\"$PRIVATE_IP\",\"region\":\"$REGION\",\"az\":\"$AZ\"}"
 
             # Wait for server to be ready (C2 will provide server IP)
             echo "Waiting for server assignment from C2..."

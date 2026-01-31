@@ -107,6 +107,7 @@ jobs:
           MAX_WAIT=14400  # 4 hours
           ELAPSED=0
           LAST_QUEUE_POS=0
+          PLACEMENT_SHOWN=false
 
           while [ $ELAPSED -lt $MAX_WAIT ]; do
             RESPONSE=$(curl -sf \
@@ -134,6 +135,33 @@ jobs:
                 fi
                 ;;
               pending|running)
+                # Show worker placement info once when workers register
+                if [[ "$PLACEMENT_SHOWN" == "false" ]]; then
+                  WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
+                  if [[ "$WORKERS" != "{}" ]]; then
+                    WORKER_COUNT=$(echo "$WORKERS" | jq 'keys | length')
+                    if [[ "$WORKER_COUNT" -gt 0 ]]; then
+                      echo ""
+                      echo "=== Worker Placement ==="
+                      for arch in arm64 x86; do
+                        for role in server client; do
+                          KEY="${arch}-${role}"
+                          WORKER=$(echo "$RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
+                          if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
+                            W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "unknown"')
+                            W_REGION=$(echo "$WORKER" | jq -r '.region // "unknown"')
+                            W_AZ=$(echo "$WORKER" | jq -r '.az // "unknown"')
+                            echo "  $arch $role: $W_TYPE in $W_REGION ($W_AZ)"
+                          fi
+                        done
+                      done
+                      echo "========================="
+                      echo ""
+                      PLACEMENT_SHOWN=true
+                    fi
+                  fi
+                fi
+
                 # Show progress
                 echo "[$((ELAPSED/60))m] Status: $STATUS"
                 WORKERS=$(echo "$RESPONSE" | jq -c '.workers // {}')
@@ -205,6 +233,31 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** \`$RUN_ID\`" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** ${{ steps.results.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Show worker placement info
+          echo "### Worker Placement" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | Role | Instance Type | Region | AZ |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|------|---------------|--------|-----|" >> $GITHUB_STEP_SUMMARY
+
+          # Fetch status to get worker info
+          STATUS_RESPONSE=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
+
+          for arch in arm64 x86; do
+            for role in server client; do
+              KEY="${arch}-${role}"
+              WORKER=$(echo "$STATUS_RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
+              if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
+                W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "-"')
+                W_REGION=$(echo "$WORKER" | jq -r '.region // "-"')
+                W_AZ=$(echo "$WORKER" | jq -r '.az // "-"')
+                echo "| $arch | $role | \`$W_TYPE\` | $W_REGION | $W_AZ |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          done
           echo "" >> $GITHUB_STEP_SUMMARY
 
           for arch in arm64 x86; do
@@ -356,10 +409,34 @@ jobs:
           MODE="${{ steps.mode.outputs.mode }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
+          # Fetch status to get worker info
+          STATUS_RESPONSE=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
+
           # Build comment body
           COMMENT="## Benchmark Results - ${MODE^^} Mode\n\n"
           COMMENT+="**Run ID:** \`$RUN_ID\`\n"
           COMMENT+="**Status:** ${{ steps.results.outputs.status }}\n\n"
+
+          # Add worker placement info
+          COMMENT+="### Worker Placement\n\n"
+          COMMENT+="| Architecture | Role | Instance Type | Region | AZ |\n"
+          COMMENT+="|--------------|------|---------------|--------|-----|\n"
+
+          for arch in arm64 x86; do
+            for role in server client; do
+              KEY="${arch}-${role}"
+              WORKER=$(echo "$STATUS_RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
+              if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
+                W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "-"')
+                W_REGION=$(echo "$WORKER" | jq -r '.region // "-"')
+                W_AZ=$(echo "$WORKER" | jq -r '.az // "-"')
+                COMMENT+="| $arch | $role | \`$W_TYPE\` | $W_REGION | $W_AZ |\n"
+              fi
+            done
+          done
+          COMMENT+="\n"
 
           for arch in arm64 x86; do
             ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)

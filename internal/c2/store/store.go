@@ -53,8 +53,11 @@ type Worker struct {
 	Role             string    `json:"role"` // server, client
 	Arch             string    `json:"arch"` // arm64, x86
 	InstanceID       string    `json:"instance_id"`
+	InstanceType     string    `json:"instance_type,omitempty"` // e.g., "c6g.metal"
 	PrivateIP        string    `json:"private_ip"`
-	Status           string    `json:"status"` // pending, running, completed, failed, terminated
+	Region           string    `json:"region,omitempty"` // e.g., "us-east-1"
+	AZ               string    `json:"az,omitempty"`     // e.g., "us-east-1a"
+	Status           string    `json:"status"`           // pending, running, completed, failed, terminated
 	RegisteredAt     time.Time `json:"registered_at"`
 	LastSeen         time.Time `json:"last_seen"`
 	CurrentServer    string    `json:"current_server,omitempty"`    // Current server being tested (e.g., "gin-h1")
