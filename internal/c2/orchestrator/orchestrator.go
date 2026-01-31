@@ -256,7 +256,14 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 	}
 
 	// Update final status
-	run, _ = o.config.Store.GetRun(run.ID)
+	run, err := o.config.Store.GetRun(run.ID)
+	if err != nil {
+		slog.Error("failed to get run for final status update",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "GetRun")
+		return
+	}
 	if len(errMsgs) > 0 {
 		run.Status = "failed"
 		run.Error = fmt.Sprintf("errors: %v", errMsgs)
@@ -264,7 +271,13 @@ func (o *Orchestrator) runBenchmarks(ctx context.Context, run *store.Run, benchM
 		run.Status = "completed"
 	}
 	run.EndedAt = time.Now()
-	_ = o.config.Store.UpdateRun(run)
+	if err := o.config.Store.UpdateRun(run); err != nil {
+		slog.Error("failed to update run with final status",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "UpdateRun",
+			"status", run.Status)
+	}
 
 	// Cleanup workers
 	o.cleanupRun(ctx, run.ID)
@@ -357,7 +370,13 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 	}
 
 	// Mark architecture as complete
-	_ = o.config.Store.CompleteArch(run.ID, arch)
+	if err := o.config.Store.CompleteArch(run.ID, arch); err != nil {
+		slog.Error("failed to mark architecture as complete",
+			"error", err,
+			"run_id", run.ID,
+			"arch", arch,
+			"operation", "CompleteArch")
+	}
 
 	slog.Info("architecture benchmarks completed",
 		"run_id", run.ID,
@@ -520,7 +539,12 @@ func (o *Orchestrator) CancelRun(ctx context.Context, runID string) error {
 
 	run.Status = "cancelled"
 	run.EndedAt = time.Now()
-	_ = o.config.Store.UpdateRun(run)
+	if err := o.config.Store.UpdateRun(run); err != nil {
+		slog.Error("failed to update run status to cancelled",
+			"error", err,
+			"run_id", run.ID,
+			"operation", "UpdateRun")
+	}
 
 	if wasRunning {
 		o.cleanupRun(ctx, runID)
@@ -599,7 +623,12 @@ func (o *Orchestrator) checkRunningRuns(ctx context.Context) {
 			slog.Warn("run exceeded timeout, cancelling",
 				"run_id", run.ID,
 				"duration_seconds", time.Since(run.StartedAt).Seconds())
-			_ = o.CancelRun(ctx, run.ID)
+			if err := o.CancelRun(ctx, run.ID); err != nil {
+				slog.Error("failed to cancel timed out run",
+					"error", err,
+					"run_id", run.ID,
+					"operation", "CancelRun")
+			}
 		}
 	}
 }
@@ -632,7 +661,12 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 			slog.Warn("cleaning up stale run",
 				"run_id", run.ID,
 				"age_hours", time.Since(run.StartedAt).Hours())
-			_ = o.CancelRun(ctx, run.ID)
+			if err := o.CancelRun(ctx, run.ID); err != nil {
+				slog.Error("failed to cancel stale run",
+					"error", err,
+					"run_id", run.ID,
+					"operation", "CancelRun")
+			}
 		}
 	}
 }
