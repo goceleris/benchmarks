@@ -64,6 +64,16 @@ Parameters:
       - all
     Description: Which servers to benchmark
 
+  ServerBinaryUrl:
+    Type: String
+    Default: ''
+    Description: Optional custom URL for server binary (for PR testing)
+
+  BenchBinaryUrl:
+    Type: String
+    Default: ''
+    Description: Optional custom URL for bench binary (for PR testing)
+
 Mappings:
   # Primary instance types
   InstanceTypes:
@@ -202,12 +212,54 @@ Resources:
             apt-get update -qq
             apt-get install -y -qq curl jq
 
-            # Download pre-built server binary from GitHub releases
+            # Kernel tuning for maximum network throughput
+            echo "Applying kernel tuning..."
+
+            # Increase socket buffer sizes
+            sysctl -w net.core.rmem_max=16777216
+            sysctl -w net.core.wmem_max=16777216
+            sysctl -w net.core.rmem_default=1048576
+            sysctl -w net.core.wmem_default=1048576
+
+            # TCP buffer auto-tuning
+            sysctl -w net.ipv4.tcp_rmem="4096 1048576 16777216"
+            sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
+
+            # Increase backlog for high connection rates
+            sysctl -w net.core.somaxconn=65535
+            sysctl -w net.core.netdev_max_backlog=65535
+            sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+
+            # Enable TCP fast open
+            sysctl -w net.ipv4.tcp_fastopen=3
+
+            # Reduce TIME_WAIT sockets
+            sysctl -w net.ipv4.tcp_tw_reuse=1
+            sysctl -w net.ipv4.tcp_fin_timeout=15
+
+            # Disable slow start after idle
+            sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+            # Increase max memory map areas
+            sysctl -w vm.max_map_count=262144
+
+            # Increase file descriptor limits
+            ulimit -n 1000000
+            echo "* soft nofile 1000000" >> /etc/security/limits.conf
+            echo "* hard nofile 1000000" >> /etc/security/limits.conf
+
+            # Download server binary (use custom URL if provided, else GitHub releases)
             ARCH="${Architecture}"
             if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
-            echo "Downloading server binary for $ARCH..."
-            curl -sL -o /usr/local/bin/server \
-              "https://github.com/${GitHubRepo}/releases/download/latest/server-linux-$ARCH"
+            CUSTOM_URL="${ServerBinaryUrl}"
+            if [ -n "$CUSTOM_URL" ]; then
+              echo "Downloading server binary from custom URL..."
+              curl -sL -o /usr/local/bin/server "$CUSTOM_URL"
+            else
+              echo "Downloading server binary from GitHub releases..."
+              curl -sL -o /usr/local/bin/server \
+                "https://github.com/${GitHubRepo}/releases/download/latest/server-linux-$ARCH"
+            fi
             chmod +x /usr/local/bin/server
 
             # Register with C2
@@ -318,12 +370,54 @@ Resources:
             apt-get update -qq
             apt-get install -y -qq curl jq
 
-            # Download pre-built bench binary from GitHub releases
+            # Kernel tuning for maximum network throughput
+            echo "Applying kernel tuning..."
+
+            # Increase socket buffer sizes
+            sysctl -w net.core.rmem_max=16777216
+            sysctl -w net.core.wmem_max=16777216
+            sysctl -w net.core.rmem_default=1048576
+            sysctl -w net.core.wmem_default=1048576
+
+            # TCP buffer auto-tuning
+            sysctl -w net.ipv4.tcp_rmem="4096 1048576 16777216"
+            sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
+
+            # Increase backlog for high connection rates
+            sysctl -w net.core.somaxconn=65535
+            sysctl -w net.core.netdev_max_backlog=65535
+            sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+
+            # Enable TCP fast open
+            sysctl -w net.ipv4.tcp_fastopen=3
+
+            # Reduce TIME_WAIT sockets
+            sysctl -w net.ipv4.tcp_tw_reuse=1
+            sysctl -w net.ipv4.tcp_fin_timeout=15
+
+            # Disable slow start after idle
+            sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+            # Increase max memory map areas
+            sysctl -w vm.max_map_count=262144
+
+            # Increase file descriptor limits
+            ulimit -n 1000000
+            echo "* soft nofile 1000000" >> /etc/security/limits.conf
+            echo "* hard nofile 1000000" >> /etc/security/limits.conf
+
+            # Download bench binary (use custom URL if provided, else GitHub releases)
             ARCH="${Architecture}"
             if [ "$ARCH" = "x86" ]; then ARCH="amd64"; fi
-            echo "Downloading bench binary for $ARCH..."
-            curl -sL -o /usr/local/bin/bench \
-              "https://github.com/${GitHubRepo}/releases/download/latest/bench-linux-$ARCH"
+            CUSTOM_URL="${BenchBinaryUrl}"
+            if [ -n "$CUSTOM_URL" ]; then
+              echo "Downloading bench binary from custom URL..."
+              curl -sL -o /usr/local/bin/bench "$CUSTOM_URL"
+            else
+              echo "Downloading bench binary from GitHub releases..."
+              curl -sL -o /usr/local/bin/bench \
+                "https://github.com/${GitHubRepo}/releases/download/latest/bench-linux-$ARCH"
+            fi
             chmod +x /usr/local/bin/bench
 
             # Register with C2

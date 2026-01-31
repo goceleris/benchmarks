@@ -32,11 +32,22 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Build C2 Binary
+      - name: Build All Binaries
         run: |
-          echo "Building C2 binary from PR code..."
-          GOOS=linux GOARCH=amd64 go build -o c2-linux-amd64 ./cmd/c2
-          ls -la c2-linux-amd64
+          echo "Building all binaries from PR code..."
+
+          # C2 (amd64 only - runs on t3.small)
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o c2-linux-amd64 ./cmd/c2
+
+          # Server (arm64 and amd64)
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o server-linux-arm64 ./cmd/server
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server-linux-amd64 ./cmd/server
+
+          # Bench (arm64 and amd64)
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o bench-linux-arm64 ./cmd/bench
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bench-linux-amd64 ./cmd/bench
+
+          ls -la *-linux-*
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -45,13 +56,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload C2 Binary to S3
+      - name: Upload Binaries to S3
         id: upload
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BUCKET="celeris-artifacts-${AWS_ACCOUNT_ID}"
-          KEY="pr-c2/pr-${PR_NUMBER}/c2-linux-amd64"
+          PREFIX="pr-c2/pr-${PR_NUMBER}"
 
           echo "Using bucket: $BUCKET"
 
@@ -61,14 +72,18 @@ jobs:
             aws s3api create-bucket --bucket "$BUCKET" --region ${{ env.AWS_REGION }}
           fi
 
-          # Upload binary
-          aws s3 cp c2-linux-amd64 "s3://${BUCKET}/${KEY}"
+          # Upload all binaries
+          for binary in c2-linux-amd64 server-linux-arm64 server-linux-amd64 bench-linux-arm64 bench-linux-amd64; do
+            echo "Uploading $binary..."
+            aws s3 cp "$binary" "s3://${BUCKET}/${PREFIX}/${binary}"
+          done
 
-          # Generate presigned URL (valid for 4 hours)
-          URL=$(aws s3 presign "s3://${BUCKET}/${KEY}" --expires-in 14400)
-          echo "binary_url=$URL" >> $GITHUB_OUTPUT
+          # Generate presigned URL for C2 binary (valid for 4 hours)
+          C2_URL=$(aws s3 presign "s3://${BUCKET}/${PREFIX}/c2-linux-amd64" --expires-in 14400)
+          echo "binary_url=$C2_URL" >> $GITHUB_OUTPUT
           echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
-          echo "Uploaded C2 binary to S3"
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "Uploaded all binaries to S3"
 
       - name: Get Main C2 Stack Outputs
         id: main-c2
@@ -125,6 +140,8 @@ jobs:
               WorkerSecurityGroupId="${{ steps.main-c2.outputs.worker_sg }}" \
               WorkerInstanceProfileArn="${{ steps.main-c2.outputs.worker_profile }}" \
               WorkerRoleArn="${{ steps.main-c2.outputs.worker_role }}" \
+              BinaryS3Bucket="${{ steps.upload.outputs.bucket }}" \
+              BinaryS3Prefix="${{ steps.upload.outputs.prefix }}" \
             --tags \
               Project=celeris-benchmarks \
               PRNumber="$PR_NUMBER" \

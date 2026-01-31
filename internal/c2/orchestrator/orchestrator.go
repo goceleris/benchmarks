@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 
 	"github.com/goceleris/benchmarks/internal/c2/cfn"
@@ -53,6 +55,10 @@ type Config struct {
 	SecurityGroupID    string
 	InstanceProfileArn string
 	C2Endpoint         string
+
+	// Optional S3 config for custom binaries (PR testing)
+	BinaryS3Bucket string
+	BinaryS3Prefix string
 }
 
 // Orchestrator coordinates benchmark runs.
@@ -333,6 +339,17 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 		"server_bid_price", serverBid.BidPrice,
 		"client_bid_price", clientBid.BidPrice)
 
+	// Generate presigned URLs for custom binaries if S3 config is set
+	var serverBinaryUrl, benchBinaryUrl string
+	if o.config.BinaryS3Bucket != "" && o.config.BinaryS3Prefix != "" {
+		archSuffix := arch
+		if archSuffix == "x86" {
+			archSuffix = "amd64"
+		}
+		serverBinaryUrl = o.generateBinaryURL(ctx, fmt.Sprintf("server-linux-%s", archSuffix))
+		benchBinaryUrl = o.generateBinaryURL(ctx, fmt.Sprintf("bench-linux-%s", archSuffix))
+	}
+
 	// Create worker stack
 	stackName, err := o.config.CFN.CreateWorkerStack(ctx, cfn.WorkerStackParams{
 		RunID:              run.ID,
@@ -346,6 +363,8 @@ func (o *Orchestrator) runArchitecture(ctx context.Context, run *store.Run, arch
 		C2Endpoint:         o.config.C2Endpoint,
 		BenchmarkDuration:  run.Duration,
 		BenchmarkMode:      benchMode,
+		ServerBinaryUrl:    serverBinaryUrl,
+		BenchBinaryUrl:     benchBinaryUrl,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create worker stack: %w", err)
@@ -669,6 +688,46 @@ func (o *Orchestrator) cleanupOldRuns(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// generateBinaryURL generates a presigned S3 URL for a binary if S3 config is set.
+// Returns empty string if S3 config is not set (workers will fall back to GitHub releases).
+func (o *Orchestrator) generateBinaryURL(ctx context.Context, binaryName string) string {
+	if o.config.BinaryS3Bucket == "" || o.config.BinaryS3Prefix == "" {
+		return ""
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(o.config.AWSRegion))
+	if err != nil {
+		slog.Error("failed to load AWS config for S3 presign",
+			"error", err,
+			"operation", "generateBinaryURL")
+		return ""
+	}
+
+	client := s3.NewFromConfig(cfg)
+	presignClient := s3.NewPresignClient(client)
+
+	key := fmt.Sprintf("%s/%s", o.config.BinaryS3Prefix, binaryName)
+	presignResult, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: &o.config.BinaryS3Bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(4*time.Hour))
+	if err != nil {
+		slog.Error("failed to generate presigned URL",
+			"error", err,
+			"bucket", o.config.BinaryS3Bucket,
+			"key", key,
+			"operation", "generateBinaryURL")
+		return ""
+	}
+
+	slog.Debug("generated presigned URL for binary",
+		"binary", binaryName,
+		"bucket", o.config.BinaryS3Bucket,
+		"key", key)
+
+	return presignResult.URL
 }
 
 // CleanupOrphaned cleans up orphaned resources (instances, stacks).
