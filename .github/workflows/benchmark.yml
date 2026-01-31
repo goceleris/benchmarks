@@ -1,4 +1,5 @@
 name: Benchmark
+# Triggers: release, manual dispatch
 
 on:
   release:
