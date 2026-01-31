@@ -42,13 +42,13 @@ Results are committed to [`results/`](results/) on each release. See benchmark c
 # Clone and build
 git clone https://github.com/goceleris/benchmarks
 cd benchmarks
-make build
+mage build
 
 # Run a quick local benchmark
-make benchmark-quick
+mage benchmarkQuick
 
 # Run full benchmark (30s per server)
-make benchmark
+mage benchmark
 ```
 
 ### Benchmark Tool
@@ -94,9 +94,25 @@ Required AWS quotas for metal benchmarks:
 
 ## Contributing
 
+### Requirements
+
+- **Go 1.25.5+**: [Download](https://go.dev/dl/)
+- **Mage**: Build tool (Go-based Make alternative)
+  ```bash
+  go install github.com/magefile/mage@latest
+  # or on macOS
+  brew install mage
+  ```
+
+Run `mage -l` to see all available commands with descriptions.
+
+### Development Workflow
+
 1. Fork and create a feature branch
-2. Run `make check` before submitting
-3. Add `run-benchmarks` label to PRs for benchmark validation
+2. Make your changes
+3. Run `mage check` to verify everything passes
+4. Submit a pull request
+5. Add `bench-fast` label to PRs for benchmark validation
 
 ### Adding a Server
 

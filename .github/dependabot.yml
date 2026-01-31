@@ -15,19 +15,3 @@ updates:
     open-pull-requests-limit: 1
     commit-message:
       prefix: "deps(actions):"
-
-  - package-ecosystem: "docker"
-    directory: "/docker"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    commit-message:
-      prefix: "deps(docker):"
-
-  - package-ecosystem: "terraform"
-    directory: "/terraform"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    commit-message:
-      prefix: "deps(terraform):"
