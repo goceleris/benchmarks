@@ -45,6 +45,10 @@ Parameters:
     Type: String
     Description: Worker instance profile ARN
 
+  WorkerRoleArn:
+    Type: String
+    Description: Worker role ARN (for PassRole permission)
+
 Resources:
   # Security Group for PR C2 Server
   PRC2SecurityGroup:
@@ -160,7 +164,7 @@ Resources:
                 Action:
                   - iam:PassRole
                 Resource:
-                  - !Ref WorkerInstanceProfileArn
+                  - !Ref WorkerRoleArn
                   - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
       Tags:
         - Key: Project

@@ -526,6 +526,12 @@ Outputs:
     Export:
       Name: celeris-worker-profile-arn
 
+  WorkerRoleArn:
+    Description: Role ARN for workers (needed for PassRole)
+    Value: !GetAtt WorkerRole.Arn
+    Export:
+      Name: celeris-worker-role-arn
+
   C2ElasticIP:
     Description: Elastic IP for C2 server
     Value: !Ref C2ElasticIP

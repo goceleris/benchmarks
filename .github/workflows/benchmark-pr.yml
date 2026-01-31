@@ -73,16 +73,19 @@ jobs:
       - name: Get Main C2 Stack Outputs
         id: main-c2
         run: |
-          # Get security group and instance profile from main C2 stack
+          # Get security group, instance profile, and role from main C2 stack
           WORKER_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`WorkerSecurityGroupId`].OutputValue' --output text)
           WORKER_PROFILE=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`WorkerInstanceProfileArn`].OutputValue' --output text)
+          WORKER_ROLE=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`WorkerRoleArn`].OutputValue' --output text)
           C2_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
             --query 'Stacks[0].Outputs[?OutputKey==`C2SecurityGroupId`].OutputValue' --output text)
 
           echo "worker_sg=$WORKER_SG" >> $GITHUB_OUTPUT
           echo "worker_profile=$WORKER_PROFILE" >> $GITHUB_OUTPUT
+          echo "worker_role=$WORKER_ROLE" >> $GITHUB_OUTPUT
           echo "c2_sg=$C2_SG" >> $GITHUB_OUTPUT
 
       - name: Deploy PR C2 Stack
@@ -107,6 +110,7 @@ jobs:
               MainC2SecurityGroupId="${{ steps.main-c2.outputs.c2_sg }}" \
               WorkerSecurityGroupId="${{ steps.main-c2.outputs.worker_sg }}" \
               WorkerInstanceProfileArn="${{ steps.main-c2.outputs.worker_profile }}" \
+              WorkerRoleArn="${{ steps.main-c2.outputs.worker_role }}" \
             --tags \
               Project=celeris-benchmarks \
               PRNumber="$PR_NUMBER" \
