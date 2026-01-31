@@ -1,41 +1,143 @@
-name: Benchmark
+name: PR Benchmark
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Benchmark mode'
-        required: false
-        type: choice
-        options:
-          - fast
-          - med
-          - metal
-        default: fast
-      duration:
-        description: 'Benchmark duration (e.g., 10s, 30s, 60s)'
-        required: false
-        default: ''
-      bench_mode:
-        description: 'Servers to benchmark'
-        required: false
-        type: choice
-        options:
-          - all
-          - baseline
-          - theoretical
-        default: all
+  pull_request:
+    types: [labeled]
 
 env:
   AWS_REGION: us-east-1
 
 jobs:
+  # Deploy PR-specific C2 for pull request benchmarks
+  deploy-pr-c2:
+    name: Deploy PR C2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      github.event.label.name == 'bench-fast' ||
+      github.event.label.name == 'bench-med' ||
+      github.event.label.name == 'bench-metal'
+    outputs:
+      c2_url: ${{ steps.deploy.outputs.c2_url }}
+      stack_name: ${{ steps.deploy.outputs.stack_name }}
+
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build C2 Binary
+        run: |
+          echo "Building C2 binary from PR code..."
+          GOOS=linux GOARCH=amd64 go build -o c2-linux-amd64 ./cmd/c2
+          ls -la c2-linux-amd64
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload C2 Binary to S3
+        id: upload
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+          KEY="pr-c2/pr-${PR_NUMBER}/c2-linux-amd64"
+
+          # Create bucket if it doesn't exist
+          aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || \
+            aws s3api create-bucket --bucket "$BUCKET" --region ${{ env.AWS_REGION }}
+
+          # Upload binary
+          aws s3 cp c2-linux-amd64 "s3://${BUCKET}/${KEY}"
+
+          # Generate presigned URL (valid for 4 hours)
+          URL=$(aws s3 presign "s3://${BUCKET}/${KEY}" --expires-in 14400)
+          echo "binary_url=$URL" >> $GITHUB_OUTPUT
+          echo "Uploaded C2 binary to S3"
+
+      - name: Get Main C2 Stack Outputs
+        id: main-c2
+        run: |
+          # Get security group and instance profile from main C2 stack
+          WORKER_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`WorkerSecurityGroupId`].OutputValue' --output text)
+          WORKER_PROFILE=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`WorkerInstanceProfileArn`].OutputValue' --output text)
+          C2_SG=$(aws cloudformation describe-stacks --stack-name celeris-c2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`C2SecurityGroupId`].OutputValue' --output text)
+
+          echo "worker_sg=$WORKER_SG" >> $GITHUB_OUTPUT
+          echo "worker_profile=$WORKER_PROFILE" >> $GITHUB_OUTPUT
+          echo "c2_sg=$C2_SG" >> $GITHUB_OUTPUT
+
+      - name: Deploy PR C2 Stack
+        id: deploy
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          STACK_NAME="celeris-c2-pr-${PR_NUMBER}"
+
+          echo "Deploying PR C2 stack: $STACK_NAME"
+
+          aws cloudformation deploy \
+            --template-file cloudformation/c2-pr.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              PRNumber="$PR_NUMBER" \
+              VpcId="${{ secrets.VPC_ID }}" \
+              SubnetId="${{ secrets.SUBNET_ID }}" \
+              ApiKey="${{ secrets.C2_API_KEY }}" \
+              GitHubToken="${{ secrets.GH_PAT_RUNNER_TOKEN }}" \
+              C2BinaryUrl="${{ steps.upload.outputs.binary_url }}" \
+              MainC2SecurityGroupId="${{ steps.main-c2.outputs.c2_sg }}" \
+              WorkerSecurityGroupId="${{ steps.main-c2.outputs.worker_sg }}" \
+              WorkerInstanceProfileArn="${{ steps.main-c2.outputs.worker_profile }}" \
+            --tags \
+              Project=celeris-benchmarks \
+              PRNumber="$PR_NUMBER" \
+            --no-fail-on-empty-changeset
+
+          # Get outputs
+          C2_IP=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`PRC2PublicIP`].OutputValue' --output text)
+          C2_URL="http://${C2_IP}:8080"
+
+          echo "stack_name=$STACK_NAME" >> $GITHUB_OUTPUT
+          echo "c2_url=$C2_URL" >> $GITHUB_OUTPUT
+          echo "PR C2 deployed at: $C2_URL"
+
+      - name: Wait for PR C2 to be Healthy
+        run: |
+          C2_URL="${{ steps.deploy.outputs.c2_url }}"
+          echo "Waiting for PR C2 to be healthy at $C2_URL..."
+
+          for i in {1..60}; do
+            if curl -sf "$C2_URL/api/health" > /dev/null 2>&1; then
+              echo "PR C2 is healthy!"
+              exit 0
+            fi
+            echo "Attempt $i/60: PR C2 not ready yet..."
+            sleep 10
+          done
+
+          echo "::error::PR C2 health check failed"
+          exit 1
+
+  # Main benchmark job
   benchmark:
     name: Run Benchmark
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    needs: [deploy-pr-c2]
     permissions:
       contents: write
       pull-requests: write
@@ -44,27 +146,24 @@ jobs:
       - name: Determine Benchmark Mode
         id: mode
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "mode=metal" >> $GITHUB_OUTPUT
-            echo "Running METAL benchmarks for release"
-          else
-            echo "mode=${{ inputs.mode || 'fast' }}" >> $GITHUB_OUTPUT
-            echo "Running ${{ inputs.mode || 'fast' }} benchmarks (manual trigger)"
-          fi
+          # Determine mode from label
+          LABEL="${{ github.event.label.name }}"
+          case "$LABEL" in
+            bench-fast) MODE="fast" ;;
+            bench-med)  MODE="med" ;;
+            bench-metal) MODE="metal" ;;
+            *) MODE="fast" ;;
+          esac
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "Running $MODE benchmarks for PR (label: $LABEL)"
 
       - name: Start Benchmark
         id: start
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           echo "Starting benchmark (mode: ${{ steps.mode.outputs.mode }}) against $C2_URL"
 
           PARAMS="mode=${{ steps.mode.outputs.mode }}"
-          if [[ -n "${{ inputs.duration }}" ]]; then
-            PARAMS="$PARAMS&duration=${{ inputs.duration }}"
-          fi
-          if [[ -n "${{ inputs.bench_mode }}" ]]; then
-            PARAMS="$PARAMS&bench_mode=${{ inputs.bench_mode }}"
-          fi
 
           RESPONSE=$(curl -sf -X POST \
             -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
@@ -81,7 +180,7 @@ jobs:
 
       - name: Wait for Completion
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
           echo "Waiting for benchmark $RUN_ID to complete..."
 
@@ -181,7 +280,7 @@ jobs:
         id: results
         if: success()
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
           if [[ -z "$RUN_ID" ]]; then
             echo "No run ID available"
@@ -208,7 +307,7 @@ jobs:
       - name: Generate Results Summary
         if: success()
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
           MODE="${{ steps.mode.outputs.mode }}"
 
@@ -217,7 +316,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** \`$RUN_ID\`" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** ${{ steps.results.outputs.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "**C2:** Main" >> $GITHUB_STEP_SUMMARY
+          echo "**C2:** PR-specific (PR #${{ github.event.pull_request.number }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Show worker placement info
@@ -262,131 +361,77 @@ jobs:
             fi
           done
 
-      - name: Save Results for Commit
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-        run: |
-          # Save results to temp location before checkout overwrites workspace
-          cp results.json /tmp/benchmark_results.json
-
-      - name: Checkout Repository
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create PR with Benchmark Results
-        if: |
-          success() &&
-          steps.mode.outputs.mode == 'metal' &&
-          (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      - name: Post PR Comment with Results
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
-          echo "Creating PR with metal results..."
+          MODE="${{ steps.mode.outputs.mode }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # Restore results from temp location
-          cp /tmp/benchmark_results.json results.json
+          # Fetch status to get worker info
+          STATUS_RESPONSE=$(curl -sf \
+            -H "X-API-Key: ${{ secrets.C2_API_KEY }}" \
+            "$C2_URL/api/benchmark/$RUN_ID/status" || echo '{}')
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Build comment body
+          COMMENT="## Benchmark Results - ${MODE^^} Mode\n\n"
+          COMMENT+="**Run ID:** \`$RUN_ID\`\n"
+          COMMENT+="**Status:** ${{ steps.results.outputs.status }}\n"
+          COMMENT+="**C2:** PR-specific (built from this PR's code)\n\n"
 
-          # Create branch name with tag and timestamp
-          TAG="${{ github.event.release.tag_name }}"
-          BRANCH="results/${TAG:-manual}-$(date +%Y%m%d%H%M%S)"
+          # Add worker placement info
+          COMMENT+="### Worker Placement\n\n"
+          COMMENT+="| Architecture | Role | Instance Type | Region | AZ |\n"
+          COMMENT+="|--------------|------|---------------|--------|-----|\n"
 
-          git checkout -b "$BRANCH"
+          for arch in arm64 x86; do
+            for role in server client; do
+              KEY="${arch}-${role}"
+              WORKER=$(echo "$STATUS_RESPONSE" | jq -r ".workers[\"$KEY\"] // {}")
+              if [[ "$WORKER" != "{}" && "$WORKER" != "null" ]]; then
+                W_TYPE=$(echo "$WORKER" | jq -r '.instance_type // "-"')
+                W_REGION=$(echo "$WORKER" | jq -r '.region // "-"')
+                W_AZ=$(echo "$WORKER" | jq -r '.az // "-"')
+                COMMENT+="| $arch | $role | \`$W_TYPE\` | $W_REGION | $W_AZ |\n"
+              fi
+            done
+          done
+          COMMENT+="\n"
 
-          # Determine result paths
-          PATHS=("results/latest")
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            PATHS+=("results/$TAG")
-          fi
-
-          # Process each architecture
-          ARM64_COUNT=0
-          X86_COUNT=0
           for arch in arm64 x86; do
             ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
             BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
             COUNT=$(echo "$BENCHMARKS" | jq 'length')
 
-            if [[ "$arch" == "arm64" ]]; then
-              ARM64_COUNT=$COUNT
-            else
-              X86_COUNT=$COUNT
-            fi
-
             if [[ "$COUNT" -gt 0 ]]; then
-              for path in "${PATHS[@]}"; do
-                mkdir -p "$path/$arch"
+              COMMENT+="### $arch Results\n\n"
+              COMMENT+="| Server | Req/sec | Avg Latency | P99 Latency | Errors |\n"
+              COMMENT+="|--------|---------|-------------|-------------|--------|\n"
 
-                # Create results JSON with metadata
-                jq -n \
-                  --arg run_id "$RUN_ID" \
-                  --arg arch "$arch" \
-                  --arg mode "metal" \
-                  --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                  --arg ref "${{ github.ref }}" \
-                  --arg sha "${{ github.sha }}" \
-                  --argjson benchmarks "$BENCHMARKS" \
-                  '{
-                    run_id: $run_id,
-                    architecture: $arch,
-                    mode: $mode,
-                    timestamp: $timestamp,
-                    git_ref: $ref,
-                    git_sha: $sha,
-                    benchmarks: $benchmarks
-                  }' > "$path/$arch/results.json"
+              while IFS= read -r row; do
+                COMMENT+="$row\n"
+              done < <(echo "$BENCHMARKS" | jq -r '.[] | "| \(.server_type) | \(.requests_per_sec | floor) | \(.latency_avg / 1000000 | . * 100 | floor / 100)ms | \(.latency_p99 / 1000000 | . * 100 | floor / 100)ms | \(.errors) |"')
 
-                git add "$path/$arch/results.json"
-              done
+              COMMENT+="\n"
             fi
           done
 
-          # Commit and push if there are changes
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            COMMIT_MSG="chore: update benchmark results"
-            if [[ "${{ github.event_name }}" == "release" ]]; then
-              COMMIT_MSG="chore: add benchmark results for $TAG"
-            fi
-            git commit -m "$COMMIT_MSG"
-            git push -u origin "$BRANCH"
+          # Delete previous benchmark comments (if any)
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Benchmark Results"))) | .id' \
+            | xargs -I {} gh api -X DELETE "repos/${{ github.repository }}/issues/comments/{}" 2>/dev/null || true
 
-            # Create PR body with results summary
-            PR_BODY="Automated benchmark results from run \`$RUN_ID\`.
-
-## Results
-- ARM64: $ARM64_COUNT benchmarks
-- x86: $X86_COUNT benchmarks
-
-**Please review the results before merging.**"
-
-            # Create PR (no auto-merge)
-            PR_TITLE="$COMMIT_MSG"
-            PR_URL=$(gh pr create \
-              --title "$PR_TITLE" \
-              --body "$PR_BODY" \
-              --base main)
-
-            echo "::notice::Results PR created: $PR_URL"
-            echo "Results PR created successfully: $PR_URL"
-          fi
+          # Post new comment
+          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file -
+          echo "Posted results to PR #$PR_NUMBER"
 
       - name: Get Results Summary (Fallback)
         if: failure()
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
           if [[ -z "$RUN_ID" ]]; then
             echo "No run ID available"
@@ -407,7 +452,7 @@ jobs:
       - name: Cancel Benchmark on Workflow Cancellation
         if: cancelled()
         run: |
-          C2_URL="${{ secrets.C2_URL }}"
+          C2_URL="${{ needs.deploy-pr-c2.outputs.c2_url }}"
           RUN_ID="${{ steps.start.outputs.run_id }}"
           if [[ -z "$RUN_ID" ]]; then
             echo "No run ID to cancel"
@@ -427,3 +472,46 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** $RUN_ID" >> $GITHUB_STEP_SUMMARY
           echo "Benchmark was cancelled. Workers are being terminated." >> $GITHUB_STEP_SUMMARY
+
+  # Cleanup PR C2 after benchmark completes (success or failure)
+  cleanup-pr-c2:
+    name: Cleanup PR C2
+    runs-on: ubuntu-latest
+    needs: [deploy-pr-c2, benchmark]
+    if: always()
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete PR C2 Stack
+        run: |
+          STACK_NAME="${{ needs.deploy-pr-c2.outputs.stack_name }}"
+          if [[ -z "$STACK_NAME" ]]; then
+            echo "No stack to delete"
+            exit 0
+          fi
+
+          echo "Deleting PR C2 stack: $STACK_NAME"
+
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          echo "Stack deletion initiated"
+
+          # Wait for deletion (with timeout)
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+          echo "PR C2 cleanup complete"
+
+      - name: Cleanup S3 Artifacts
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BUCKET="celeris-artifacts-${{ secrets.AWS_ACCOUNT_ID }}"
+
+          echo "Cleaning up S3 artifacts for PR #$PR_NUMBER..."
+          aws s3 rm "s3://${BUCKET}/pr-c2/pr-${PR_NUMBER}/" --recursive || true
+          echo "S3 cleanup complete"
