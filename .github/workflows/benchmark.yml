@@ -271,13 +271,11 @@ jobs:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create PR with Benchmark Results
+      - name: Commit Benchmark Results
         if: success() && steps.mode.outputs.mode == 'metal' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ steps.start.outputs.run_id }}"
-          echo "Creating PR with metal results..."
+          echo "Committing metal results to main..."
 
           cp /tmp/benchmark_results.json results.json
 
@@ -285,27 +283,16 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           TAG="${{ github.event.release.tag_name }}"
-          BRANCH="results/${TAG:-manual}-$(date +%Y%m%d%H%M%S)"
-
-          git checkout -b "$BRANCH"
 
           PATHS=("results/latest")
           if [[ "${{ github.event_name }}" == "release" ]]; then
             PATHS+=("results/$TAG")
           fi
 
-          ARM64_COUNT=0
-          X86_COUNT=0
           for arch in arm64 x86; do
             ARCH_RESULTS=$(jq -r ".$arch // {}" results.json)
             BENCHMARKS=$(echo "$ARCH_RESULTS" | jq -r '.benchmarks // []')
             COUNT=$(echo "$BENCHMARKS" | jq 'length')
-
-            if [[ "$arch" == "arm64" ]]; then
-              ARM64_COUNT=$COUNT
-            else
-              X86_COUNT=$COUNT
-            fi
 
             if [[ "$COUNT" -gt 0 ]]; then
               for path in "${PATHS[@]}"; do
@@ -342,16 +329,10 @@ jobs:
               COMMIT_MSG="chore: add benchmark results for $TAG"
             fi
             git commit -m "$COMMIT_MSG"
-            git push -u origin "$BRANCH"
+            git push origin main
 
-            PR_TITLE="$COMMIT_MSG"
-            PR_URL=$(gh pr create \
-              --title "$PR_TITLE" \
-              --body "Automated benchmark results from run \`$RUN_ID\`.\n\n## Results\n- ARM64: $ARM64_COUNT benchmarks\n- x86: $X86_COUNT benchmarks\n\n**Please review the results before merging.**" \
-              --base main)
-
-            echo "::notice::Results PR created: $PR_URL"
-            echo "Results PR created successfully: $PR_URL"
+            echo "::notice::Results committed to main (run: $RUN_ID)"
+            echo "Benchmark results committed successfully"
           fi
 
       - name: Get Results Summary (Fallback)
