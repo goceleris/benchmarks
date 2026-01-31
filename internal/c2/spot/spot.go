@@ -4,25 +4,74 @@ package spot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
+	pricingtypes "github.com/aws/aws-sdk-go-v2/service/pricing/types"
 
 	"github.com/goceleris/benchmarks/internal/c2/awsutil"
 )
+
+// PriceCacheTTL is how long cached on-demand prices are valid.
+const PriceCacheTTL = 1 * time.Hour
+
+// cachedPrice holds a cached on-demand price with expiration.
+type cachedPrice struct {
+	price     float64
+	expiresAt time.Time
+}
 
 // Client wraps AWS EC2 client with spot-specific operations.
 type Client struct {
 	ec2     *ec2.Client
 	pricing *pricing.Client
 	region  string
+
+	// Price cache for on-demand prices (thread-safe)
+	priceMu    sync.RWMutex
+	priceCache map[string]*cachedPrice // key: "region:instanceType"
+}
+
+// regionLocations maps AWS region codes to Pricing API location names.
+var regionLocations = map[string]string{
+	"us-east-1":      "US East (N. Virginia)",
+	"us-east-2":      "US East (Ohio)",
+	"us-west-1":      "US West (N. California)",
+	"us-west-2":      "US West (Oregon)",
+	"af-south-1":     "Africa (Cape Town)",
+	"ap-east-1":      "Asia Pacific (Hong Kong)",
+	"ap-south-1":     "Asia Pacific (Mumbai)",
+	"ap-south-2":     "Asia Pacific (Hyderabad)",
+	"ap-southeast-1": "Asia Pacific (Singapore)",
+	"ap-southeast-2": "Asia Pacific (Sydney)",
+	"ap-southeast-3": "Asia Pacific (Jakarta)",
+	"ap-southeast-4": "Asia Pacific (Melbourne)",
+	"ap-northeast-1": "Asia Pacific (Tokyo)",
+	"ap-northeast-2": "Asia Pacific (Seoul)",
+	"ap-northeast-3": "Asia Pacific (Osaka)",
+	"ca-central-1":   "Canada (Central)",
+	"eu-central-1":   "EU (Frankfurt)",
+	"eu-central-2":   "EU (Zurich)",
+	"eu-west-1":      "EU (Ireland)",
+	"eu-west-2":      "EU (London)",
+	"eu-west-3":      "EU (Paris)",
+	"eu-south-1":     "EU (Milan)",
+	"eu-south-2":     "EU (Spain)",
+	"eu-north-1":     "EU (Stockholm)",
+	"me-south-1":     "Middle East (Bahrain)",
+	"me-central-1":   "Middle East (UAE)",
+	"sa-east-1":      "South America (Sao Paulo)",
+	"il-central-1":   "Israel (Tel Aviv)",
 }
 
 // SpotPrice represents spot pricing for an instance type in an AZ.
@@ -110,9 +159,10 @@ func NewClient(region string) (*Client, error) {
 	}
 
 	return &Client{
-		ec2:     ec2.NewFromConfig(cfg),
-		pricing: pricing.NewFromConfig(pricingCfg),
-		region:  region,
+		ec2:        ec2.NewFromConfig(cfg),
+		pricing:    pricing.NewFromConfig(pricingCfg),
+		region:     region,
+		priceCache: make(map[string]*cachedPrice),
 	}, nil
 }
 
@@ -713,34 +763,233 @@ func (c *Client) DescribeAllWorkerInstances(ctx context.Context) ([]types.Instan
 	return instances, nil
 }
 
+// fallbackPrices contains hardcoded on-demand prices for us-east-1 as fallback.
+// These are used when the Pricing API is unavailable or returns no results.
+var fallbackPrices = map[string]float64{
+	// ARM64 - C6g family
+	"c6g.medium":  0.034,
+	"c6g.large":   0.068,
+	"c6g.xlarge":  0.136,
+	"c6g.2xlarge": 0.272,
+	"c6g.4xlarge": 0.544,
+	"c6g.8xlarge": 1.088,
+	"c6g.metal":   2.176,
+	// ARM64 - C7g family
+	"c7g.medium":  0.0363,
+	"c7g.large":   0.0725,
+	"c7g.xlarge":  0.145,
+	"c7g.2xlarge": 0.29,
+	"c7g.4xlarge": 0.58,
+	"c7g.metal":   2.32,
+	// ARM64 - T4g family
+	"t4g.micro":  0.0084,
+	"t4g.small":  0.0168,
+	"t4g.medium": 0.0336,
+	// ARM64 - M7g family
+	"m7g.metal": 3.2640,
+
+	// x86 - C5 family
+	"c5.large":   0.085,
+	"c5.xlarge":  0.17,
+	"c5.2xlarge": 0.34,
+	"c5.9xlarge": 1.53,
+	"c5.metal":   4.08,
+	// x86 - C5a family
+	"c5a.large":   0.077,
+	"c5a.xlarge":  0.154,
+	"c5a.2xlarge": 0.308,
+	// x86 - C5d family
+	"c5d.metal":   4.608,
+	"c5d.9xlarge": 1.728,
+	// x86 - C5n family
+	"c5n.metal":   4.608,
+	"c5n.9xlarge": 1.944,
+	// x86 - C6i family
+	"c6i.large":   0.085,
+	"c6i.xlarge":  0.17,
+	"c6i.2xlarge": 0.34,
+	// x86 - T2/T3 family
+	"t2.small":  0.023,
+	"t3.small":  0.0208,
+	"t3a.small": 0.0188,
+}
+
 // getOnDemandPrice retrieves the on-demand price for an instance type.
-// Uses hardcoded prices for us-east-1 region (prices are region-specific).
+// It first checks the cache, then queries the AWS Pricing API, and falls back
+// to hardcoded prices if the API is unavailable.
 func (c *Client) getOnDemandPrice(ctx context.Context, instanceType string) (float64, error) {
-	// Hardcoded on-demand prices for us-east-1 (updated periodically)
-	// These serve as caps for spot bids
-	prices := map[string]float64{
-		// ARM64
-		"c6g.medium":  0.034,
-		"c6g.xlarge":  0.136,
-		"c6g.2xlarge": 0.272,
-		"c6g.4xlarge": 0.544,
-		"c6g.metal":   2.176,
-		"t4g.small":   0.0168,
+	cacheKey := c.region + ":" + instanceType
 
-		// x86
-		"c5.large":   0.085,
-		"c5.xlarge":  0.17,
-		"c5.2xlarge": 0.34,
-		"c5.9xlarge": 1.53,
-		"c5.metal":   4.08,
-		"t3.small":   0.0208,
+	// Check cache first (with read lock)
+	c.priceMu.RLock()
+	if cached, ok := c.priceCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
+		c.priceMu.RUnlock()
+		return cached.price, nil
+	}
+	c.priceMu.RUnlock()
+
+	// Try to fetch from Pricing API
+	price, err := c.fetchOnDemandPriceFromAPI(ctx, instanceType)
+	if err != nil {
+		slog.Warn("failed to fetch price from API, using fallback",
+			"instance_type", instanceType,
+			"region", c.region,
+			"error", err)
+
+		// Fall back to hardcoded prices
+		if fallbackPrice, ok := fallbackPrices[instanceType]; ok {
+			return fallbackPrice, nil
+		}
+		return 0, fmt.Errorf("unknown instance type: %s (no API price or fallback)", instanceType)
 	}
 
-	if price, ok := prices[instanceType]; ok {
-		return price, nil
+	// Cache the price (with write lock)
+	c.priceMu.Lock()
+	c.priceCache[cacheKey] = &cachedPrice{
+		price:     price,
+		expiresAt: time.Now().Add(PriceCacheTTL),
+	}
+	c.priceMu.Unlock()
+
+	slog.Debug("fetched on-demand price from API",
+		"instance_type", instanceType,
+		"region", c.region,
+		"price", price)
+
+	return price, nil
+}
+
+// fetchOnDemandPriceFromAPI queries the AWS Pricing API for on-demand EC2 prices.
+func (c *Client) fetchOnDemandPriceFromAPI(ctx context.Context, instanceType string) (float64, error) {
+	// Get location name for the region
+	location, ok := regionLocations[c.region]
+	if !ok {
+		return 0, fmt.Errorf("unknown region: %s", c.region)
 	}
 
-	return 0, fmt.Errorf("unknown instance type: %s", instanceType)
+	// Build filters for the Pricing API
+	filters := []pricingtypes.Filter{
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("instanceType"),
+			Value: strPtr(instanceType),
+		},
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("location"),
+			Value: strPtr(location),
+		},
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("operatingSystem"),
+			Value: strPtr("Linux"),
+		},
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("tenancy"),
+			Value: strPtr("Shared"),
+		},
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("preInstalledSw"),
+			Value: strPtr("NA"),
+		},
+		{
+			Type:  pricingtypes.FilterTypeTermMatch,
+			Field: strPtr("capacitystatus"),
+			Value: strPtr("Used"),
+		},
+	}
+
+	input := &pricing.GetProductsInput{
+		ServiceCode: strPtr("AmazonEC2"),
+		Filters:     filters,
+		MaxResults:  intPtr32(1),
+	}
+
+	result, err := awsutil.WithRetry(ctx, "GetProducts", awsutil.DefaultMaxRetries, func() (*pricing.GetProductsOutput, error) {
+		return c.pricing.GetProducts(ctx, input)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("pricing API call failed: %w", err)
+	}
+
+	if len(result.PriceList) == 0 {
+		return 0, fmt.Errorf("no pricing data found for %s in %s", instanceType, c.region)
+	}
+
+	// Parse the pricing JSON
+	return parsePricingJSON(result.PriceList[0])
+}
+
+// parsePricingJSON extracts the on-demand hourly price from AWS Pricing API response.
+func parsePricingJSON(priceJSON string) (float64, error) {
+	var data map[string]any
+	if err := json.Unmarshal([]byte(priceJSON), &data); err != nil {
+		return 0, fmt.Errorf("failed to parse pricing JSON: %w", err)
+	}
+
+	// Navigate: terms -> OnDemand -> (first key) -> priceDimensions -> (first key) -> pricePerUnit -> USD
+	terms, ok := data["terms"].(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("missing 'terms' in pricing data")
+	}
+
+	onDemand, ok := terms["OnDemand"].(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("missing 'OnDemand' in pricing data")
+	}
+
+	// Get first offer
+	var offer map[string]any
+	for _, v := range onDemand {
+		offer, ok = v.(map[string]any)
+		if ok {
+			break
+		}
+	}
+	if offer == nil {
+		return 0, fmt.Errorf("no offers found in pricing data")
+	}
+
+	priceDimensions, ok := offer["priceDimensions"].(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("missing 'priceDimensions' in pricing data")
+	}
+
+	// Get first price dimension
+	var priceDim map[string]any
+	for _, v := range priceDimensions {
+		priceDim, ok = v.(map[string]any)
+		if ok {
+			break
+		}
+	}
+	if priceDim == nil {
+		return 0, fmt.Errorf("no price dimensions found")
+	}
+
+	pricePerUnit, ok := priceDim["pricePerUnit"].(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("missing 'pricePerUnit' in pricing data")
+	}
+
+	usdPrice, ok := pricePerUnit["USD"].(string)
+	if !ok {
+		return 0, fmt.Errorf("missing 'USD' price in pricing data")
+	}
+
+	var price float64
+	if _, err := fmt.Sscanf(usdPrice, "%f", &price); err != nil {
+		return 0, fmt.Errorf("failed to parse price '%s': %w", usdPrice, err)
+	}
+
+	return price, nil
+}
+
+// intPtr32 returns a pointer to an int32 value.
+func intPtr32(i int32) *int32 {
+	return &i
 }
 
 // parsePrice converts a price string to float64.
