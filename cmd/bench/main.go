@@ -108,6 +108,10 @@ func main() {
 	// Infrastructure mode (affects connection/worker scaling)
 	infraMode := flag.String("infra-mode", "", "Infrastructure mode: fast, med, metal (affects scaling defaults)")
 
+	// HTTP/2 specific configuration
+	h2Connections := flag.Int("h2-connections", 16, "Number of HTTP/2 connections (H2 multiplexes streams, so fewer connections are needed)")
+	h2Streams := flag.Int("h2-streams", 100, "Max concurrent streams per HTTP/2 connection")
+
 	flag.Parse()
 
 	arch := runtime.GOARCH
@@ -147,6 +151,9 @@ func main() {
 	maxWorkers := 1024
 	maxConnections := 4096
 
+	// Track effective H2 connections (may be scaled by infrastructure mode)
+	effectiveH2Conns := *h2Connections
+
 	switch *infraMode {
 	case "metal":
 		// Metal: saturate 64-96 core servers from 36-72 core clients
@@ -155,6 +162,10 @@ func main() {
 		}
 		if *connectionsPerWorker == 2 { // default, not explicitly set
 			effectiveConnsPerWorker = 8
+		}
+		// Scale up H2 connections for metal infrastructure
+		if *h2Connections == 16 { // default, not explicitly set
+			effectiveH2Conns = 64
 		}
 		maxWorkers = 2048
 		maxConnections = 16384
@@ -166,6 +177,10 @@ func main() {
 		}
 		if *connectionsPerWorker == 2 {
 			effectiveConnsPerWorker = 4
+		}
+		// Scale up H2 connections for med infrastructure
+		if *h2Connections == 16 { // default, not explicitly set
+			effectiveH2Conns = 32
 		}
 		maxWorkers = 1024
 		maxConnections = 8192
@@ -220,6 +235,7 @@ func main() {
 	} else {
 		log.Printf("Connections: %d (manually set)", actualConnections)
 	}
+	log.Printf("HTTP/2 settings: %d connections x %d streams/conn (for H2/hybrid servers)", effectiveH2Conns, *h2Streams)
 
 	// In local mode, we need the server binary
 	if !remoteMode {
@@ -468,16 +484,19 @@ func main() {
 				c2.progressMu.Unlock()
 			}
 
+			isH2 := strings.Contains(serverType, "-h2") || strings.Contains(serverType, "-hybrid")
 			cfg := bench.Config{
-				URL:         fmt.Sprintf("http://%s:%s%s", serverHost, *port, bt.Path),
-				Method:      bt.Method,
-				Body:        bt.Body,
-				Duration:    *duration,
-				Connections: actualConnections,
-				Workers:     actualWorkers,
-				WarmupTime:  *warmup,
-				KeepAlive:   true,
-				H2C:         strings.Contains(serverType, "-h2") || strings.Contains(serverType, "-hybrid"),
+				URL:           fmt.Sprintf("http://%s:%s%s", serverHost, *port, bt.Path),
+				Method:        bt.Method,
+				Body:          bt.Body,
+				Duration:      *duration,
+				Connections:   actualConnections,
+				Workers:       actualWorkers,
+				WarmupTime:    *warmup,
+				KeepAlive:     true,
+				H2C:           isH2,
+				H2Connections: effectiveH2Conns,
+				H2MaxStreams:  *h2Streams,
 			}
 
 			// In remote mode, wrap the benchmark with retry logic

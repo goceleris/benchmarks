@@ -28,6 +28,14 @@ type Config struct {
 	WarmupTime  time.Duration
 	KeepAlive   bool
 	H2C         bool
+
+	// H2-specific settings for better performance
+	// H2Connections is the number of HTTP/2 connections to use (default: 16)
+	// HTTP/2 multiplexes streams over a single connection, but having multiple
+	// connections can improve throughput by avoiding head-of-line blocking
+	H2Connections int
+	// H2MaxStreams is the max concurrent streams per connection (default: 100)
+	H2MaxStreams int
 }
 
 // DefaultConfig returns sensible defaults for benchmarking.
@@ -35,13 +43,80 @@ type Config struct {
 // based on available CPUs. These defaults are fallbacks for direct library usage.
 func DefaultConfig() Config {
 	return Config{
-		Method:      "GET",
-		Duration:    30 * time.Second,
-		Connections: 256,
-		Workers:     64, // Higher default for direct library use
-		WarmupTime:  5 * time.Second,
-		KeepAlive:   true,
+		Method:        "GET",
+		Duration:      30 * time.Second,
+		Connections:   256,
+		Workers:       64, // Higher default for direct library use
+		WarmupTime:    5 * time.Second,
+		KeepAlive:     true,
+		H2Connections: 16,  // Multiple H2 connections for better throughput
+		H2MaxStreams:  100, // Concurrent streams per connection
 	}
+}
+
+// multiConnH2Transport wraps multiple http2.Transport instances for round-robin
+// load balancing. This addresses the limitation that Go's http2.Transport uses
+// a single connection per host, which can bottleneck throughput due to TCP
+// head-of-line blocking and flow control on a single connection.
+type multiConnH2Transport struct {
+	transports []*http2.Transport
+	counter    atomic.Uint64
+}
+
+// RoundTrip implements http.RoundTripper, distributing requests across
+// multiple HTTP/2 connections in a round-robin fashion.
+func (t *multiConnH2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	idx := t.counter.Add(1) % uint64(len(t.transports))
+	return t.transports[idx].RoundTrip(req)
+}
+
+// CloseIdleConnections closes idle connections on all underlying transports.
+func (t *multiConnH2Transport) CloseIdleConnections() {
+	for _, tr := range t.transports {
+		tr.CloseIdleConnections()
+	}
+}
+
+// newMultiConnH2Transport creates a new multi-connection HTTP/2 transport.
+// numConns specifies the number of parallel connections to maintain.
+// Each connection gets its own http2.Transport with tuned settings.
+func newMultiConnH2Transport(numConns int) *multiConnH2Transport {
+	if numConns < 1 {
+		numConns = 16 // Default to 16 connections
+	}
+
+	transports := make([]*http2.Transport, numConns)
+	for i := 0; i < numConns; i++ {
+		transports[i] = &http2.Transport{
+			AllowHTTP: true,
+			DialTLS: func(network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
+				// Use a dialer with optimized settings
+				dialer := &net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}
+				// Set TCP options for better throughput
+				conn, err := dialer.Dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					// Disable Nagle's algorithm for lower latency
+					_ = tcpConn.SetNoDelay(true)
+					// Increase socket buffer sizes
+					_ = tcpConn.SetReadBuffer(256 * 1024)
+					_ = tcpConn.SetWriteBuffer(256 * 1024)
+				}
+				return conn, nil
+			},
+			// Increase read frame size for better throughput (default is 16KB)
+			MaxReadFrameSize: 64 * 1024,
+			// Don't enforce strict max concurrent streams to allow more parallelism
+			StrictMaxConcurrentStreams: false,
+		}
+	}
+
+	return &multiConnH2Transport{transports: transports}
 }
 
 // Benchmarker runs HTTP benchmarks.
@@ -64,22 +139,19 @@ type Benchmarker struct {
 
 // New creates a new Benchmarker with the given configuration.
 func New(cfg Config) *Benchmarker {
+	// Set H2 defaults if not specified
+	if cfg.H2Connections == 0 {
+		cfg.H2Connections = 16
+	}
+	if cfg.H2MaxStreams == 0 {
+		cfg.H2MaxStreams = 100
+	}
+
 	if cfg.H2C {
-		// HTTP/2 cleartext transport with optimized settings
-		h2Transport := &http2.Transport{
-			AllowHTTP: true,
-			DialTLS: func(network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
-				// Use a dialer with proper timeouts
-				dialer := &net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}
-				return dialer.Dial(network, addr)
-			},
-			// Allow many concurrent streams per connection for better multiplexing
-			MaxReadFrameSize:           32 * 1024,
-			StrictMaxConcurrentStreams: false,
-		}
+		// Use multi-connection HTTP/2 transport for better throughput
+		// This addresses the limitation of single-connection multiplexing
+		h2Transport := newMultiConnH2Transport(cfg.H2Connections)
+
 		return &Benchmarker{
 			config: cfg,
 			client: &http.Client{
