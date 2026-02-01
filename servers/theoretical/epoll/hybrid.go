@@ -107,12 +107,24 @@ func (w *hybridWorker) run() error {
 	}
 	w.listenFd = listenFd
 
+	// SO_REUSEADDR: Allow reuse of local addresses for faster server restarts
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+
+	// SO_REUSEPORT: Enable kernel load balancing across multiple accept threads
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+
+	// TCP_NODELAY: Disable Nagle's algorithm for lower latency
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+
+	// TCP_QUICKACK: Disable delayed ACKs for lower latency
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
-	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
+
+	// SO_RCVBUF/SO_SNDBUF: 256KB buffers for higher throughput
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+
+	// SO_BUSY_POLL: Enable busy polling for reduced latency
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollUsec)
 
 	addr := &unix.SockaddrInet4{Port: w.port}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -179,9 +191,14 @@ func (w *hybridWorker) acceptConnections() {
 			continue
 		}
 
+		// Apply TCP optimizations to accepted connection
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollUsec)
 
+		// Register with epoll using edge-triggered mode
 		event := &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
