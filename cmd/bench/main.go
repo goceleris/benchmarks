@@ -105,6 +105,9 @@ func main() {
 	runID := flag.String("run-id", "", "Benchmark run ID (required in C2 mode)")
 	archOverride := flag.String("arch", "", "Architecture override (default: auto-detect)")
 
+	// Infrastructure mode (affects connection/worker scaling)
+	infraMode := flag.String("infra-mode", "", "Infrastructure mode: fast, med, metal (affects scaling defaults)")
+
 	flag.Parse()
 
 	arch := runtime.GOARCH
@@ -137,27 +140,64 @@ func main() {
 	// Get CPU count for scaling
 	numCPU := runtime.NumCPU()
 
+	// Determine scaling multipliers based on infrastructure mode
+	// Metal mode needs much higher values to saturate 64-96 core servers
+	effectiveWorkersPerCPU := *workersPerCPU
+	effectiveConnsPerWorker := *connectionsPerWorker
+	maxWorkers := 1024
+	maxConnections := 4096
+
+	switch *infraMode {
+	case "metal":
+		// Metal: saturate 64-96 core servers from 36-72 core clients
+		if *workersPerCPU == 4 { // default, not explicitly set
+			effectiveWorkersPerCPU = 16
+		}
+		if *connectionsPerWorker == 2 { // default, not explicitly set
+			effectiveConnsPerWorker = 8
+		}
+		maxWorkers = 2048
+		maxConnections = 16384
+		log.Printf("Infrastructure mode: METAL (high-throughput scaling)")
+	case "med":
+		// Med: moderate scaling for larger instances
+		if *workersPerCPU == 4 {
+			effectiveWorkersPerCPU = 8
+		}
+		if *connectionsPerWorker == 2 {
+			effectiveConnsPerWorker = 4
+		}
+		maxWorkers = 1024
+		maxConnections = 8192
+		log.Printf("Infrastructure mode: MED")
+	case "fast", "":
+		// Fast/default: conservative scaling for small instances
+		log.Printf("Infrastructure mode: FAST (default)")
+	default:
+		log.Printf("Infrastructure mode: %s (using defaults)", *infraMode)
+	}
+
 	// Auto-scale workers based on CPU count if not explicitly set
 	actualWorkers := *workers
 	if actualWorkers == 0 {
-		actualWorkers = numCPU * *workersPerCPU
+		actualWorkers = numCPU * effectiveWorkersPerCPU
 		if actualWorkers < 8 {
 			actualWorkers = 8
 		}
-		if actualWorkers > 1024 {
-			actualWorkers = 1024
+		if actualWorkers > maxWorkers {
+			actualWorkers = maxWorkers
 		}
 	}
 
 	// Auto-scale connections based on workers if not explicitly set
 	actualConnections := *connections
 	if actualConnections == 0 {
-		actualConnections = actualWorkers * *connectionsPerWorker
+		actualConnections = actualWorkers * effectiveConnsPerWorker
 		if actualConnections < 64 {
 			actualConnections = 64
 		}
-		if actualConnections > 4096 {
-			actualConnections = 4096
+		if actualConnections > maxConnections {
+			actualConnections = maxConnections
 		}
 	}
 
