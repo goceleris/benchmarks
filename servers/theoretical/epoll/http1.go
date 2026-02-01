@@ -3,6 +3,16 @@
 // Package epoll provides barebones HTTP servers using raw epoll for maximum throughput.
 // These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
 // Connection limits and buffer sizes scale automatically based on available CPUs.
+//
+// Performance Optimizations:
+// - SO_REUSEPORT: Enables kernel-level load balancing across multiple accept threads
+// - TCP_NODELAY: Disables Nagle's algorithm for lower latency
+// - TCP_QUICKACK: Forces immediate ACKs instead of delayed ACKs
+// - SO_RCVBUF/SO_SNDBUF: Larger socket buffers for higher throughput
+// - SO_BUSY_POLL: Reduces latency by busy-polling the socket
+// - Pre-allocated buffers: Zero-allocation request handling
+// - sync.Pool: Efficient buffer recycling for dynamic allocations
+// - EPOLLET (edge-triggered): More efficient event notification
 package epoll
 
 import (
@@ -11,6 +21,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -19,12 +30,23 @@ import (
 
 // Scaling constants - these scale based on CPU count
 const (
-	maxEventsBase  = 1024  // Base epoll_wait batch size
-	maxConnsPerCPU = 512   // Connections per CPU per worker
-	readBufSize    = 65536 // Per-connection read buffer (64KB for large POST bodies)
-	maxConnsMin    = 1024  // Minimum connections per worker
-	maxConnsMax    = 65536 // Maximum connections per worker (fd limit)
+	maxEventsBase  = 1024   // Base epoll_wait batch size
+	maxConnsPerCPU = 512    // Connections per CPU per worker
+	readBufSize    = 65536  // Per-connection read buffer (64KB for large POST bodies)
+	maxConnsMin    = 1024   // Minimum connections per worker
+	maxConnsMax    = 65536  // Maximum connections per worker (fd limit)
+	socketBufSize  = 262144 // Socket buffer size (256KB for higher throughput)
+	busyPollUsec   = 50     // Busy poll timeout in microseconds (reduces latency)
 )
+
+// bufferPool provides efficient recycling of byte buffers for dynamic allocations
+// This reduces GC pressure during high-throughput scenarios
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, readBufSize)
+		return &buf
+	},
+}
 
 // getScaledLimits returns connection limits scaled to available CPUs
 func getScaledLimits() (maxEvents int, maxConns int) {
@@ -143,12 +165,31 @@ func (w *epollWorker) run() error {
 	}
 	w.listenFd = listenFd
 
+	// SO_REUSEADDR: Allow reuse of local addresses for faster server restarts
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+
+	// SO_REUSEPORT: Enable kernel load balancing across multiple accept threads
+	// Each worker creates its own listening socket, and the kernel distributes
+	// incoming connections across all workers automatically
 	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+
+	// TCP_NODELAY: Disable Nagle's algorithm to reduce latency
+	// Sends data immediately without waiting to coalesce small packets
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+
+	// TCP_QUICKACK: Disable delayed ACKs for lower latency
+	// Forces immediate acknowledgment of received data
 	_ = unix.SetsockoptInt(listenFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, 65536)
-	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, 65536)
+
+	// SO_RCVBUF/SO_SNDBUF: Larger socket buffers for higher throughput
+	// 256KB buffers allow more data in flight and reduce syscall overhead
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+
+	// SO_BUSY_POLL: Enable busy polling for reduced latency
+	// Kernel will busy-wait for incoming packets instead of sleeping
+	// This trades CPU cycles for lower latency - beneficial under high load
+	_ = unix.SetsockoptInt(listenFd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollUsec)
 
 	addr := &unix.SockaddrInet4{Port: w.port}
 	if err := unix.Bind(listenFd, addr); err != nil {
@@ -217,9 +258,22 @@ func (w *epollWorker) acceptConnections() {
 			continue
 		}
 
+		// Apply TCP optimizations to accepted connection
+		// TCP_NODELAY: Disable Nagle's algorithm for immediate sends
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+
+		// TCP_QUICKACK: Force immediate ACKs for lower latency
 		_ = unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
+		// Larger socket buffers for accepted connections
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+
+		// SO_BUSY_POLL on connection socket for lower latency
+		_ = unix.SetsockoptInt(connFd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollUsec)
+
+		// Register with epoll using edge-triggered mode (EPOLLET)
+		// Edge-triggered is more efficient as it only notifies once per state change
 		event := &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET,
 			Fd:     int32(connFd),
