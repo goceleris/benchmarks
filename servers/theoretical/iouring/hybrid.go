@@ -1,5 +1,8 @@
 //go:build linux
 
+// Hybrid HTTP/1.1 and H2C server implementation using io_uring with advanced optimizations.
+// Automatically detects and handles both protocols on the same port.
+// Supports SQPOLL mode, multishot accept, and batched CQ processing.
 package iouring
 
 import (
@@ -36,6 +39,7 @@ type hybridioWorker struct {
 	sqTail        *uint32
 	cqHead        *uint32
 	cqTail        *uint32
+	sqFlags       *uint32 // SQ ring flags for SQPOLL wakeup detection
 	sqMask        uint32
 	cqMask        uint32
 	sqeTail       uint32
@@ -49,6 +53,11 @@ type hybridioWorker struct {
 	connState     []*hybridioConnState
 	sqeCount      int
 	bufferCount   int
+
+	// Optimization flags
+	useSQPoll          bool // Using SQPOLL mode (kernel polls SQ)
+	useMultishotAccept bool // Using multishot accept
+	acceptPending      bool // Multishot accept is active
 }
 
 // HybridServer is a multi-threaded server that muxes HTTP/1.1 and H2C using io_uring.
@@ -142,14 +151,40 @@ func (w *hybridioWorker) run() error {
 	return w.eventLoop()
 }
 
+// setupRing initializes the io_uring ring with advanced optimizations.
+// It attempts SQPOLL mode first (eliminates syscalls), then falls back gracefully.
 func (w *hybridioWorker) setupRing() error {
-	params := &IoUringParams{Flags: 0}
+	// Try to setup with SQPOLL mode first for maximum performance.
+	// SQPOLL eliminates io_uring_enter syscalls in the hot path.
+	params := &IoUringParams{
+		Flags:        IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		SqThreadIdle: sqPollIdleMs,
+	}
 
 	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
-		return fmt.Errorf("io_uring_setup: %w", errno)
+		// SQPOLL may fail due to permissions or kernel version.
+		// Fall back to normal mode with cooperative task running optimization.
+		params = &IoUringParams{
+			Flags: IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		}
+		ringFd, _, errno = unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
+		if errno != 0 {
+			// Final fallback: basic setup for older kernels
+			params = &IoUringParams{Flags: 0}
+			ringFd, _, errno = unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
+			if errno != 0 {
+				return fmt.Errorf("io_uring_setup: %w", errno)
+			}
+		}
+		w.useSQPoll = false
+	} else {
+		w.useSQPoll = true
 	}
 	w.ringFd = int(ringFd)
+
+	// Check for multishot accept support (kernel 5.19+)
+	w.useMultishotAccept = (params.Features & IORING_FEAT_FAST_POLL) != 0
 
 	sqSize := params.SqOff.Array + params.SqEntries*4
 	cqSize := params.CqOff.Cqes + params.CqEntries*uint32(unsafe.Sizeof(IoUringCqe{}))
@@ -174,6 +209,9 @@ func (w *hybridioWorker) setupRing() error {
 	w.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	w.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
 	w.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
+
+	// Store pointer to SQ flags for SQPOLL wakeup detection
+	w.sqFlags = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Flags]))
 
 	w.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	w.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
@@ -211,7 +249,14 @@ func (w *hybridioWorker) flushAndSubmit() {
 	w.lastFlushed = tail
 }
 
+// prepareAccept submits an accept operation.
+// With multishot accept (kernel 5.19+), a single SQE handles multiple accepts.
 func (w *hybridioWorker) prepareAccept() {
+	// If multishot is active and pending, don't re-submit
+	if w.useMultishotAccept && w.acceptPending {
+		return
+	}
+
 	sqe := w.getSqe()
 	if sqe == nil {
 		return
@@ -219,6 +264,12 @@ func (w *hybridioWorker) prepareAccept() {
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(w.listenFd)
 	sqe.UserData = uint64(w.listenFd)
+
+	// Enable multishot accept if supported
+	if w.useMultishotAccept {
+		sqe.Ioprio = IORING_ACCEPT_MULTISHOT
+		w.acceptPending = true
+	}
 }
 
 func (w *hybridioWorker) prepareRecv(fd int) {
@@ -234,9 +285,13 @@ func (w *hybridioWorker) prepareRecv(fd int) {
 	sqe.UserData = uint64(fd)
 }
 
+// eventLoop is the main event processing loop with batching optimization.
 func (w *hybridioWorker) eventLoop() error {
 	for {
-		for {
+		processed := 0
+
+		// Process completions in batches for better efficiency
+		for processed < maxBatchSize {
 			head := atomic.LoadUint32(w.cqHead)
 			tail := atomic.LoadUint32(w.cqTail)
 			if head == tail {
@@ -245,6 +300,7 @@ func (w *hybridioWorker) eventLoop() error {
 
 			cqe := &w.cqes[head&w.cqMask]
 			atomic.StoreUint32(w.cqHead, head+1)
+			processed++
 
 			fd := int(cqe.UserData & 0xFFFFFFFF)
 			isSend := (cqe.UserData>>32)&1 == 1
@@ -264,6 +320,15 @@ func (w *hybridioWorker) eventLoop() error {
 					} else {
 						_ = unix.Close(connFd)
 					}
+				}
+
+				// Handle multishot accept re-arming
+				if w.useMultishotAccept {
+					if cqe.Flags&IORING_CQE_F_MORE == 0 {
+						w.acceptPending = false
+						w.prepareAccept()
+					}
+				} else {
 					w.prepareAccept()
 				}
 			} else if !isSend {
@@ -285,10 +350,23 @@ func (w *hybridioWorker) eventLoop() error {
 		toSubmit := tail - w.submittedTail
 		w.submittedTail = tail
 
-		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
-			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
-		if errno != 0 && errno != unix.EINTR {
-			return fmt.Errorf("io_uring_enter: %w", errno)
+		// SQPOLL mode handling
+		if w.useSQPoll {
+			flags := uint32(IORING_ENTER_GETEVENTS)
+			if atomic.LoadUint32(w.sqFlags)&IORING_SQ_NEED_WAKEUP != 0 {
+				flags |= IORING_ENTER_SQ_WAKEUP
+			}
+			_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
+				0, 1, uintptr(flags), 0, 0)
+			if errno != 0 && errno != unix.EINTR {
+				return fmt.Errorf("io_uring_enter: %w", errno)
+			}
+		} else {
+			_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
+				uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
+			if errno != 0 && errno != unix.EINTR {
+				return fmt.Errorf("io_uring_enter: %w", errno)
+			}
 		}
 	}
 }

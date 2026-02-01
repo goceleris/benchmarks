@@ -3,6 +3,13 @@
 // Package iouring provides barebones HTTP servers using io_uring for maximum throughput.
 // These implementations use multiple worker threads with SO_REUSEPORT for true parallelism.
 // Buffer pool and queue sizes scale automatically based on available CPUs.
+//
+// OPTIMIZATION FEATURES:
+// - SQPOLL mode: Kernel thread polls SQ, eliminating io_uring_enter syscalls in hot path
+// - Multishot accept: Single SQE handles multiple accepts, reducing submission overhead
+// - Cooperative task running: Reduced context switching overhead
+// - Single issuer mode: Optimized for single-threaded submission per ring
+// - Batched CQ processing: Process multiple completions before submitting
 package iouring
 
 import (
@@ -18,22 +25,47 @@ import (
 )
 
 const (
+	// io_uring operation codes
 	IORING_OP_ACCEPT = 13
 	IORING_OP_RECV   = 27
 	IORING_OP_SEND   = 26
 
+	// io_uring_enter flags
 	IORING_ENTER_GETEVENTS = 1 << 0
+	IORING_ENTER_SQ_WAKEUP = 1 << 1 // Wake up SQ polling thread
 
-	// Base values for scaling
-	sqeCountBase      = 1024  // Base submission queue size
+	// io_uring_setup flags for advanced features
+	IORING_SETUP_SQPOLL        = 1 << 1  // Kernel polls SQ, eliminating syscalls
+	IORING_SETUP_COOP_TASKRUN  = 1 << 8  // Cooperative task running (kernel 5.19+)
+	IORING_SETUP_SINGLE_ISSUER = 1 << 12 // Only one thread submits (kernel 6.0+)
+
+	// Accept flags for multishot (kernel 5.19+)
+	// Single SQE handles multiple accepts continuously
+	IORING_ACCEPT_MULTISHOT = 1 << 0
+
+	// CQE flags
+	IORING_CQE_F_MORE = 1 << 1 // More completions coming (multishot indicator)
+
+	// SQ ring flags (read from mapped ring)
+	IORING_SQ_NEED_WAKEUP = 1 << 0 // SQ poll thread needs wakeup
+
+	// Feature flags returned in params.Features
+	IORING_FEAT_FAST_POLL = 1 << 5 // Fast poll support (indicates modern kernel)
+
+	// Base values for scaling - increased for high throughput
+	sqeCountBase      = 2048  // Base submission queue size (doubled for batching)
 	bufferCountPerCPU = 512   // Buffers per CPU per worker
 	bufferSize        = 65536 // Size of each buffer (64KB for large POST bodies)
 
 	// Limits
-	sqeCountMin    = 1024
-	sqeCountMax    = 16384 // io_uring limit
+	sqeCountMin    = 2048
+	sqeCountMax    = 32768 // Increased for high connection counts
 	bufferCountMin = 1024
 	bufferCountMax = 65536
+
+	// Batching parameters for optimal throughput
+	maxBatchSize = 256  // Max CQEs to process before submitting
+	sqPollIdleMs = 2000 // SQ poll thread idle timeout in milliseconds
 )
 
 // getScaledIOUringLimits returns io_uring limits scaled to available CPUs
@@ -137,6 +169,7 @@ type ioWorker struct {
 	sqTail        *uint32
 	cqHead        *uint32
 	cqTail        *uint32
+	sqFlags       *uint32 // SQ ring flags for SQPOLL wakeup detection
 	sqMask        uint32
 	cqMask        uint32
 	sqeTail       uint32
@@ -149,6 +182,11 @@ type ioWorker struct {
 	connPos       []int
 	sqeCount      int
 	bufferCount   int
+
+	// Optimization flags
+	useSQPoll          bool // Using SQPOLL mode (kernel polls SQ)
+	useMultishotAccept bool // Using multishot accept
+	acceptPending      bool // Multishot accept is active
 }
 
 // HTTP1Server is a multi-threaded HTTP/1.1 server using io_uring.
@@ -247,16 +285,48 @@ func (w *ioWorker) run() error {
 	return w.eventLoop()
 }
 
+// setupRing initializes the io_uring ring with advanced optimizations.
+// It attempts SQPOLL mode first (eliminates syscalls), then falls back gracefully.
 func (w *ioWorker) setupRing() error {
+	// Try to setup with SQPOLL mode first for maximum performance.
+	// SQPOLL eliminates io_uring_enter syscalls in the hot path by having
+	// a kernel thread continuously poll the submission queue.
 	params := &IoUringParams{
-		Flags: 0,
+		Flags:        IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		SqThreadIdle: sqPollIdleMs,
 	}
 
 	ringFd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
 	if errno != 0 {
-		return fmt.Errorf("io_uring_setup: %w", errno)
+		// SQPOLL may fail due to permissions (needs CAP_SYS_NICE) or kernel version.
+		// Fall back to normal mode with cooperative task running optimization.
+		params = &IoUringParams{
+			Flags: IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+		}
+		ringFd, _, errno = unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
+		if errno != 0 {
+			// Final fallback: basic setup for older kernels
+			params = &IoUringParams{Flags: 0}
+			ringFd, _, errno = unix.Syscall(unix.SYS_IO_URING_SETUP, uintptr(w.sqeCount), uintptr(unsafe.Pointer(params)), 0)
+			if errno != 0 {
+				return fmt.Errorf("io_uring_setup: %w", errno)
+			}
+		}
+		w.useSQPoll = false
+	} else {
+		w.useSQPoll = true
+		if w.id == 0 {
+			log.Printf("io_uring: SQPOLL mode enabled (eliminates syscalls in hot path)")
+		}
 	}
 	w.ringFd = int(ringFd)
+
+	// Check for multishot accept support (kernel 5.19+).
+	// IORING_FEAT_FAST_POLL indicates a modern kernel with multishot support.
+	w.useMultishotAccept = (params.Features & IORING_FEAT_FAST_POLL) != 0
+	if w.id == 0 && w.useMultishotAccept {
+		log.Printf("io_uring: Multishot accept enabled (single SQE handles multiple accepts)")
+	}
 
 	sqSize := params.SqOff.Array + params.SqEntries*4
 	cqSize := params.CqOff.Cqes + params.CqEntries*uint32(unsafe.Sizeof(IoUringCqe{}))
@@ -281,6 +351,9 @@ func (w *ioWorker) setupRing() error {
 	w.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Tail]))
 	w.sqMask = *((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.RingMask])))
 	w.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Array])), params.SqEntries)
+
+	// Store pointer to SQ flags for SQPOLL wakeup detection
+	w.sqFlags = (*uint32)(unsafe.Pointer(&sqPtr[params.SqOff.Flags]))
 
 	w.cqHead = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Head]))
 	w.cqTail = (*uint32)(unsafe.Pointer(&cqPtr[params.CqOff.Tail]))
@@ -318,7 +391,15 @@ func (w *ioWorker) flushAndSubmit() {
 	w.lastFlushed = tail
 }
 
+// prepareAccept submits an accept operation.
+// With multishot accept (kernel 5.19+), a single SQE handles multiple accepts
+// continuously, avoiding the overhead of re-submitting after each connection.
 func (w *ioWorker) prepareAccept() {
+	// If multishot is active and pending, don't re-submit
+	if w.useMultishotAccept && w.acceptPending {
+		return
+	}
+
 	sqe := w.getSqe()
 	if sqe == nil {
 		return
@@ -326,6 +407,12 @@ func (w *ioWorker) prepareAccept() {
 	sqe.Opcode = IORING_OP_ACCEPT
 	sqe.Fd = int32(w.listenFd)
 	sqe.UserData = uint64(w.listenFd)
+
+	// Enable multishot accept if supported - single SQE handles multiple connections
+	if w.useMultishotAccept {
+		sqe.Ioprio = IORING_ACCEPT_MULTISHOT
+		w.acceptPending = true
+	}
 }
 
 func (w *ioWorker) prepareRecv(fd int) {
@@ -341,10 +428,15 @@ func (w *ioWorker) prepareRecv(fd int) {
 	sqe.UserData = uint64(fd)
 }
 
+// eventLoop is the main event processing loop with batching optimization.
+// It processes multiple CQEs before submitting to reduce syscall overhead.
 func (w *ioWorker) eventLoop() error {
 	for {
 		processed := 0
-		for {
+
+		// Process completions in batches for better cache efficiency
+		// and reduced syscall overhead
+		for processed < maxBatchSize {
 			head := atomic.LoadUint32(w.cqHead)
 			tail := atomic.LoadUint32(w.cqTail)
 			if head == tail {
@@ -359,6 +451,7 @@ func (w *ioWorker) eventLoop() error {
 			isSend := (cqe.UserData>>32)&1 == 1
 
 			if fd == w.listenFd && !isSend {
+				// Handle accept completion
 				if cqe.Res >= 0 {
 					connFd := int(cqe.Res)
 					if connFd < w.bufferCount {
@@ -369,9 +462,23 @@ func (w *ioWorker) eventLoop() error {
 					} else {
 						_ = unix.Close(connFd)
 					}
+				}
+
+				// For multishot accept, check if we need to re-arm.
+				// IORING_CQE_F_MORE indicates more completions will come from this SQE.
+				if w.useMultishotAccept {
+					if cqe.Flags&IORING_CQE_F_MORE == 0 {
+						// Multishot terminated (error or kernel decision), re-arm
+						w.acceptPending = false
+						w.prepareAccept()
+					}
+					// Otherwise multishot is still active, no need to re-submit
+				} else {
+					// Single-shot mode: always re-submit accept
 					w.prepareAccept()
 				}
 			} else if !isSend {
+				// Handle recv completion
 				if cqe.Res > 0 {
 					w.handleData(fd, int(cqe.Res))
 				} else {
@@ -379,6 +486,7 @@ func (w *ioWorker) eventLoop() error {
 					w.connPos[fd] = 0
 				}
 			} else {
+				// Handle send completion
 				if cqe.Res < 0 {
 					_ = unix.Close(fd)
 					w.connPos[fd] = 0
@@ -392,10 +500,27 @@ func (w *ioWorker) eventLoop() error {
 		toSubmit := tail - w.submittedTail
 		w.submittedTail = tail
 
-		_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
-			uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
-		if errno != 0 && errno != unix.EINTR {
-			return fmt.Errorf("io_uring_enter: %w", errno)
+		// In SQPOLL mode, the kernel thread polls the SQ ring automatically.
+		// We only need to call io_uring_enter to wait for completions or
+		// wake up the polling thread if it went idle.
+		if w.useSQPoll {
+			// Check if SQ poll thread needs wakeup (went idle due to no work)
+			flags := uint32(IORING_ENTER_GETEVENTS)
+			if atomic.LoadUint32(w.sqFlags)&IORING_SQ_NEED_WAKEUP != 0 {
+				flags |= IORING_ENTER_SQ_WAKEUP
+			}
+			_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
+				0, 1, uintptr(flags), 0, 0)
+			if errno != 0 && errno != unix.EINTR {
+				return fmt.Errorf("io_uring_enter: %w", errno)
+			}
+		} else {
+			// Normal mode: submit and wait for completions
+			_, _, errno := unix.Syscall6(unix.SYS_IO_URING_ENTER, uintptr(w.ringFd),
+				uintptr(toSubmit), 1, IORING_ENTER_GETEVENTS, 0, 0)
+			if errno != 0 && errno != unix.EINTR {
+				return fmt.Errorf("io_uring_enter: %w", errno)
+			}
 		}
 	}
 }
